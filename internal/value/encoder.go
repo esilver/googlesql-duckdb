@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"reflect"
+	"strconv"
 	"time"
 
 	"github.com/goccy/go-json"
@@ -37,6 +38,59 @@ func EncodeValue(v Value) (any, error) {
 		return nil, fmt.Errorf("failed to encode value: %w", err)
 	}
 	return base64.StdEncoding.EncodeToString(b), nil
+}
+
+// EncodeValueAsString serializes any Value into the canonical
+// base64-of-(header,body) envelope as a string, including the
+// INT64 / FLOAT64 / BOOL primitives that EncodeValue would otherwise
+// hand back as bare Go scalars. DuckDB scalar UDFs declare a single
+// fixed result type, so the JSON-family UDFs return VARCHAR uniformly
+// and let the row decoder (DecodeValue + CastValue) re-type the value
+// against the statement's output column. Returns ("", false) for a NULL
+// value so the caller can hand DuckDB a typed NULL.
+func EncodeValueAsString(v Value) (string, bool, error) {
+	if v == nil {
+		return "", false, nil
+	}
+	if sv, ok := v.(*SafeValue); ok {
+		return EncodeValueAsString(sv.Value)
+	}
+	layout, err := valueLayoutFromValue(v)
+	if err != nil {
+		return "", false, err
+	}
+	b, err := json.Marshal(layout)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to encode value: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(b), true, nil
+}
+
+// EncodeValueString serializes a Value into the base64-of-JSON envelope
+// form unconditionally, including the INT64 / FLOAT64 / BOOL scalars that
+// EncodeValue hands back as bare Go primitives. The DuckDB scalar-UDF
+// bridge declares a single VARCHAR result type for every value-layer
+// function regardless of the GoogleSQL element type it computes, so it
+// needs the envelope string even for primitive results. DecodeValue is
+// the inverse and now understands the int64 / float / bool headers this
+// emits. A nil value becomes a NULL (returned as the empty string with
+// isNull true) so callers can forward it to DuckDB as SQL NULL.
+func EncodeValueString(v Value) (string, bool, error) {
+	if v == nil {
+		return "", true, nil
+	}
+	if sv, ok := v.(*SafeValue); ok {
+		return EncodeValueString(sv.Value)
+	}
+	layout, err := valueLayoutFromValue(v)
+	if err != nil {
+		return "", false, err
+	}
+	b, err := json.Marshal(layout)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to encode value: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(b), false, nil
 }
 
 // ValueFromGoValue converts a plain Go value (the kind a SQL driver
@@ -133,6 +187,21 @@ func ValueLayoutFromValue(v Value) (*ValueLayout, error) {
 
 func valueLayoutFromValue(v Value) (*ValueLayout, error) {
 	switch vv := v.(type) {
+	case IntValue:
+		return &ValueLayout{
+			Header: IntValueType,
+			Body:   strconv.FormatInt(int64(vv), 10),
+		}, nil
+	case FloatValue:
+		return &ValueLayout{
+			Header: FloatValueType,
+			Body:   strconv.FormatFloat(float64(vv), 'g', -1, 64),
+		}, nil
+	case BoolValue:
+		return &ValueLayout{
+			Header: BoolValueType,
+			Body:   strconv.FormatBool(bool(vv)),
+		}, nil
 	case StringValue:
 		return &ValueLayout{
 			Header: StringValueType,

@@ -96,6 +96,27 @@ func DecodeValue(v any) (Value, error) {
 		return FloatValue(float64(vv)), nil
 	case bool:
 		return BoolValue(vv), nil
+	case *big.Int:
+		// DuckDB returns HUGEINT (128-bit) results as *big.Int, which the
+		// SQLite backend never produced. COUNT / COUNTIF / SUM(INTEGER)
+		// promote to HUGEINT in DuckDB even when the true result fits in
+		// 64 bits, so map a representable value to INT64 and fall back to
+		// FLOAT64 only when it genuinely overflows int64.
+		if vv == nil {
+			return nil, nil
+		}
+		if vv.IsInt64() {
+			return IntValue(vv.Int64()), nil
+		}
+		f, _ := new(big.Float).SetInt(vv).Float64()
+		return FloatValue(f), nil
+	case big.Int:
+		bi := vv
+		if bi.IsInt64() {
+			return IntValue(bi.Int64()), nil
+		}
+		f, _ := new(big.Float).SetInt(&bi).Float64()
+		return FloatValue(f), nil
 	}
 	s, ok := v.(string)
 	if !ok {
@@ -124,6 +145,20 @@ func decodeFromValueLayout(layout *ValueLayout) (Value, error) {
 	switch layout.Header {
 	case StringValueType:
 		return StringValue(layout.Body), nil
+	case IntValueType:
+		i, err := strconv.ParseInt(layout.Body, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode int body %q: %w", layout.Body, err)
+		}
+		return IntValue(i), nil
+	case FloatValueType:
+		f, err := strconv.ParseFloat(layout.Body, 64)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode float body %q: %w", layout.Body, err)
+		}
+		return FloatValue(f), nil
+	case BoolValueType:
+		return BoolValue(layout.Body == "true"), nil
 	case BytesValueType:
 		decoded, err := base64.StdEncoding.DecodeString(layout.Body)
 		if err != nil {

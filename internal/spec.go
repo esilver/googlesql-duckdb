@@ -494,6 +494,11 @@ func (s *ColumnSpec) SQLiteSchema() string {
 		typ = "TEXT"
 	case googlesql.TypeKindTypeInterval:
 		typ = "TEXT"
+	case googlesql.TypeKindTypeRange:
+		// RANGE has no DuckDB-native column type; like the other rich
+		// value-layer kinds it round-trips through storage as the base64
+		// wire-form string, so it lands in a TEXT/VARCHAR column.
+		typ = "TEXT"
 	default:
 		typ = "UNKNOWN"
 	}

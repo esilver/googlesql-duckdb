@@ -108,6 +108,16 @@ func (r *Rows) assignValue(src any, dst reflect.Value, typ *Type) error {
 		dst.Set(reflect.New(dst.Type()).Elem())
 		return nil
 	}
+	// DuckDB retarget: native DATE / TIME / TIMESTAMP / TIMESTAMPTZ
+	// columns are scanned by duckdb-go as a Go time.Time, not the
+	// SQLite-era base64 envelope. DecodeValue has no time.Time case, so
+	// wrap it in the value type the analyzer resolved for this column
+	// before the normal CastValue -> ToString/ToJSON render path.
+	if tt, ok := src.(time.Time); ok {
+		if tv := timeValueForKind(tt, googlesql.TypeKind(typ.Kind)); tv != nil {
+			return r.renderDecodedValue(tv, dst, typ)
+		}
+	}
 	decodedValue, err := DecodeValue(src)
 	if err != nil {
 		// SQLite TEXT-affinity columns (NUMERIC, BIGNUMERIC, DATE,
@@ -138,17 +148,26 @@ func (r *Rows) assignValue(src any, dst reflect.Value, typ *Type) error {
 			return err
 		}
 	}
+	return r.renderDecodedValue(decodedValue, dst, typ)
+}
+
+// renderDecodedValue casts an already-decoded value.Value to the
+// analyzer-resolved column type and writes it into dst via the
+// destination-kind converters (scalar widths) or the interface render
+// path (string/temporal/struct/array). Shared by the base64-envelope
+// decode path and the DuckDB-native time.Time path.
+func (r *Rows) renderDecodedValue(decoded value.Value, dst reflect.Value, typ *Type) error {
 	t, err := typ.ToGoogleSQLType()
 	if err != nil {
 		return err
 	}
-	value, err := CastValue(t, decodedValue)
+	casted, err := CastValue(t, decoded)
 	if err != nil {
 		return err
 	}
 	kind := dst.Type().Kind()
 	if conv, ok := scalarValueConverters[kind]; ok {
-		rv, err := conv(value)
+		rv, err := conv(casted)
 		if err != nil {
 			return err
 		}
@@ -156,9 +175,29 @@ func (r *Rows) assignValue(src any, dst reflect.Value, typ *Type) error {
 		return nil
 	}
 	if kind == reflect.Interface {
-		return r.assignInterfaceValue(value, dst, typ)
+		return r.assignInterfaceValue(casted, dst, typ)
 	}
-	return fmt.Errorf("unexpected destination type %s for %T", kind, value)
+	return fmt.Errorf("unexpected destination type %s for %T", kind, casted)
+}
+
+// timeValueForKind wraps a DuckDB-native time.Time into the
+// googlesqlite value.Value matching the analyzer-resolved column kind.
+// DuckDB returns DATE / TIME / TIMESTAMP / TIMESTAMPTZ uniformly as
+// time.Time; the resolved kind tells us which civil/absolute reading
+// the caller expects. Returns nil for non-temporal kinds so the caller
+// falls back to the generic decode path.
+func timeValueForKind(t time.Time, kind googlesql.TypeKind) value.Value {
+	switch kind {
+	case googlesql.TypeKindTypeDate:
+		return value.DateValue(t)
+	case googlesql.TypeKindTypeTime:
+		return value.TimeValue(t)
+	case googlesql.TypeKindTypeDatetime:
+		return value.DatetimeValue(t)
+	case googlesql.TypeKindTypeTimestamp:
+		return value.TimestampValue(t)
+	}
+	return nil
 }
 
 // scalarValueConverters maps a destination reflect.Kind to a function

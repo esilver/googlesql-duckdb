@@ -103,6 +103,25 @@ func literalFromValue(v value.Value) (string, error) {
 		return fmt.Sprint(b), nil
 	case *value.SafeValue:
 		return literalFromValue(vv.Value)
+	case value.DateValue:
+		// DuckDB retarget: emit a native typed literal so DuckDB binds
+		// the operand as DATE. GoogleSQL DATE is a civil calendar date,
+		// matching DuckDB DATE exactly.
+		return fmt.Sprintf("DATE '%s'", time.Time(vv).Format("2006-01-02")), nil
+	case value.TimeValue:
+		// GoogleSQL TIME is a civil time-of-day -> DuckDB TIME. Carry
+		// microsecond precision (GoogleSQL's resolution).
+		return fmt.Sprintf("TIME '%s'", time.Time(vv).Format("15:04:05.999999")), nil
+	case value.DatetimeValue:
+		// GoogleSQL DATETIME is a civil date+time with no zone -> DuckDB
+		// TIMESTAMP (zoneless). The base64 envelope would otherwise reach
+		// DuckDB as VARCHAR and miss every DATETIME_* overload.
+		return fmt.Sprintf("TIMESTAMP '%s'", time.Time(vv).Format("2006-01-02 15:04:05.999999")), nil
+	case value.TimestampValue:
+		// GoogleSQL TIMESTAMP is an absolute instant -> DuckDB
+		// TIMESTAMPTZ. Normalize to UTC and pin the +00 offset so the
+		// instant round-trips regardless of DuckDB's session TimeZone.
+		return fmt.Sprintf("TIMESTAMPTZ '%s+00'", time.Time(vv).UTC().Format("2006-01-02 15:04:05.999999")), nil
 	}
 	layout, err := value.ValueLayoutFromValue(v)
 	if err != nil {
