@@ -1,0 +1,23 @@
+spec: docs/specs/googlesql/functions/aggregate/count.md
+dialect: googlesql
+cases:
+  - desc: count integers
+    sql: SELECT COUNT(x) FROM UNNEST([1, 2, 3]) AS x
+    expected:
+      rows:
+        - [3]
+  - desc: count star
+    sql: SELECT COUNT(*) FROM UNNEST([1, 2, 3]) AS x
+    expected:
+      rows:
+        - [3]
+  - desc: count of empty input is zero
+    sql: SELECT COUNT(x) FROM UNNEST(CAST([] AS ARRAY<INT64>)) AS x
+    expected:
+      rows:
+        - [0]
+  - desc: count star of empty input is zero
+    sql: SELECT COUNT(*) FROM UNNEST(CAST([] AS ARRAY<INT64>)) AS x
+    expected:
+      rows:
+        - [0]

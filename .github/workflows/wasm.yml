@@ -1,0 +1,53 @@
+name: wasm
+
+# Reusable workflow that builds the js/wasm Playground engine — and
+# nothing else. It is the single definition of the wasm build: the
+# release-test workflow calls it as a compile-only check, and the
+# release workflow calls it with upload=true to publish the engine as
+# an artifact the release then consumes. The bundled static site is
+# built separately by the release workflow, so this job needs no Node
+# toolchain.
+on:
+  workflow_call:
+    inputs:
+      upload:
+        description: >-
+          When true, upload the built engine as an artifact for the
+          release. When false, only compile-check the js/wasm build.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The engine is built with the latest stable Go.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: go.sum
+
+      - name: Build the js/wasm engine
+        working-directory: docs/playground
+        run: make build/wasm
+
+      # The engine artifact carries both the wasm binary and its
+      # matching Go wasm_exec.js loader: the release and deploy-pages
+      # jobs only download this artifact, so a missing wasm_exec.js
+      # leaves the deployed site unable to start the engine.
+      - name: Upload the Playground engine
+        if: ${{ inputs.upload }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playground-engine
+          path: |
+            docs/playground/public/googlesqlite.wasm
+            docs/playground/public/wasm_exec.js
+          retention-days: 1

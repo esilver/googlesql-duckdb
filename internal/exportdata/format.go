@@ -1,0 +1,166 @@
+package exportdata
+
+import (
+	"encoding/csv"
+	"encoding/json"
+	"fmt"
+	"io"
+	"strings"
+	"unicode/utf8"
+)
+
+// Format is the EXPORT DATA output format selected by the `format` option.
+type Format string
+
+const (
+	FormatCSV    Format = "CSV"
+	FormatNDJSON Format = "NEWLINE_DELIMITED_JSON"
+)
+
+// ParseFormat normalizes the `format` option value. An empty string maps to
+// CSV (matching real BigQuery's default). Formats that BigQuery accepts but
+// the emulator does not yet implement fall into two buckets:
+//
+//   - Object-store formats (AVRO, PARQUET) — the encoder is missing.
+//   - Reverse-ETL destination formats (CLOUD_SPANNER, CLOUD_BIGTABLE,
+//     CLOUD_PUBSUB, ALLOYDB) — these target operational databases /
+//     pub-sub topics rather than blob storage and require a managed
+//     destination connector that googlesqlite does not provide.
+//
+// Both buckets return a descriptive error naming the format so callers see
+// the gap instead of a corrupt file or a generic "unknown format".
+func ParseFormat(s string) (Format, error) {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "", "CSV":
+		return FormatCSV, nil
+	case "JSON", "NEWLINE_DELIMITED_JSON":
+		return FormatNDJSON, nil
+	case "AVRO", "PARQUET":
+		return "", fmt.Errorf("EXPORT DATA: format %q is not yet supported by googlesqlite", s)
+	case "CLOUD_SPANNER", "CLOUD_BIGTABLE", "CLOUD_PUBSUB", "ALLOYDB":
+		return "", fmt.Errorf("EXPORT DATA: reverse-ETL destination format %q is not supported by googlesqlite (no managed connector for the target service)", s)
+	default:
+		return "", fmt.Errorf("EXPORT DATA: unknown format %q", s)
+	}
+}
+
+// CSVOptions carries the CSV-specific EXPORT DATA options. The zero value
+// is a sentinel: Header defaults to true at encode time when nil, matching
+// BigQuery, and FieldDelimiter defaults to ",".
+type CSVOptions struct {
+	// Header writes a header row of column names when true. nil leaves
+	// the default (true) in place; *false explicitly suppresses it.
+	Header *bool
+	// FieldDelimiter is the single-character cell separator. Empty
+	// defaults to ",". Strings longer than one rune are rejected.
+	FieldDelimiter string
+}
+
+// RowSource yields successive rows of an EXPORT DATA output. Each call must
+// return the next row's values in the order matching the column list passed
+// to EncodeRows. The bool result is true while more rows remain and false
+// once iteration is exhausted; an error short-circuits encoding.
+type RowSource func() (values []any, hasMore bool, err error)
+
+// EncodeRows streams rows from src into w using the chosen format. CSV
+// writes a header row of column names; NDJSON writes one JSON object per
+// row keyed by column name.
+func EncodeRows(w io.Writer, format Format, columns []string, csvOpts CSVOptions, src RowSource) error {
+	switch format {
+	case FormatCSV:
+		return encodeCSV(w, columns, csvOpts, src)
+	case FormatNDJSON:
+		return encodeNDJSON(w, columns, src)
+	}
+	return fmt.Errorf("EXPORT DATA: unsupported format %q", format)
+}
+
+func encodeCSV(w io.Writer, columns []string, opts CSVOptions, src RowSource) error {
+	cw := csv.NewWriter(w)
+	if delim := opts.FieldDelimiter; delim != "" {
+		r, size := utf8.DecodeRuneInString(delim)
+		if r == utf8.RuneError || size != len(delim) {
+			return fmt.Errorf("EXPORT DATA: field_delimiter must be a single rune, got %q", delim)
+		}
+		cw.Comma = r
+	}
+	writeHeader := true
+	if opts.Header != nil {
+		writeHeader = *opts.Header
+	}
+	if writeHeader {
+		if err := cw.Write(columns); err != nil {
+			return fmt.Errorf("EXPORT DATA: write CSV header: %w", err)
+		}
+	}
+	for {
+		values, hasMore, err := src()
+		if err != nil {
+			return err
+		}
+		if !hasMore {
+			break
+		}
+		record := make([]string, len(values))
+		for i, v := range values {
+			record[i] = csvString(v)
+		}
+		if err := cw.Write(record); err != nil {
+			return fmt.Errorf("EXPORT DATA: write CSV row: %w", err)
+		}
+	}
+	cw.Flush()
+	return cw.Error()
+}
+
+func encodeNDJSON(w io.Writer, columns []string, src RowSource) error {
+	enc := json.NewEncoder(w)
+	for {
+		values, hasMore, err := src()
+		if err != nil {
+			return err
+		}
+		if !hasMore {
+			break
+		}
+		obj := make(map[string]any, len(columns))
+		for i, name := range columns {
+			if i < len(values) {
+				obj[name] = values[i]
+			}
+		}
+		if err := enc.Encode(obj); err != nil {
+			return fmt.Errorf("EXPORT DATA: write JSON row: %w", err)
+		}
+	}
+	return nil
+}
+
+// csvString renders a Go value to a CSV field. Strings pass through as-is,
+// nil becomes an empty field, and everything else is JSON-marshaled to a
+// stable textual form (matching how the BigQuery emulator's existing
+// extract-job CSV encoder renders non-scalar values).
+func csvString(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Sprintf("%v", v)
+	}
+	s := string(b)
+	// json.Marshal wraps a string in quotes; for scalars rendered as JSON
+	// strings (rare here since we already special-cased string above), drop
+	// the surrounding quotes so the CSV cell carries the value, not a JSON
+	// literal.
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		var unquoted string
+		if json.Unmarshal(b, &unquoted) == nil {
+			return unquoted
+		}
+	}
+	return s
+}

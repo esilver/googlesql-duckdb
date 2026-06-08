@@ -1,0 +1,13 @@
+spec: docs/specs/googlesql/functions/aggregate/array_agg.md
+dialect: googlesql
+cases:
+  - desc: aggregate ints into array
+    sql: SELECT ARRAY_AGG(x ORDER BY x) FROM UNNEST([3, 1, 2]) AS x
+    expected:
+      rows:
+        - [[1, 2, 3]]
+  - desc: empty input returns NULL
+    sql: SELECT ARRAY_AGG(x) FROM UNNEST(CAST([] AS ARRAY<INT64>)) AS x
+    expected:
+      rows:
+        - [null]
