@@ -1,8 +1,6 @@
 package internal
 
 import (
-	"fmt"
-
 	arrfn "github.com/goccy/googlesqlite/internal/functions/array"
 	datefn "github.com/goccy/googlesqlite/internal/functions/date"
 	jsonfn "github.com/goccy/googlesqlite/internal/functions/json"
@@ -128,33 +126,6 @@ func GoogleSQLArrayAtOrdinal(args ...any) (any, error) {
 
 func GoogleSQLSafeArrayAtOrdinal(args ...any) (any, error) {
 	return runValueLayerFunc(arrfn.BindSafeArrayAtOrdinal, args)
-}
-
-// GoogleSQLDecodeArray is the bridge for googlesqlite_decode_array. The
-// analyzer emits json_each(googlesqlite_decode_array(<array>)) when it
-// lowers higher-order array operators (ARRAY_INCLUDES / ARRAY_SUM /
-// UNNEST(...) over a literal, etc.). DuckDB has a native json_each table
-// function, so the bridge only has to turn the value-layer envelope into
-// the JSON array text json_each parses. ArrayValue.ToString already emits
-// canonical JSON (numbers bare, strings quoted, nested values recursed),
-// which is exactly what json_each consumes. A NULL or non-array input
-// yields SQL NULL so the surrounding json_each produces zero rows.
-func GoogleSQLDecodeArray(args ...any) (any, error) {
-	if len(args) != 1 {
-		return nil, fmt.Errorf("googlesqlite_decode_array: want 1 arg, got %d", len(args))
-	}
-	v, err := value.DecodeValue(args[0])
-	if err != nil {
-		return nil, err
-	}
-	if v == nil {
-		return nil, nil
-	}
-	arr, err := v.ToArray()
-	if err != nil {
-		return nil, err
-	}
-	return arr.ToString()
 }
 
 // GoogleSQLToJsonString is the bridge for to_json_string. DuckDB has no
