@@ -162,9 +162,10 @@ func EnsureFuncMaps() {
 // formatter lowers to a UDF) and the root-package registration (which decides
 // what UDF exists), so the two can never drift apart.
 var duckdbPortedFuncNames = func() map[string]struct{} {
-	m := make(map[string]struct{}, len(stringFamilyUDFNames))
-	for _, name := range stringFamilyUDFNames {
-		m[name] = struct{}{}
+	specs := DuckDBNormalUDFSpecs()
+	m := make(map[string]struct{}, len(specs))
+	for _, spec := range specs {
+		m[spec.Name] = struct{}{}
 	}
 	return m
 }()

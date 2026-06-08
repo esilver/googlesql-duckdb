@@ -33,6 +33,7 @@ const (
 type DuckDBUDFSpec struct {
 	Name       string
 	ResultKind DuckDBUDFResultKind
+	Volatile   bool
 }
 
 // stringFamilyResultKinds records the result type for every string-family
@@ -55,6 +56,21 @@ var stringFamilyResultKinds = map[string]DuckDBUDFResultKind{
 	// REGEXP_MATCH is the legacy boolean form (full-string match), not a
 	// substring extractor, so it returns BOOL like CONTAINS/STARTS_WITH.
 	"regexp_match": DuckDBResultBoolean,
+}
+
+var duckDBNormalResultKinds = map[string]DuckDBUDFResultKind{
+	"contains_substr":    DuckDBResultBoolean,
+	"like":               DuckDBResultBoolean,
+	"keys_keyset_length": DuckDBResultBigint,
+}
+
+var duckDBVolatileUDFNames = map[string]struct{}{
+	"generate_uuid":               {},
+	"keys_new_keyset":             {},
+	"keys_add_key_from_raw_bytes": {},
+	"keys_rotate_keyset":          {},
+	"keys_new_wrapped_keyset":     {},
+	"aead_encrypt":                {},
 }
 
 // stringFamilyUDFNames is the canonical builtin names of the string-family
@@ -121,6 +137,41 @@ var stringFamilyUDFNames = []string{
 	"to_json_string",
 }
 
+// duckDBNormalUDFNames is the broader normal-function surface registered on
+// DuckDB through the generic value-layer scalar bridge. It includes the string
+// family plus BigQuery scalars whose bodies already live in normalFuncs.
+var duckDBNormalUDFNames = append(append([]string{}, stringFamilyUDFNames...),
+	"contains_substr",
+	"like",
+	"make_array",
+	"generate_uuid",
+	"typeof",
+	"date_bucket",
+	"datetime_bucket",
+	"timestamp_bucket",
+	"text_analyze",
+	"bag_of_words",
+	"keys_new_keyset",
+	"keys_add_key_from_raw_bytes",
+	"keys_keyset_length",
+	"keys_keyset_to_json",
+	"keys_keyset_from_json",
+	"keys_rotate_keyset",
+	"keys_keyset_chain",
+	"keys_new_wrapped_keyset",
+	"keys_rewrap_keyset",
+	"keys_rotate_wrapped_keyset",
+	"aead_encrypt",
+	"aead_decrypt_bytes",
+	"aead_decrypt_string",
+	"deterministic_encrypt",
+	"deterministic_decrypt_bytes",
+	"deterministic_decrypt_string",
+	"dlp_key_chain",
+	"dlp_deterministic_encrypt",
+	"dlp_deterministic_decrypt",
+)
+
 // StringFamilyUDFSpecs returns the DuckDB scalar UDF specs for the string
 // family. The root package consumes these to register one variadic UDF per
 // name (and its googlesqlite_safe_ companion) against duckdb-go.
@@ -130,6 +181,26 @@ func StringFamilyUDFSpecs() []DuckDBUDFSpec {
 		specs = append(specs, DuckDBUDFSpec{
 			Name:       name,
 			ResultKind: stringFamilyResultKinds[name],
+		})
+	}
+	return specs
+}
+
+// DuckDBNormalUDFSpecs returns the normal scalar UDF specs registered on the
+// DuckDB backend. The result kind mirrors EncodeValue's native output where
+// callers need a BOOL / INT64 in SQL; richer results remain VARCHAR envelopes.
+func DuckDBNormalUDFSpecs() []DuckDBUDFSpec {
+	specs := make([]DuckDBUDFSpec, 0, len(duckDBNormalUDFNames))
+	for _, name := range duckDBNormalUDFNames {
+		kind, ok := duckDBNormalResultKinds[name]
+		if !ok {
+			kind = stringFamilyResultKinds[name]
+		}
+		_, volatile := duckDBVolatileUDFNames[name]
+		specs = append(specs, DuckDBUDFSpec{
+			Name:       name,
+			ResultKind: kind,
+			Volatile:   volatile,
 		})
 	}
 	return specs
