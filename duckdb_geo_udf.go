@@ -5,11 +5,22 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"sync"
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
 
 	internal "github.com/goccy/googlesqlite/internal"
 )
+
+// spatialLoadMu serializes the spatial-extension INSTALL/LOAD across all
+// DuckDB databases opened in the process. registerDuckDBGeography runs on
+// every DB open (see driver.go), so the conformance harness drives
+// hundreds of concurrent first-loads of the extension; the DuckDB C++
+// extension loader is not safe under that concurrency and aborts the
+// process. Holding this mutex around the INSTALL/LOAD pair makes each load
+// observe a quiescent loader while keeping the extension present in every
+// database (geography behaviour is unchanged).
+var spatialLoadMu sync.Mutex
 
 // loadSpatialExtension installs and loads DuckDB's spatial extension on
 // the connection. The geography family lowers to a mix of pure-Go
@@ -23,6 +34,8 @@ func loadSpatialExtension(db *sql.DB) error {
 		return fmt.Errorf("googlesqlite: spatial conn: %w", err)
 	}
 	defer conn.Close()
+	spatialLoadMu.Lock()
+	defer spatialLoadMu.Unlock()
 	for _, stmt := range []string{"INSTALL spatial", "LOAD spatial"} {
 		if _, err := conn.ExecContext(context.Background(), stmt); err != nil {
 			return fmt.Errorf("googlesqlite: %q: %w", stmt, err)
