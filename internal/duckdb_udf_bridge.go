@@ -62,6 +62,47 @@ func GoogleSQLDecodeArray(arr any) (string, error) {
 	return string(b), nil
 }
 
+// GoogleSQLDecodeScalar is the DuckDB-facing bridge for the
+// googlesqlite_decode_scalar scalar UDF. It decodes a value-layer scalar
+// envelope (the base64-of-JSON VARCHAR that googlesqlite_get_struct_field
+// returns for a scalar field) back into a value.Value and re-encodes it
+// to its bare over-the-wire form via EncodeValue: INT64 / FLOAT64 / BOOL
+// come back as raw Go scalars, which the UDF's VARCHAR result type renders
+// as the plain textual value ("3", "5.5", "true"). The formatter wraps the
+// call in a DuckDB CAST to the field's resolved scalar type, so
+// `x.a + x.b` binds as native arithmetic instead of failing on
+// '+(VARCHAR, VARCHAR)'. A NULL envelope decodes to a NULL result.
+func GoogleSQLDecodeScalar(envelope any) (any, error) {
+	decoded, err := DecodeValue(envelope)
+	if err != nil {
+		return nil, err
+	}
+	if decoded == nil {
+		return nil, nil
+	}
+	bare, err := EncodeValue(decoded)
+	if err != nil {
+		return nil, err
+	}
+	if bare == nil {
+		return nil, nil
+	}
+	// The UDF declares a VARCHAR result, and duckdb-go does not coerce a
+	// bare Go int64 / float64 / bool return into the declared string type
+	// (it raises "cannot cast int64 to string"). Render the bare scalar as
+	// its plain textual value so the formatter's wrapping DuckDB CAST can
+	// retype it: json.Marshal yields "3" / "5.5" / "true", all of which
+	// CAST cleanly to BIGINT / DOUBLE / BOOLEAN.
+	if s, ok := bare.(string); ok {
+		return s, nil
+	}
+	b, err := json.Marshal(bare)
+	if err != nil {
+		return nil, err
+	}
+	return string(b), nil
+}
+
 // GoogleSQLCast is the DuckDB-facing bridge for the googlesqlite_cast scalar
 // UDF, which the formatter (CastNode) emits for every GoogleSQL CAST /
 // SAFE_CAST. The four arguments are the value-layer-encoded expression, the

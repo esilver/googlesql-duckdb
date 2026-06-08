@@ -404,7 +404,7 @@ func (n *FunctionCallNode) FormatSQL(ctx context.Context) (string, error) {
 	if sql, ok := tryNativeMathFunc(funcName, args); ok {
 		return sql, nil
 	}
-	if sql, ok := tryNativeOperator(funcName, args); ok {
+	if sql, ok := tryNativeOperator(funcName, args, argKinds(m1(n.node.ArgumentList()))); ok {
 		return sql, nil
 	}
 	// DuckDB retarget: date / datetime / time / timestamp builtins lower
@@ -693,12 +693,26 @@ var nativeScalarRenames = map[string]string{
 // builtin handled here, else ("", false) so the caller falls through to the
 // UDF path. Only the operators whose DuckDB-native semantics match
 // GoogleSQL are lowered; IN-subquery stays a sql_rewrite.
-func tryNativeOperator(funcName string, args []string) (string, bool) {
+func tryNativeOperator(funcName string, args []string, kinds []googlesql.TypeKind) (string, bool) {
 	isSafe := strings.HasPrefix(funcName, "googlesqlite_safe_")
 	op := strings.TrimPrefix(funcName, "googlesqlite_")
 	op = strings.TrimPrefix(op, "safe_")
 
 	if tok, ok := nativeBinaryOperators[op]; ok && len(args) == 2 {
+		// The arithmetic operators (+, -, *) require native numeric
+		// operands, but an operand sourced from a decoded array element
+		// (json_each.value) reaches DuckDB JSON-typed, so the binder rejects
+		// `*(JSON, INTEGER_LITERAL)` for ARRAY_TRANSFORM([1,2,3], e -> e*2).
+		// Cast each operand to its analyzer-resolved scalar type so the
+		// arithmetic binds natively. The cast is idempotent for operands
+		// that are already native (literals, prior casts). The comparison
+		// operators are left untouched: their operands are compared in the
+		// value-layer form (struct / string equality relies on the envelope),
+		// and json_each.value comparisons already round-trip through the
+		// forgiving spec comparator.
+		if isArithmeticOperator(op) {
+			return fmt.Sprintf("(%s %s %s)", castOperandToKind(args[0], kindAt(kinds, 0)), tok, castOperandToKind(args[1], kindAt(kinds, 1))), true
+		}
 		return fmt.Sprintf("(%s %s %s)", args[0], tok, args[1]), true
 	}
 
@@ -1405,6 +1419,17 @@ var canonicalBuiltinFuncNames = map[string]string{
 	"iferror":     "googlesqlite_iferror",
 	"iserror":     "googlesqlite_iserror",
 	"nulliferror": "googlesqlite_nulliferror",
+	// On the DuckDB target the analyzer resolves these proto builtins to
+	// their bare GoogleSQL names (the SQLite normalFuncMap that would
+	// otherwise shell them into googlesqlite_<name> is never populated).
+	// Canonicalize so the switch below reaches their format* lowerings,
+	// which rewrite the call to the googlesqlite_<name> scalar UDFs
+	// registered by registerProtoUDFs. FILTER_FIELDS / REPLACE_FIELDS are
+	// already shelled to the prefixed name upstream, so they are omitted.
+	"from_proto":             "googlesqlite_from_proto",
+	"to_proto":               "googlesqlite_to_proto",
+	"proto_modify_map":       "googlesqlite_proto_modify_map",
+	"proto_map_contains_key": "googlesqlite_proto_map_contains_key",
 }
 
 // canonicalizeBuiltinFuncName maps a bare special-form builtin name to its
@@ -2379,6 +2404,85 @@ func (n *CastNode) tryNativeCast(ctx context.Context) (string, bool, error) {
 // duckDBTypeName maps a GoogleSQL temporal/primitive kind to the DuckDB
 // type keyword used in a CAST target. ok=false for kinds this path does
 // not handle.
+// valueLayerScalarCastType returns the DuckDB type a bare value-layer
+// scalar should be CAST to, and true, for the element/field kinds whose
+// over-the-wire form is a bare JSON scalar (EncodeValue hands INT64 /
+// FLOAT64 / BOOL back as raw Go scalars, so json_each.value over a
+// decoded array yields a JSON number / boolean rather than the base64
+// envelope). Casting those to BIGINT / DOUBLE / BOOLEAN recovers a native
+// value DuckDB's arithmetic / comparison operators bind against - the
+// same recovery nativeNumericAggregates applies for SUM(JSON) etc.
+//
+// STRING / BYTES / temporal / NUMERIC / STRUCT / ARRAY return ("",
+// false): EncodeValue keeps those in the base64 value-layer envelope, so
+// the raw column value is not a castable native literal and must flow on
+// to the consumer (googlesqlite_cast / get_struct_field / the row
+// decoder) untouched.
+func valueLayerScalarCastType(kind googlesql.TypeKind) (string, bool) {
+	switch kind {
+	case googlesql.TypeKindTypeInt32, googlesql.TypeKindTypeInt64,
+		googlesql.TypeKindTypeUint32, googlesql.TypeKindTypeUint64:
+		return "BIGINT", true
+	case googlesql.TypeKindTypeFloat, googlesql.TypeKindTypeDouble:
+		return "DOUBLE", true
+	case googlesql.TypeKindTypeBool:
+		return "BOOLEAN", true
+	}
+	return "", false
+}
+
+// isArithmeticOperator reports whether op is one of the additive /
+// multiplicative operator builtins whose operands must be native numerics
+// (so a JSON-typed array element needs a CAST). The comparison operators
+// in nativeBinaryOperators are excluded - they tolerate the value-layer
+// operand form.
+func isArithmeticOperator(op string) bool {
+	switch op {
+	case "add", "subtract", "multiply":
+		return true
+	}
+	return false
+}
+
+// argKinds returns the resolved TypeKind of each function argument, in
+// order, so an operator lowering can decide whether to cast an operand to
+// its native scalar type. A nil / typeless argument contributes
+// TypeKindTypeUnknown, which castOperandToKind leaves untouched.
+func argKinds(args []googlesql.ResolvedExprNode) []googlesql.TypeKind {
+	kinds := make([]googlesql.TypeKind, len(args))
+	for i, a := range args {
+		if a == nil {
+			continue
+		}
+		if t, _ := a.Type(); t != nil {
+			if k, err := t.Kind(); err == nil {
+				kinds[i] = k
+			}
+		}
+	}
+	return kinds
+}
+
+// kindAt returns the kind at index i, or TypeKindTypeUnknown when the
+// index is out of range.
+func kindAt(kinds []googlesql.TypeKind, i int) googlesql.TypeKind {
+	if i < 0 || i >= len(kinds) {
+		return googlesql.TypeKindTypeUnknown
+	}
+	return kinds[i]
+}
+
+// castOperandToKind wraps an operand SQL string in a DuckDB CAST to the
+// native scalar type for kind, when kind is a JSON-backed scalar
+// (INT64 / FLOAT64 / BOOL). Other kinds are returned unchanged. The cast
+// is idempotent, so applying it to an already-native operand is harmless.
+func castOperandToKind(operand string, kind googlesql.TypeKind) string {
+	if castType, ok := valueLayerScalarCastType(kind); ok {
+		return fmt.Sprintf("CAST(%s AS %s)", operand, castType)
+	}
+	return operand
+}
+
 func duckDBTypeName(kind googlesql.TypeKind) (string, bool) {
 	switch kind {
 	case googlesql.TypeKindTypeDate:
@@ -2517,7 +2621,24 @@ func (n *GetStructFieldNode) FormatSQL(ctx context.Context) (string, error) {
 		return "", err
 	}
 	idx, _ := n.node.FieldIdx()
-	return fmt.Sprintf("googlesqlite_get_struct_field(%s, %d)", expr, idx), nil
+	access := fmt.Sprintf("googlesqlite_get_struct_field(%s, %d)", expr, idx)
+	// get_struct_field returns the value-layer envelope (a base64 VARCHAR),
+	// which DuckDB cannot use in native arithmetic / comparison - `x.a +
+	// x.b` over two INT64 fields fails the binder as '+(VARCHAR, VARCHAR)'.
+	// For a scalar field, decode the envelope back to its bare value and
+	// cast it to the analyzer-resolved scalar type so the field reads as a
+	// native BIGINT / DOUBLE / BOOLEAN. The row decoder accepts the native
+	// value on the result path just as it accepts the envelope, so a plain
+	// top-level `SELECT x.a` keeps working. STRUCT / ARRAY / STRING / other
+	// envelope-typed fields pass through untouched.
+	if t, _ := n.node.Type(); t != nil {
+		if k, err := t.Kind(); err == nil {
+			if castType, ok := valueLayerScalarCastType(k); ok {
+				return fmt.Sprintf("CAST(googlesqlite_decode_scalar(%s) AS %s)", access, castType), nil
+			}
+		}
+	}
+	return access, nil
 }
 
 func (n *GetProtoFieldNode) FormatSQL(ctx context.Context) (string, error) {

@@ -43,6 +43,9 @@ func registerDuckDBUDFs(db *sql.DB) error {
 	if err := duckdb.RegisterScalarUDF(conn, "googlesqlite_decode_array", &decodeArrayUDF{}); err != nil {
 		return fmt.Errorf("googlesqlite: register googlesqlite_decode_array: %w", err)
 	}
+	if err := duckdb.RegisterScalarUDF(conn, "googlesqlite_decode_scalar", &decodeScalarUDF{}); err != nil {
+		return fmt.Errorf("googlesqlite: register googlesqlite_decode_scalar: %w", err)
+	}
 	if err := duckdb.RegisterScalarUDF(conn, "googlesqlite_cast", &castUDF{}); err != nil {
 		return fmt.Errorf("googlesqlite: register googlesqlite_cast: %w", err)
 	}
@@ -73,6 +76,9 @@ func registerDuckDBUDFs(db *sql.DB) error {
 		return err
 	}
 	if err := registerStructUDFs(conn); err != nil {
+		return err
+	}
+	if err := registerProtoUDFs(conn); err != nil {
 		return err
 	}
 	if err := registerExtraScalarUDFs(conn); err != nil {
@@ -158,6 +164,37 @@ func (*decodeArrayUDF) Executor() duckdb.ScalarFuncExecutor {
 				return nil, fmt.Errorf("googlesqlite_decode_array: want 1 arg, got %d", len(values))
 			}
 			return internal.GoogleSQLDecodeArray(values[0])
+		},
+	}
+}
+
+// decodeScalarUDF adapts internal.GoogleSQLDecodeScalar to DuckDB's
+// scalar-UDF interface. The formatter wraps a scalar struct-field access
+// (googlesqlite_get_struct_field, which returns the value-layer envelope)
+// in googlesqlite_decode_scalar so the bare textual value falls out of the
+// envelope, then casts it to the field's resolved scalar type. The single
+// argument is the envelope VARCHAR; the result is the bare value rendered
+// through the VARCHAR result type.
+type decodeScalarUDF struct{}
+
+func (*decodeScalarUDF) Config() duckdb.ScalarFuncConfig {
+	varchar, _ := duckdb.NewTypeInfo(duckdb.TYPE_VARCHAR)
+	return duckdb.ScalarFuncConfig{
+		InputTypeInfos: []duckdb.TypeInfo{varchar},
+		ResultTypeInfo: varchar,
+		// A NULL field value (struct field access on a NULL struct) must stay
+		// NULL rather than decode, so route NULLs through the body.
+		SpecialNullHandling: true,
+	}
+}
+
+func (*decodeScalarUDF) Executor() duckdb.ScalarFuncExecutor {
+	return duckdb.ScalarFuncExecutor{
+		RowExecutor: func(values []driver.Value) (any, error) {
+			if len(values) != 1 {
+				return nil, fmt.Errorf("googlesqlite_decode_scalar: want 1 arg, got %d", len(values))
+			}
+			return internal.GoogleSQLDecodeScalar(values[0])
 		},
 	}
 }
