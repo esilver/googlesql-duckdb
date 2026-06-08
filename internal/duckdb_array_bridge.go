@@ -77,6 +77,39 @@ func CallValueLayerFunc(name string, args ...any) (any, error) {
 	return s, nil
 }
 
+// CallProtoFunc is the proto-family variant of CallValueLayerFunc. The
+// FROM_PROTO / TO_PROTO identity-passthrough cases accept a native SQL
+// temporal value (`FROM_PROTO(DATE '...')`, `TO_PROTO(TIMESTAMP '...')`),
+// which the formatter lowers to a native DuckDB DATE / TIMESTAMP literal.
+// That literal reaches the UDF as a bare Go time.Time, which
+// value.ConvertArgs cannot decode on its own. The kind hint the formatter
+// always passes as the second argument ('date' / 'timestamp' / ...) tells
+// us how to re-wrap a leading time.Time into the matching value.Value (the
+// same fix retypeTimeArgs applies for the GENERATE_*_ARRAY bounds) so the
+// shared proto body's DateValue / TimestampValue identity-passthrough
+// fires. All other proto builtins pass their arguments through unchanged.
+func CallProtoFunc(name string, args ...any) (any, error) {
+	if len(args) >= 2 {
+		if t, ok := args[0].(time.Time); ok {
+			kind, _ := args[1].(string)
+			args[0] = protoTimeValueForKind(t, kind)
+		}
+	}
+	return CallValueLayerFunc(name, args...)
+}
+
+// protoTimeValueForKind wraps a native time.Time into the value.Value the
+// proto body expects for the given kind hint. A "date" kind yields a
+// DateValue; everything else (including "timestamp") yields a
+// TimestampValue, matching FROM_PROTO / TO_PROTO's only two temporal
+// passthrough kinds.
+func protoTimeValueForKind(t time.Time, kind string) value.Value {
+	if kind == "date" {
+		return value.DateValue(t)
+	}
+	return value.TimestampValue(t)
+}
+
 // runNativeScalarFunc is the bridge variant for value-layer functions
 // whose GoogleSQL result type is a fixed scalar (INT64 / STRING / BOOL).
 // It decodes the arguments, runs the body, then projects the result to

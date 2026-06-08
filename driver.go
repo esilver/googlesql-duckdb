@@ -91,6 +91,14 @@ func resolveWasmOptions() wasmOptions {
 // ensureGoogleSQLInit initialises the embedded GoogleSQL WASM runtime
 // once per process. Subsequent calls are no-ops (Init uses sync.Once).
 // It is invoked on the first sql.Open of a googlesqlite DB.
+//
+// It also primes the one-time spatial-extension load here, inside the same
+// process-init barrier. Because this runs under sync.OnceValue, the first
+// open blocks every other open until it returns, so the single INSTALL/LOAD
+// of the spatial extension completes while the process is still effectively
+// single-threaded - before any concurrent query reaches DuckDB's
+// duckdb_execute_pending. That ordering is what keeps the extension loader
+// from racing the steady-state query stream (see loadSpatialExtension).
 var ensureGoogleSQLInit = sync.OnceValue(func() error {
 	opts := resolveWasmOptions()
 	googlesqlOpts := make([]googlesql.Option, 0, 2)
@@ -103,7 +111,10 @@ var ensureGoogleSQLInit = sync.OnceValue(func() error {
 	default:
 		googlesqlOpts = append(googlesqlOpts, googlesql.WithCompilationMode(googlesql.CompilationModeInterpreter))
 	}
-	return googlesql.Init(googlesqlOpts...)
+	if err := googlesql.Init(googlesqlOpts...); err != nil {
+		return err
+	}
+	return loadSpatialExtension(nil)
 })
 
 var (
