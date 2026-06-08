@@ -22,6 +22,20 @@ import (
 // json_each.key (its 0-based offset) - identical to the SQLite path the
 // body was written for in function_register.go.
 func GoogleSQLDecodeArray(arr any) (string, error) {
+	// DuckDB-native LIST input: native aggregates (array_agg, list, the
+	// ARRAY(SELECT ...) subquery lowering) hand back a Go []any whose
+	// elements are already the per-element over-the-wire form (an envelope
+	// VARCHAR for richer element types, a native int64/float64/bool for
+	// primitives). json_each only needs each element re-marshalled as a
+	// JSON scalar, so forward the slice straight to json.Marshal without
+	// the value-layer envelope decode the VARCHAR path requires.
+	if list, ok := arr.([]any); ok {
+		b, err := json.Marshal(list)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	}
 	decoded, err := DecodeValue(arr)
 	if err != nil {
 		return "", err

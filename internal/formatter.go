@@ -1756,6 +1756,22 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 	if native, ok := nativeAggregateFuncMap[funcName]; ok {
 		funcName = native
 	}
+	// DuckDB retarget: ARRAY_CONCAT_AGG flattens per-row ARRAY<T> values
+	// into one ARRAY<T>. DuckDB has no array_concat_agg, and duckdb-go
+	// exposes no aggregate-UDF registration, so collect the per-row array
+	// values with native array_agg (yielding a LIST of array-envelope
+	// VARCHARs) and flatten them in a scalar UDF that decodes each envelope
+	// and concatenates the elements into a single array-envelope. An
+	// all-empty / zero-row input flattens to an empty array, which
+	// GoogleSQL then surfaces as NULL on the result path.
+	if funcName == "array_concat_agg" {
+		return fmt.Sprintf(
+			"googlesqlite_array_concat_agg_flatten(array_agg(%s%s%s))",
+			argPrefix,
+			strings.Join(args, ","),
+			orderByClause,
+		), nil
+	}
 	return fmt.Sprintf(
 		"%s(%s%s%s)",
 		funcName,
@@ -2682,7 +2698,23 @@ func (n *SubqueryExprNode) FormatSQL(ctx context.Context) (string, error) {
 			return "", fmt.Errorf("failed to find computed column names for array subquery")
 		}
 		colName := uniqueColumnName(ctx, subCols[0])
-		return fmt.Sprintf("(SELECT googlesqlite_array(\"%s\") FROM (%s))", colName, sql), nil
+		// DuckDB retarget: the predecessor collected the array-subquery rows
+		// with the googlesqlite_array SQLite aggregate UDF. duckdb-go exposes
+		// no aggregate-UDF registration, so collect the rows with DuckDB's
+		// native array_agg (yielding a LIST whose elements are the per-row
+		// value-layer wire form) and fold that LIST back into the array-layer
+		// envelope with googlesqlite_array_from_native. Re-enveloping keeps
+		// the array-subquery result a VARCHAR, which is what the surrounding
+		// expressions assume: the error-handling CASE arms in ARRAY_ZIP /
+		// ARRAY_SLICE mix the subquery result with envelope-typed ERROR(...)
+		// branches, and DuckDB rejects a CASE that mixes VARCHAR[] with
+		// VARCHAR. COALESCE over an empty list keeps an all-NULL / zero-row
+		// subquery from folding to SQL NULL before the envelope wrap, matching
+		// GoogleSQL's empty-ARRAY result.
+		return fmt.Sprintf(
+			"googlesqlite_array_from_native(COALESCE((SELECT array_agg(\"%s\") FROM (%s)), []))",
+			colName, sql,
+		), nil
 	case googlesql.ResolvedSubqueryExprEnums_SubqueryTypeExists:
 		return fmt.Sprintf("EXISTS (%s)", sql), nil
 	case googlesql.ResolvedSubqueryExprEnums_SubqueryTypeIn:
@@ -2826,15 +2858,33 @@ func (n *ArrayScanNode) FormatSQL(ctx context.Context) (string, error) {
 			} else {
 				joinMode = "INNER JOIN"
 			}
+			// DuckDB retarget: a correlated array scan with a JOIN condition
+			// (the multi-array UNNEST that ARRAY_ZIP lowers to) references the
+			// element/offset columns of THIS scan inside the ON clause
+			// (e.g. ON "offset#6" = "offset#8"). DuckDB resolves a JOIN ON
+			// against the joined relation's columns, not the outer SELECT
+			// list, so projecting `json_each.value AS "e#"` in the outer
+			// SELECT leaves the ON clause unable to see the alias (Binder
+			// Error: Referenced column "offset#8" not found). Push the value
+			// / key aliases into a subquery wrapping the joined json_each so
+			// they become real columns the ON clause and the outer `SELECT *`
+			// both resolve.
+			array = fmt.Sprintf("(SELECT %s FROM %s)", strings.Join(columns, ","), array)
 			arrayJoinExpr = fmt.Sprintf("%s %s ON %s",
 				joinMode,
 				array,
 				arrayJoinExpr,
 			)
-		} else {
-			// If there is no join expression, use a CROSS JOIN
-			arrayJoinExpr = fmt.Sprintf(", %s", array)
+			return fmt.Sprintf(
+				"SELECT * %s %s",
+				formattedInput,
+				arrayJoinExpr,
+			), nil
 		}
+		// If there is no join expression, use a CROSS JOIN. The single-array
+		// scan projects the element / offset aliases directly because there
+		// is no ON clause that needs them as real columns.
+		arrayJoinExpr = fmt.Sprintf(", %s", array)
 
 		return fmt.Sprintf(
 			"SELECT *, %s %s %s",

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"math/big"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -67,6 +68,13 @@ func DecodeValue(v any) (Value, error) {
 	if isNullValue(v) {
 		return nil, nil
 	}
+	// Pass an already-decoded Value straight through. The generate-array
+	// bridges pre-wrap a native time.Time bound as a DateValue /
+	// TimestampValue (ConvertArgs cannot decode a bare time.Time), so the
+	// decoder must treat an incoming Value as a no-op rather than reject it.
+	if vv, ok := v.(Value); ok {
+		return vv, nil
+	}
 	v = coerceJSONNumber(v)
 	switch vv := v.(type) {
 	case int64:
@@ -117,6 +125,48 @@ func DecodeValue(v any) (Value, error) {
 		}
 		f, _ := new(big.Float).SetInt(&bi).Float64()
 		return FloatValue(f), nil
+	case []any:
+		// DuckDB-native LIST: duckdb-go scans a LIST / ARRAY column to a Go
+		// []any. Each element is either a value-layer envelope (a richer
+		// element type re-encoded as VARCHAR by a UDF) or a native Go
+		// primitive (INT64 / FLOAT64 / BOOL element), so recurse through
+		// DecodeValue per element to materialise the ArrayValue. This lets a
+		// native aggregate (array_agg / list / the ARRAY(SELECT ...)
+		// subquery lowering) round-trip back through ToArray on the result
+		// path without the base64 envelope.
+		elems := make([]Value, 0, len(vv))
+		for _, e := range vv {
+			ev, err := DecodeValue(e)
+			if err != nil {
+				return nil, err
+			}
+			elems = append(elems, ev)
+		}
+		return &ArrayValue{Values: elems}, nil
+	case map[string]any:
+		// DuckDB-native STRUCT: duckdb-go scans a STRUCT column to a Go
+		// map[string]any keyed by field name. The struct value layer carries
+		// field names on the column type rather than the value, so we keep
+		// the keys for round-tripping but the row decoder reads fields
+		// positionally; preserve a stable key order so the positional read
+		// matches the declared field order is the caller's concern. Recurse
+		// per field value (envelope or native primitive).
+		keys := make([]string, 0, len(vv))
+		for k := range vv {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		values := make([]Value, 0, len(keys))
+		m := make(map[string]Value, len(keys))
+		for _, k := range keys {
+			fv, err := DecodeValue(vv[k])
+			if err != nil {
+				return nil, err
+			}
+			values = append(values, fv)
+			m[k] = fv
+		}
+		return &StructValue{Keys: keys, Values: values, M: m}, nil
 	}
 	s, ok := v.(string)
 	if !ok {

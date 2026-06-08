@@ -72,6 +72,12 @@ func registerDuckDBUDFs(db *sql.DB) error {
 	if err := registerNetUDFs(conn); err != nil {
 		return err
 	}
+	if err := registerStructUDFs(conn); err != nil {
+		return err
+	}
+	if err := registerExtraScalarUDFs(conn); err != nil {
+		return err
+	}
 	if err := registerRangeUDFs(conn); err != nil {
 		return err
 	}
@@ -127,8 +133,14 @@ type decodeArrayUDF struct{}
 
 func (*decodeArrayUDF) Config() duckdb.ScalarFuncConfig {
 	varchar, _ := duckdb.NewTypeInfo(duckdb.TYPE_VARCHAR)
+	// The argument is polymorphic: the value-layer ARRAY envelope arrives as
+	// a VARCHAR, while a DuckDB-native aggregate (array_agg / list / the
+	// ARRAY(SELECT ...) subquery lowering) hands back a native LIST. Declare
+	// the single input as TYPE_ANY so the binder accepts both without an
+	// explicit cast; the bridge branches on the Go type it receives.
+	anyType, _ := duckdb.NewTypeInfo(duckdb.TYPE_ANY)
 	return duckdb.ScalarFuncConfig{
-		InputTypeInfos: []duckdb.TypeInfo{varchar},
+		InputTypeInfos: []duckdb.TypeInfo{anyType},
 		ResultTypeInfo: varchar,
 		// A NULL array argument must decode to "[]" (an empty unnest), so
 		// route NULLs through the body rather than short-circuiting to NULL.
@@ -279,6 +291,8 @@ func vectorDistanceUDFConfig() duckdb.ScalarFuncConfig {
 // DuckDB's native array_* functions, which expect native LIST values.
 var envelopeArrayUDFs = map[string]func(...any) (any, error){
 	"googlesqlite_array_concat":             internal.GoogleSQLArrayConcat,
+	"googlesqlite_array_concat_agg_flatten": internal.GoogleSQLArrayConcatAggFlatten,
+	"googlesqlite_array_from_native":        internal.GoogleSQLArrayFromNative,
 	"googlesqlite_array_reverse":            internal.GoogleSQLArrayReverse,
 	"googlesqlite_generate_array":           internal.GoogleSQLGenerateArray,
 	"googlesqlite_generate_date_array":      internal.GoogleSQLGenerateDateArray,
