@@ -84,6 +84,9 @@ func registerDuckDBUDFs(db *sql.DB) error {
 	if err := registerNormalFuncUDFs(conn); err != nil {
 		return err
 	}
+	if err := registerChangeHistoryTableUDFs(conn); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -568,16 +571,16 @@ func resultTypeInfo(kind internal.DuckDBUDFResultKind) (duckdb.TypeInfo, error) 
 // and delegates to internal.CallNormalFunc for the decode -> body -> encode
 // round-trip.
 func registerNormalFuncUDFs(conn *sql.Conn) error {
-	for _, spec := range internal.StringFamilyUDFSpecs() {
+	for _, spec := range internal.DuckDBNormalUDFSpecs() {
 		resultInfo, err := resultTypeInfo(spec.ResultKind)
 		if err != nil {
 			return fmt.Errorf("googlesqlite: result type for %s: %w", spec.Name, err)
 		}
-		raising := &normalFuncUDF{name: spec.Name, safe: false, resultInfo: resultInfo}
+		raising := &normalFuncUDF{name: spec.Name, safe: false, resultInfo: resultInfo, volatile: spec.Volatile}
 		if err := duckdb.RegisterScalarUDF(conn, "googlesqlite_"+spec.Name, raising); err != nil {
 			return fmt.Errorf("googlesqlite: register googlesqlite_%s: %w", spec.Name, err)
 		}
-		safe := &normalFuncUDF{name: spec.Name, safe: true, resultInfo: resultInfo}
+		safe := &normalFuncUDF{name: spec.Name, safe: true, resultInfo: resultInfo, volatile: spec.Volatile}
 		if err := duckdb.RegisterScalarUDF(conn, "googlesqlite_safe_"+spec.Name, safe); err != nil {
 			return fmt.Errorf("googlesqlite: register googlesqlite_safe_%s: %w", spec.Name, err)
 		}
@@ -597,6 +600,7 @@ type normalFuncUDF struct {
 	name       string
 	safe       bool
 	resultInfo duckdb.TypeInfo
+	volatile   bool
 }
 
 func (u *normalFuncUDF) Config() duckdb.ScalarFuncConfig {
@@ -605,6 +609,7 @@ func (u *normalFuncUDF) Config() duckdb.ScalarFuncConfig {
 		VariadicTypeInfo:    anyInfo,
 		ResultTypeInfo:      u.resultInfo,
 		SpecialNullHandling: true,
+		Volatile:            u.volatile,
 	}
 }
 

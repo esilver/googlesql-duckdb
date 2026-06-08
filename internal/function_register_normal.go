@@ -370,6 +370,7 @@ var normalFuncs = []*funcInfo{
 	{Name: "int64", BindFunc: bindInt64},
 	{Name: "double", BindFunc: bindDouble},
 	{Name: "float64", BindFunc: bindDouble},
+	{Name: "typeof", BindFunc: bindTypeof},
 	{Name: "json_type", BindFunc: jsonfn.BindJsonType},
 	{Name: "json_strip_nulls", BindFunc: jsonfn.BindJsonStripNulls},
 	{Name: "json_remove", BindFunc: jsonfn.BindJsonRemove},

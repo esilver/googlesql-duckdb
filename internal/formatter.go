@@ -443,6 +443,9 @@ func (n *FunctionCallNode) FormatSQL(ctx context.Context) (string, error) {
 	if mapped, ok := duckDBRangeFuncRemap[funcName]; ok {
 		funcName = mapped
 	}
+	if mapped, ok := duckDBAeadFuncRemap[funcName]; ok {
+		funcName = mapped
+	}
 	if sql, ok := tryNativeScalarFunc(funcName, args); ok {
 		return sql, nil
 	}
@@ -520,6 +523,25 @@ var duckDBRangeFuncRemap = map[string]string{
 	"range_overlaps":       "googlesqlite_range_overlaps",
 	"range_intersect":      "googlesqlite_range_intersect",
 	"generate_range_array": "googlesqlite_generate_range_array",
+}
+
+// duckDBAeadFuncRemap maps the short names produced by the upstream
+// Encryption catalog for AEAD.ENCRYPT / KEYS.NEW_KEYSET-style calls to the
+// normal UDF names registered for the local pure-Go AEAD bodies.
+var duckDBAeadFuncRemap = map[string]string{
+	"new_keyset":             "googlesqlite_keys_new_keyset",
+	"add_key_from_raw_bytes": "googlesqlite_keys_add_key_from_raw_bytes",
+	"keyset_length":          "googlesqlite_keys_keyset_length",
+	"keyset_to_json":         "googlesqlite_keys_keyset_to_json",
+	"keyset_from_json":       "googlesqlite_keys_keyset_from_json",
+	"rotate_keyset":          "googlesqlite_keys_rotate_keyset",
+	"keyset_chain":           "googlesqlite_keys_keyset_chain",
+	"new_wrapped_keyset":     "googlesqlite_keys_new_wrapped_keyset",
+	"rewrap_keyset":          "googlesqlite_keys_rewrap_keyset",
+	"rotate_wrapped_keyset":  "googlesqlite_keys_rotate_wrapped_keyset",
+	"encrypt":                "googlesqlite_aead_encrypt",
+	"decrypt_bytes":          "googlesqlite_aead_decrypt_bytes",
+	"decrypt_string":         "googlesqlite_aead_decrypt_string",
 }
 
 // nativeBinaryOperators maps a bare GoogleSQL operator-builtin name (the
@@ -990,6 +1012,38 @@ func intervalUnitForPart(part string) (string, int) {
 	return "", 0
 }
 
+var googleSQLIntervalCallRE = regexp.MustCompile(`^googlesqlite_interval\((.+),\s*('[^']*')\)$`)
+
+func parseGoogleSQLIntervalCall(sql string) (string, string, bool) {
+	m := googleSQLIntervalCallRE.FindStringSubmatch(strings.TrimSpace(sql))
+	if m == nil {
+		return "", "", false
+	}
+	part, ok := decodeLiteralArgBody(m[2])
+	if !ok {
+		return "", "", false
+	}
+	return strings.TrimSpace(m[1]), strings.ToUpper(strings.TrimSpace(part)), true
+}
+
+func intervalWidthSeconds(count, part string) (string, bool) {
+	switch strings.ToUpper(strings.TrimSpace(part)) {
+	case "MICROSECOND":
+		return fmt.Sprintf("(%s / 1000000.0)", count), true
+	case "MILLISECOND":
+		return fmt.Sprintf("(%s / 1000.0)", count), true
+	case "SECOND":
+		return count, true
+	case "MINUTE":
+		return fmt.Sprintf("(%s * 60)", count), true
+	case "HOUR":
+		return fmt.Sprintf("(%s * 3600)", count), true
+	case "DAY":
+		return fmt.Sprintf("(%s * 86400)", count), true
+	}
+	return "", false
+}
+
 // tryNativeDatetimeFunc lowers the GoogleSQL date / datetime / time /
 // timestamp builtins to native DuckDB forms. The formatter reaches this
 // with funcName == the function's storage name (the lowercase BQ name,
@@ -1051,6 +1105,12 @@ func tryNativeDatetimeFunc(funcName string, args []string) (string, bool) {
 			return ""
 		}
 		return strings.ToUpper(strings.TrimSpace(body))
+	}
+	bucketWidth := func(i int) (string, string, bool) {
+		if i >= len(args) {
+			return "", "", false
+		}
+		return parseGoogleSQLIntervalCall(args[i])
 	}
 	// addSub lowers DATE/DATETIME/TIME/TIMESTAMP _ADD / _SUB. args are
 	// [temporal, count, part]; emit `(temporal op (count * INTERVAL
@@ -1139,6 +1199,64 @@ func tryNativeDatetimeFunc(funcName string, args []string) (string, bool) {
 		return fmt.Sprintf(
 			"CAST(date_trunc(%s, %s) AS TIME)",
 			part(1), timeLiftedToTimestamp(args[0]),
+		), true
+
+	// ---- *_BUCKET: origin + floor((value-origin)/width)*width ----
+	case "date_bucket", "googlesqlite_date_bucket":
+		if len(args) < 2 {
+			return "", false
+		}
+		count, unit, ok := bucketWidth(1)
+		if !ok || unit != "DAY" {
+			return "", false
+		}
+		origin := "DATE '1950-01-01'"
+		if len(args) >= 3 {
+			origin = args[2]
+		}
+		return fmt.Sprintf(
+			"CAST((%[2]s + (CAST(floor(CAST(date_diff('day', %[2]s, %[1]s) AS DOUBLE) / (%[3]s)) AS BIGINT) * (%[3]s) * INTERVAL '1 day')) AS DATE)",
+			args[0], origin, count,
+		), true
+	case "datetime_bucket", "googlesqlite_datetime_bucket":
+		if len(args) < 2 {
+			return "", false
+		}
+		count, unit, ok := bucketWidth(1)
+		if !ok {
+			return "", false
+		}
+		widthSeconds, ok := intervalWidthSeconds(count, unit)
+		if !ok {
+			return "", false
+		}
+		origin := "TIMESTAMP '1950-01-01 00:00:00'"
+		if len(args) >= 3 {
+			origin = args[2]
+		}
+		return fmt.Sprintf(
+			"make_timestamp(CAST(((epoch(CAST(%[2]s AS TIMESTAMP)) + floor((epoch(CAST(%[1]s AS TIMESTAMP)) - epoch(CAST(%[2]s AS TIMESTAMP))) / CAST((%[3]s) AS DOUBLE)) * CAST((%[3]s) AS DOUBLE)) * 1000000) AS BIGINT))",
+			args[0], origin, widthSeconds,
+		), true
+	case "timestamp_bucket", "googlesqlite_timestamp_bucket":
+		if len(args) < 2 {
+			return "", false
+		}
+		count, unit, ok := bucketWidth(1)
+		if !ok {
+			return "", false
+		}
+		widthSeconds, ok := intervalWidthSeconds(count, unit)
+		if !ok {
+			return "", false
+		}
+		origin := "TIMESTAMPTZ '1950-01-01 00:00:00+00'"
+		if len(args) >= 3 {
+			origin = args[2]
+		}
+		return fmt.Sprintf(
+			"to_timestamp(epoch(CAST(%[2]s AS TIMESTAMP WITH TIME ZONE)) + floor((epoch(CAST(%[1]s AS TIMESTAMP WITH TIME ZONE)) - epoch(CAST(%[2]s AS TIMESTAMP WITH TIME ZONE))) / CAST((%[3]s) AS DOUBLE)) * CAST((%[3]s) AS DOUBLE))",
+			args[0], origin, widthSeconds,
 		), true
 
 	// ---- FORMAT_*: strftime(value, format) ----
@@ -1694,6 +1812,12 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 	// and the zero-on-empty semantics.
 	if funcName == "countif" && len(args) == 1 {
 		return fmt.Sprintf("count(CASE WHEN %s THEN 1 END)", args[0]), nil
+	}
+	if funcName == "max_by" && len(args) == 2 {
+		return fmt.Sprintf("arg_max(%s,%s)", args[0], args[1]), nil
+	}
+	if funcName == "min_by" && len(args) == 2 {
+		return fmt.Sprintf("arg_min(%s,%s)", args[0], args[1]), nil
 	}
 	// DuckDB retarget: numeric / statistical / bitwise / logical
 	// aggregates resolve to their bare catalog name here (the SQLite
