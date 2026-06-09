@@ -124,7 +124,29 @@ func GoogleSQLCast(expr, fromType, toType, isSafe any) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return EncodeValue(out)
+	encoded, err := EncodeValue(out)
+	if err != nil {
+		return nil, err
+	}
+	if encoded == nil {
+		return nil, nil
+	}
+	// The UDF declares a VARCHAR result, and duckdb-go does not coerce a bare
+	// Go int64 / float64 / bool return into the declared string type (it raises
+	// "cannot cast float64 to string"). A CAST to a scalar numeric / boolean
+	// target therefore has to come back as its plain textual value so the
+	// formatter's wrapping DuckDB CAST can retype it - mirroring
+	// GoogleSQLDecodeScalar. Without this, the ANON_AVG partial rewrite, which
+	// emits CAST(googlesqlite_cast(x, INT64, DOUBLE, false) AS DOUBLE), fails
+	// before the outer CAST can apply.
+	if s, ok := encoded.(string); ok {
+		return s, nil
+	}
+	b, err := json.Marshal(encoded)
+	if err != nil {
+		return nil, err
+	}
+	return string(b), nil
 }
 
 // GoogleSQLInArray is the DuckDB-facing bridge for the googlesqlite_in_array

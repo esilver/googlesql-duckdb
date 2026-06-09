@@ -116,26 +116,34 @@ func joinDot(path []string) string {
 	return out
 }
 
-// infoSchemaTableMetaFor looks up the (view, dataset) pair attached
-// to the given resolved Table handle, or returns nil when the scan
-// is not an INFORMATION_SCHEMA virtual.
-func (c *Catalog) infoSchemaTableMetaFor(table googlesql.TableNode) *infoSchemaTableMeta {
+// infoSchemaInlineRelationFor resolves the given scan target to its
+// INFORMATION_SCHEMA view and, when matched, renders the view's live
+// rows as a self-contained DuckDB relation. The meta lookup and the
+// BuildRows call happen under a single mutex hold so the rendered
+// snapshot is internally consistent with any concurrent DDL. ok is
+// false when the scan is an ordinary table (not an info-schema view).
+func (c *Catalog) infoSchemaInlineRelationFor(table googlesql.TableNode) (string, bool, error) {
 	if table == nil {
-		return nil
+		return "", false, nil
 	}
 	name, err := table.Name()
 	if err != nil || name == "" {
-		return nil
+		return "", false, nil
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.infoSchemaTables == nil {
-		return nil
+		return "", false, nil
 	}
-	if meta, ok := c.infoSchemaTables[name]; ok {
-		return meta
+	meta, ok := c.infoSchemaTables[name]
+	if !ok {
+		return "", false, nil
 	}
-	return nil
+	relation, err := c.InfoSchemaInlineRelationSQL(meta)
+	if err != nil {
+		return "", false, err
+	}
+	return relation, true, nil
 }
 
 // infoSchemaSimpleTypeForColumn maps the view-declared column type

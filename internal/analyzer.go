@@ -2612,10 +2612,17 @@ func (a *Analyzer) newAssignmentStmtAction(ctx context.Context, _ string, _ []dr
 	}, nil
 }
 
-//nolint:unparam
-func (a *Analyzer) newTruncateStmtAction(_ context.Context, _ string, _ []driver.NamedValue, node *googlesql.ResolvedTruncateStmt) (*TruncateStmtAction, error) {
-	table, _ := m1(m1(node.TableScan()).Table()).Name()
-	return &TruncateStmtAction{query: fmt.Sprintf("DELETE FROM `%s`", table)}, nil
+func (a *Analyzer) newTruncateStmtAction(ctx context.Context, _ string, _ []driver.NamedValue, node *googlesql.ResolvedTruncateStmt) (*TruncateStmtAction, error) {
+	// Resolve the storage name through the catalog index so every path
+	// form (bare table, dataset.table, project.dataset.table, and
+	// backquoted compound) collapses to the same flattened SQLite
+	// identifier the DELETE/UPDATE/INSERT formatters use. Quote with
+	// double-quotes - DuckDB rejects backquoted identifiers.
+	table, err := getTableName(ctx, m1(node.TableScan()))
+	if err != nil {
+		return nil, err
+	}
+	return &TruncateStmtAction{query: fmt.Sprintf("DELETE FROM \"%s\"", table)}, nil
 }
 
 func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, args []driver.NamedValue, node *googlesql.ResolvedMergeStmt) (*MergeStmtAction, error) {

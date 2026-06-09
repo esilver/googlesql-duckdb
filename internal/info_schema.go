@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"fmt"
 	"strings"
 
 	googlesql "github.com/goccy/go-googlesql"
@@ -293,6 +294,83 @@ func tableOptionsRows(t *TableSpec) []tableOptionRow {
 		})
 	}
 	return out
+}
+
+// infoSchemaDuckDBColumnType maps a view-declared column type string
+// to the DuckDB column type used when the rows are materialised as an
+// inline VALUES relation. STRING columns ride through as VARCHAR
+// because their values are value-layer base64 envelopes (see
+// literalFromValue); INT64 lands as BIGINT so ordinal_position keeps
+// integer semantics. Anything else collapses to VARCHAR.
+func infoSchemaDuckDBColumnType(declared string) string {
+	switch declared {
+	case "INT64":
+		return "BIGINT"
+	case "BOOL":
+		return "BOOLEAN"
+	default:
+		return "VARCHAR"
+	}
+}
+
+// InfoSchemaInlineRelationSQL renders the INFORMATION_SCHEMA view named
+// by meta as a self-contained DuckDB relation expression that exposes
+// every declared column by name. The DuckDB fork has no SQLite
+// virtual-table layer, so the formatter splices this inline relation
+// in place of the (non-existent) eponymous vtab module: the catalog's
+// BuildRows synthesises the live rows, each value is rendered through
+// the same value-layer literal encoder the rest of the formatter uses
+// (so the row scanner decodes them identically to ordinary table
+// values), and an empty result degrades to a typed zero-row SELECT
+// rather than an illegal empty VALUES list.
+//
+// The caller must hold the catalog mutex: BuildRows reads c.tables /
+// c.functions / c.tvfs, which DDL mutates under the same lock.
+func (c *Catalog) InfoSchemaInlineRelationSQL(meta *infoSchemaTableMeta) (string, error) {
+	view := meta.view
+	colNames := make([]string, 0, len(view.Columns))
+	for _, col := range view.Columns {
+		colNames = append(colNames, fmt.Sprintf("%q", col.Name))
+	}
+
+	rows := view.BuildRows(c, meta.dataset)
+	if len(rows) == 0 {
+		// An empty VALUES clause is not valid SQL. Emit a single typed
+		// NULL row gated by WHERE FALSE so the relation carries the
+		// right column names and types but yields zero rows.
+		typedNulls := make([]string, 0, len(view.Columns))
+		for _, col := range view.Columns {
+			typedNulls = append(
+				typedNulls,
+				fmt.Sprintf("CAST(NULL AS %s) AS %q", infoSchemaDuckDBColumnType(col.Type), col.Name),
+			)
+		}
+		return fmt.Sprintf("(SELECT %s WHERE FALSE)", strings.Join(typedNulls, ", ")), nil
+	}
+
+	valueRows := make([]string, 0, len(rows))
+	for _, row := range rows {
+		cells := make([]string, 0, len(view.Columns))
+		for _, col := range view.Columns {
+			lit, err := literalFromValue(row[col.Name])
+			if err != nil {
+				return "", fmt.Errorf("googlesqlite info-schema %s.%s: render value: %w", view.Name, col.Name, err)
+			}
+			if lit == "null" {
+				// Pin the column type so a column that is NULL in every
+				// row still binds to the declared type instead of
+				// DuckDB's NULL/INTEGER default.
+				lit = fmt.Sprintf("CAST(NULL AS %s)", infoSchemaDuckDBColumnType(col.Type))
+			}
+			cells = append(cells, lit)
+		}
+		valueRows = append(valueRows, fmt.Sprintf("(%s)", strings.Join(cells, ", ")))
+	}
+	return fmt.Sprintf(
+		"(SELECT * FROM (VALUES %s) AS _info_schema(%s))",
+		strings.Join(valueRows, ", "),
+		strings.Join(colNames, ", "),
+	), nil
 }
 
 func infoSchemaDataType(typ *Type) string {

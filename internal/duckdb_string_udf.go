@@ -77,10 +77,15 @@ var duckDBNormalResultKinds = map[string]DuckDBUDFResultKind{
 	// an INT64; the date/timestamp EXTRACT forms never reach this UDF
 	// (tryFormatExtract lowers them to native date_part / CAST).
 	"extract": DuckDBResultBigint,
+	// HLL_COUNT.EXTRACT returns the sketch's cardinality as an INT64.
+	"hll_count_extract": DuckDBResultBigint,
 }
 
 var duckDBVolatileUDFNames = map[string]struct{}{
-	"generate_uuid":               {},
+	"generate_uuid": {},
+	// NEW_UUID is GoogleSQL's V1.4 alias for GENERATE_UUID: a random
+	// UUID per call, so it must stay volatile (never constant-folded).
+	"new_uuid":                    {},
 	"keys_new_keyset":             {},
 	"keys_add_key_from_raw_bytes": {},
 	"keys_rotate_keyset":          {},
@@ -160,6 +165,7 @@ var duckDBNormalUDFNames = append(append([]string{}, stringFamilyUDFNames...),
 	"like",
 	"make_array",
 	"generate_uuid",
+	"new_uuid",
 	"typeof",
 	"date_bucket",
 	"datetime_bucket",
@@ -219,6 +225,12 @@ var duckDBNormalUDFNames = append(append([]string{}, stringFamilyUDFNames...),
 	// (no DuckDB-native date_part overload accepts the interval
 	// envelope). The extracted interval field is an INT64.
 	"extract",
+	// HLL_COUNT.EXTRACT(sketch) reads a serialized HyperLogLog++ sketch and
+	// returns its INT64 cardinality. The analyzer lowers it to the bare leaf
+	// `extract`, which collides with SQL's EXTRACT keyword, so the formatter
+	// remaps that leaf to googlesqlite_hll_count_extract (duckDBExtractFuncRemap)
+	// and the body is the same hll.BindHllCountExtract registered in normalFuncs.
+	"hll_count_extract",
 )
 
 // StringFamilyUDFSpecs returns the DuckDB scalar UDF specs for the string
