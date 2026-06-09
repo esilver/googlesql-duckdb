@@ -44,8 +44,14 @@ with `-vet=off` — `go vet` can't scope the giant generated file.)
   `RegisterTableUDF`, …) backed by the pure-Go engine — and `duckdbconverge` at
   `../duckdb-wasm2go-poc/converge`. **No call-site changes** in this repo.
 - The single cgo translation unit `duckdb_aggregate_udf.go` is build-tagged
-  `//go:build cgo`; `duckdb_aggregate_udf_purego.go` (`//go:build !cgo`) stubs
-  aggregate registration for now — **scalar UDFs work; aggregates are the next tier**.
+  `//go:build cgo`; `duckdb_aggregate_udf_purego.go` (`//go:build !cgo`) is the
+  pure-Go port of the same bridge: all 32 aggregate specs (KLL, HLL, ANY_VALUE
+  HAVING, googlesqlite_agg, ST_*_AGG, st_clusterdbscan, tf_idf, and both
+  differential-privacy families) register as arity bands of ANY-parameter
+  overloads through the engine's `RegisterAggregateBandConn`, with the same
+  collect / concat / replay state model. Verified by `cmd/t2boot` (9/9
+  corpus-derived aggregate queries, including HLL INIT+MERGE over struct
+  UNNEST and the noiseless `WITH ANONYMIZATION ANON_COUNT(*)` rewrite).
 - `doLoadSpatialExtension` is a no-op (geography lowers to pure-Go
   `googlesqlite_st_*`/`s2_*` UDFs, so the native `INSTALL spatial` was a dead probe).
 
@@ -62,6 +68,13 @@ surface the emulator already uses. (See `SWAP-BLUEPRINT.md` in the PoC repo.)
 
 - ✅ Compiles `CGO_ENABLED=0`; T0 (data path, DDL/DML, cross-conn) + scalar UDFs
   (GoogleSQL string/math/`SAFE_*` builtins) run pure-Go.
-- ⏳ Aggregates (T2: the 33 specs), table functions (T3), and full conformance —
-  in progress. The mechanism for all of them (Go callbacks as DuckDB UDFs) is
-  proven; see the PoC's `SWAP-BLUEPRINT.md` for the tiered plan.
+- ✅ T2 aggregates: all 32 specs registered and exercised (`cmd/t2boot`, 9/9).
+  Needs an engine built WITH the json extension (the UNNEST lowering rides
+  `json_each`) — the PoC repo's `rebuild_fs_all.sh` produces it.
+- ⏳ Table functions (T3) and the full conformance suite — next. The mechanism
+  (Go callbacks as DuckDB UDFs) is proven; see the PoC's `SWAP-BLUEPRINT.md`.
+- Known latent issue (backend-independent): a DuckDB-level failure inside
+  `catalog.Sync` can leave a transaction open on the pooled connection
+  ("cannot start a transaction within a transaction" on later queries) — the
+  sync error path has no rollback. Not currently reproducible after the json
+  fix; revisit if conformance runs hit it.
