@@ -29,6 +29,16 @@ import (
 // only one walked; everything else surfaces as a "not yet
 // supported" error so we don't silently emit a broken query.
 
+// dq quotes a SQL identifier with double quotes, the form the
+// underlying DuckDB engine accepts. Any embedded double quote is
+// doubled per the SQL standard. The graph lowering emits identifiers
+// (table names, per-scan aliases, column names) through this helper so
+// they match the double-quote convention the rest of the formatter
+// uses; DuckDB rejects the backtick quoting BigQuery/SQLite accept.
+func dq(ident string) string {
+	return "\"" + strings.ReplaceAll(ident, "\"", "\"\"") + "\""
+}
+
 type GraphTableScanNode struct {
 	node *googlesql.ResolvedGraphTableScan
 }
@@ -161,7 +171,7 @@ func (n *GraphTableScanNode) FormatSQL(ctx context.Context) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		exprs = append(exprs, fmt.Sprintf("%s AS `%s`", exprSQL, uniqueColumnName(ctx, col)))
+		exprs = append(exprs, fmt.Sprintf("%s AS %s", exprSQL, dq(uniqueColumnName(ctx, col))))
 	}
 	return fmt.Sprintf("(SELECT %s FROM (%s))", strings.Join(exprs, ", "), innerSQL), nil
 }
@@ -365,7 +375,7 @@ func formatEdgeScan(ctx context.Context, n *googlesql.ResolvedGraphEdgeScan) (st
 	orient, _ := n.Orientation()
 	meta := graphElementMetadataFor(tbl)
 	alias := fmt.Sprintf("__g%d", nextGraphAliasID(ctx))
-	out := fmt.Sprintf("`%s` AS `%s`", tableName, alias)
+	out := fmt.Sprintf("%s AS %s", dq(tableName), dq(alias))
 	if gc := graphCtxFromContext(ctx); gc != nil {
 		for _, col := range colList {
 			id, _ := col.ColumnId()
@@ -414,7 +424,7 @@ func nodeEdgeJoinCondition(
 	}
 	parts := make([]string, 0, len(fk))
 	for i := range fk {
-		parts = append(parts, fmt.Sprintf("`%s`.`%s` = `%s`.`%s`", nodeAlias, nodeRef[i], edgeAlias, fk[i]))
+		parts = append(parts, fmt.Sprintf("%s.%s = %s.%s", dq(nodeAlias), dq(nodeRef[i]), dq(edgeAlias), dq(fk[i])))
 	}
 	return strings.Join(parts, " AND "), nil
 }
@@ -457,7 +467,7 @@ func formatPathScalarFunc(ctx context.Context, name string, n *googlesql.Resolve
 		parts := []string{}
 		for i := 0; i < len(pi.EdgeAliases); i++ {
 			for j := i + 1; j < len(pi.EdgeAliases); j++ {
-				parts = append(parts, fmt.Sprintf("`%s`.rowid <> `%s`.rowid", pi.EdgeAliases[i], pi.EdgeAliases[j]))
+				parts = append(parts, fmt.Sprintf("%s.rowid <> %s.rowid", dq(pi.EdgeAliases[i]), dq(pi.EdgeAliases[j])))
 			}
 		}
 		return "(" + strings.Join(parts, " AND ") + ")", true, nil
@@ -469,7 +479,7 @@ func formatPathScalarFunc(ctx context.Context, name string, n *googlesql.Resolve
 		parts := []string{}
 		for i := 0; i < len(pi.NodeAliases); i++ {
 			for j := i + 1; j < len(pi.NodeAliases); j++ {
-				parts = append(parts, fmt.Sprintf("`%s`.rowid <> `%s`.rowid", pi.NodeAliases[i], pi.NodeAliases[j]))
+				parts = append(parts, fmt.Sprintf("%s.rowid <> %s.rowid", dq(pi.NodeAliases[i]), dq(pi.NodeAliases[j])))
 			}
 		}
 		return "(" + strings.Join(parts, " AND ") + ")", true, nil
@@ -481,12 +491,12 @@ func formatPathScalarFunc(ctx context.Context, name string, n *googlesql.Resolve
 		if len(pi.NodeAliases) == 0 {
 			return "NULL", true, nil
 		}
-		return fmt.Sprintf("CAST(`%s`.rowid AS STRING)", pi.NodeAliases[0]), true, nil
+		return fmt.Sprintf("CAST(%s.rowid AS STRING)", dq(pi.NodeAliases[0])), true, nil
 	case "path_last":
 		if len(pi.NodeAliases) == 0 {
 			return "NULL", true, nil
 		}
-		return fmt.Sprintf("CAST(`%s`.rowid AS STRING)", pi.NodeAliases[len(pi.NodeAliases)-1]), true, nil
+		return fmt.Sprintf("CAST(%s.rowid AS STRING)", dq(pi.NodeAliases[len(pi.NodeAliases)-1])), true, nil
 	}
 	return "", false, nil
 }
@@ -507,7 +517,7 @@ func graphElementIDArrayLiteral(aliases []string) string {
 	}
 	parts := make([]string, 0, len(aliases))
 	for _, a := range aliases {
-		parts = append(parts, fmt.Sprintf("CAST(`%s`.rowid AS STRING)", a))
+		parts = append(parts, fmt.Sprintf("CAST(%s.rowid AS STRING)", dq(a)))
 	}
 	return "googlesqlite_make_array(" + strings.Join(parts, ", ") + ")"
 }
@@ -564,7 +574,7 @@ func (n *GraphNodeScanNode) FormatSQL(ctx context.Context) (string, error) {
 		return "", err
 	}
 	alias := fmt.Sprintf("__g%d", nextGraphAliasID(ctx))
-	out := fmt.Sprintf("`%s` AS `%s`", tableName, alias)
+	out := fmt.Sprintf("%s AS %s", dq(tableName), dq(alias))
 	if gc := graphCtxFromContext(ctx); gc != nil {
 		for _, col := range colList {
 			id, _ := col.ColumnId()
@@ -635,7 +645,7 @@ func (n *GraphGetElementPropertyNode) FormatSQL(ctx context.Context) (string, er
 	// column existing under the same name.
 	_, _ = elemTable.FindPropertyDefinitionByName(propName)
 	_ = elemTable
-	return fmt.Sprintf("`%s`.`%s`", alias, propName), nil
+	return fmt.Sprintf("%s.%s", dq(alias), dq(propName)), nil
 }
 
 // FormatSQL — a GraphRefScan re-uses the table reference set
@@ -757,7 +767,7 @@ func tryFormatMeasureAGG(ctx context.Context, n *googlesql.ResolvedAggregateFunc
 	// a single column / "*", so wrap it directly.
 	innerSQL := innerExpr
 	if innerSQL != "*" {
-		innerSQL = fmt.Sprintf("`%s`.`%s`", alias, innerExpr)
+		innerSQL = fmt.Sprintf("%s.%s", dq(alias), dq(innerExpr))
 	} else {
 		innerSQL = "1"
 	}
@@ -806,7 +816,7 @@ func parseMeasureSQL(s string) (kind, inner string, err error) {
 // simplest such key — it's the integer primary key alias unique
 // per row, exactly what the AGG locking-key dedup needs.
 func keySQLForElement(_ googlesql.GraphElementTableNode, alias string) (string, error) {
-	return fmt.Sprintf("`%s`.rowid", alias), nil
+	return fmt.Sprintf("%s.rowid", dq(alias)), nil
 }
 
 // tryFormatGraphElementFunc lowers the Spanner graph-element
@@ -895,7 +905,7 @@ func tryFormatGraphElementFunc(ctx context.Context, n *googlesql.ResolvedFunctio
 	case "labels":
 		return graphStringArrayLiteral(meta.Labels), true, nil
 	case "element_id":
-		return fmt.Sprintf("CAST(`%s`.rowid AS STRING)", alias), true, nil
+		return fmt.Sprintf("CAST(%s.rowid AS STRING)", dq(alias)), true, nil
 	case "element_definition_name":
 		lit, _ := literalFromValue(value.StringValue(meta.Name))
 		return lit, true, nil
@@ -905,12 +915,12 @@ func tryFormatGraphElementFunc(ctx context.Context, n *googlesql.ResolvedFunctio
 		if !meta.IsEdge || len(meta.SrcFKCols) == 0 {
 			return "NULL", true, nil
 		}
-		return fmt.Sprintf("CAST(`%s`.`%s` AS STRING)", alias, meta.SrcFKCols[0]), true, nil
+		return fmt.Sprintf("CAST(%s.%s AS STRING)", dq(alias), dq(meta.SrcFKCols[0])), true, nil
 	case "destination_node_id":
 		if !meta.IsEdge || len(meta.DstFKCols) == 0 {
 			return "NULL", true, nil
 		}
-		return fmt.Sprintf("CAST(`%s`.`%s` AS STRING)", alias, meta.DstFKCols[0]), true, nil
+		return fmt.Sprintf("CAST(%s.%s AS STRING)", dq(alias), dq(meta.DstFKCols[0])), true, nil
 	}
 	return "", false, nil
 }

@@ -1,9 +1,9 @@
-internal/formatter.go:1854 - HIGH - `IFERROR` always decodes scalar try arms as value-layer `VARCHAR`; native expressions like `1 + 2` are `BIGINT`, so `IFERROR(1 + 2, 99)` now fails binding `googlesqlite_decode_scalar(BIGINT)`.
+internal/functions/aggregate/agg.go:62 - HIGH - `COUNT(expr)` re-aggregation counts locked rows including NULL values; BigQuery `COUNT(expr)` must skip NULLs. `COUNT(*)` is the only row-count case.
 
-duckdb_aggregate_udf.go:399 - HIGH - `HLL_COUNT.MERGE` is registered with default `VARCHAR` envelope despite returning `INT64`; top-level selects decode later, but composed SQL sees a string/envelope instead of numeric.
+internal/functions/aggregate/agg.go:91 - HIGH - `SUM(INT64)` re-aggregation sums via `float64` then casts back to `int64`, losing precision for values above 2^53 and breaking type round-trips.
 
-duckdb_aggregate_udf.go:406 - MEDIUM - `having_any_value` also uses default `VARCHAR` aggregate result for type-preserving `ANY_VALUE`; numeric/typed results round-trip only at row scan, breaking composition inside SQL.
+internal/formatter.go:2548 - HIGH - ST_CLUSTERDBSCAN reuses the analytic `OVER` clause as-is; with `ORDER BY` DuckDB aggregate windows default to a prefix frame, so clustering is computed over rows up to the current row, not the whole partition.
 
-internal/info_schema.go:336 - MEDIUM - `INFORMATION_SCHEMA` rows are materialized during format/prepare, so prepared/reused statements can return stale catalog rows after DDL instead of execution-time state.
+internal/graph_scan_node.go:770 - MED - MEASURE inner expressions are treated as a single quoted column name; `MEASURE(SUM(x + y))` lowers to `"alias"."x + y"` instead of evaluating the expression.
 
-Targeted specs mostly passed; `TestIferrorNoError` failed with the first issue.
+internal/graph_scan_node.go:819 - MED - AGG locking key ignores registered graph element key metadata and uses physical `rowid`; this diverges from element-key semantics and can mis-dedup if logical element identity is not physical-row identity.

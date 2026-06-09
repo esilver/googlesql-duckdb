@@ -2239,6 +2239,15 @@ func (n *AnalyticFunctionCallNode) FormatSQL(ctx context.Context) (string, error
 	// `$` (e.g. `$count_star` for COUNT(*)). Strip it for lookup.
 	rawName = strings.TrimPrefix(rawName, "$")
 
+	// ST_CLUSTERDBSCAN has no native analytic form and the SQLite
+	// emulation hack does not survive DuckDB's unordered parallel
+	// scan, so lower it to a native list_extract(... OVER (), ...)
+	// window expression backed by the st_clusterdbscan window
+	// aggregate. See formatStClusterDBSCAN.
+	if rawName == "st_clusterdbscan" {
+		return n.formatStClusterDBSCAN(ctx, orderColumns)
+	}
+
 	// SUM(DISTINCT x) / COUNT(DISTINCT x) / AVG(DISTINCT x) — SQLite
 	// rejects DISTINCT in OVER, but our custom natives know how to
 	// dedupe. Take precedence over the SQLite-native fast path.
@@ -2436,6 +2445,18 @@ func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName 
 	}
 	call := fmt.Sprintf("%s(%s)", sqliteName, strings.Join(valueArgs, ","))
 
+	over, err := n.windowOverClause(ctx, orderColumns)
+	if err != nil {
+		return "", err
+	}
+	return call + " " + over, nil
+}
+
+// windowOverClause assembles the `OVER (...)` clause shared by the
+// native window path from the partition / order / frame information the
+// predecessor tucked into the analytic context. Returns `OVER ()` when
+// no window spec applies.
+func (n *AnalyticFunctionCallNode) windowOverClause(ctx context.Context, orderColumns []*analyticOrderBy) (string, error) {
 	var clauses []string
 	if cols := analyticPartitionColumnNamesFromContext(ctx); len(cols) > 0 {
 		clauses = append(clauses, "PARTITION BY "+strings.Join(cols, ","))
@@ -2469,9 +2490,92 @@ func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName 
 	}
 
 	if len(clauses) == 0 {
-		return call + " OVER ()", nil
+		return "OVER ()", nil
 	}
-	return call + " OVER (" + strings.Join(clauses, " ") + ")", nil
+	return "OVER (" + strings.Join(clauses, " ") + ")", nil
+}
+
+// formatStClusterDBSCAN lowers the analytic ST_CLUSTERDBSCAN to a
+// native-DuckDB window expression. DBSCAN assigns each row a cluster id
+// computed from the whole partition, which has no native DuckDB
+// analytic; the SQLite backend faked it with a correlated-subquery +
+// rowid-marker hack that depended on the engine preserving scan order
+// (DuckDB's parallel scan does not, so that path mis-aligns). Instead
+// emit:
+//
+//	list_extract(st_clusterdbscan(geo, eps, min_pts) OVER (w),
+//	             row_number() OVER (w))
+//
+// st_clusterdbscan is registered as a window aggregate (see
+// duckdbAggSpecs) that returns the partition's ARRAY<INT64> of cluster
+// ids in window order; within a single window operator DuckDB feeds
+// that aggregate rows in the same order row_number() numbers them, so
+// list_extract(array, row_number) projects each row's own cluster id. A
+// noise / empty / NULL row is a NULL array element, which list_extract
+// surfaces as SQL NULL - matching the upstream "unclustered -> NULL".
+func (n *AnalyticFunctionCallNode) formatStClusterDBSCAN(ctx context.Context, orderColumns []*analyticOrderBy) (string, error) {
+	var valueArgs []string
+	for _, a := range m1(n.node.ResolvedFunctionCallBase.ArgumentList()) {
+		arg, err := newNode(a).FormatSQL(ctx)
+		if err != nil {
+			return "", err
+		}
+		valueArgs = append(valueArgs, arg)
+	}
+	over, err := n.windowOverClause(ctx, orderColumns)
+	if err != nil {
+		return "", err
+	}
+	// Thread the row's 1-based position into the aggregate as a 4th
+	// argument so it can slot each geography by row position rather than
+	// by DuckDB's (unordered, parallel) feed order. DuckDB rejects a
+	// window function (row_number() OVER ()) as the argument of another
+	// window function, so reuse the predecessor emulation's row_id wrap:
+	// markAnalyticEmulationUsed tells the surrounding AnalyticScanNode to
+	// materialize `ROW_NUMBER() OVER() AS "row_id"`, and both the
+	// aggregate argument and the extractor index reference that single
+	// plain column - so the place-and-read position is identical per row
+	// and alignment never depends on two window calls iterating in the
+	// same order. st_clusterdbscan returns the partition's cluster-id
+	// ARRAY (value-layer base64 envelope) ordered by "row_id";
+	// array_at_ordinal pulls the current row's element by the same
+	// "row_id"; decode_scalar + CAST retype it to the BIGINT the analyzer
+	// assigns ST_CLUSTERDBSCAN. A noise/empty/NULL element decodes to SQL
+	// NULL, which CAST preserves.
+	markAnalyticEmulationUsed(ctx)
+	// DBSCAN clusters the WHOLE partition, so the aggregate must always
+	// receive every partition row. A bare OVER () already feeds the full
+	// partition, but an OVER (... ORDER BY ...) would make DuckDB default
+	// to a growing RANGE prefix frame and the aggregate would cluster
+	// only rows up to the current one. Force an explicit full-partition
+	// frame whenever an ORDER BY is present so the clustering is computed
+	// over the entire partition regardless of ordering.
+	over = forceFullPartitionFrame(over)
+	rowID := `"row_id"`
+	aggArgs := append(append([]string{}, valueArgs...), rowID)
+	arr := fmt.Sprintf("st_clusterdbscan(%s) %s", strings.Join(aggArgs, ","), over)
+	elem := fmt.Sprintf("googlesqlite_array_at_ordinal(%s, %s)", arr, rowID)
+	return fmt.Sprintf("CAST(googlesqlite_decode_scalar(%s) AS BIGINT)", elem), nil
+}
+
+// forceFullPartitionFrame appends an explicit full-partition frame to an
+// OVER clause that carries an ORDER BY but no frame, so a whole-partition
+// aggregate (DBSCAN) is fed every partition row rather than a growing
+// prefix. A bare `OVER ()` (no ORDER BY) already spans the full partition
+// and is returned unchanged; an OVER clause that already names a frame is
+// also left as is.
+func forceFullPartitionFrame(over string) string {
+	if !strings.Contains(over, "ORDER BY") {
+		return over
+	}
+	if strings.Contains(over, "ROWS") || strings.Contains(over, "RANGE") || strings.Contains(over, "GROUPS") {
+		return over
+	}
+	const frame = " ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING"
+	if i := strings.LastIndex(over, ")"); i >= 0 {
+		return over[:i] + frame + over[i:]
+	}
+	return over
 }
 
 // formatNativeFrame turns the resolved-tree frame into a SQLite frame
