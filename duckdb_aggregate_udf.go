@@ -405,11 +405,34 @@ func duckdbAggSpecs() []aggSpec {
 		// the extremum of key.
 		{name: "having_any_value", minParams: 3, maxParams: 3, newAgg: aggregate.BindHavingAnyValue()},
 
+		// Property-graph MEASURE re-aggregation: AGG(measure) over a graph
+		// element. The graph lowering (internal/graph_scan_node.go) emits
+		// googlesqlite_agg(value_expr, locking_key, 'KIND'), always three
+		// arguments. The aggregator dedups contributions by locking key and
+		// finalizes with the measure's inner aggregate kind (SUM / AVG / MIN /
+		// MAX / COUNT / COUNT_DISTINCT / ANY_VALUE), returning the value-layer
+		// envelope like the other non-DP aggregates.
+		{name: "googlesqlite_agg", minParams: 1, maxParams: 3, newAgg: aggregate.BindAGG()},
+
 		// Geography aggregates: single GEOGRAPHY argument (the value-layer
 		// envelope).
 		{name: "st_centroid_agg", minParams: 1, maxParams: 1, newAgg: geofn.BindStCentroidAgg()},
 		{name: "st_union_agg", minParams: 1, maxParams: 1, newAgg: geofn.BindStUnionAgg()},
 		{name: "st_extent", minParams: 1, maxParams: 1, newAgg: geofn.BindStExtentAgg()},
+
+		// ST_CLUSTERDBSCAN(geo, eps, min_pts) OVER (w) has no native
+		// DuckDB analytic form (DBSCAN assigns a per-row cluster id
+		// computed from the whole partition). The formatter lowers it to
+		// array_at_ordinal(st_clusterdbscan(geo, eps, min_pts,
+		// row_number() OVER (w)) OVER (w), row_number() OVER (w)): this
+		// aggregate runs as the window function and returns the
+		// partition's ARRAY<INT64> of cluster ids ordered by the 4th
+		// (row_number) argument, and array_at_ordinal picks the current
+		// row's id by the same row_number. Like tf_idf it only ever runs
+		// under OVER (), so singleState routes every frame row into the
+		// one accumulator. Arity is exactly 4 (geo, eps, min_pts,
+		// row_number); no option markers are appended on this path.
+		{name: "st_clusterdbscan", minParams: 4, maxParams: 4, newAgg: geofn.BindStClusterDBSCANAgg(), singleState: true},
 
 		// Text analysis: a registered aggregate auto-works as a window
 		// function under OVER (). The formatter is taught to emit tf_idf
