@@ -69,10 +69,16 @@ surface the emulator already uses. (See `SWAP-BLUEPRINT.md` in the PoC repo.)
 - ✅ Compiles `CGO_ENABLED=0`; T0 (data path, DDL/DML, cross-conn) + scalar UDFs
   (GoogleSQL string/math/`SAFE_*` builtins) run pure-Go.
 - ✅ T2 aggregates: all 32 specs registered and exercised (`cmd/t2boot`, 9/9).
-  Needs an engine built WITH the json extension (the UNNEST lowering rides
-  `json_each`) — the PoC repo's `rebuild_fs_all.sh` produces it.
-- ⏳ Table functions (T3) and the full conformance suite — next. The mechanism
-  (Go callbacks as DuckDB UDFs) is proven; see the PoC's `SWAP-BLUEPRINT.md`.
+  Needs an engine built WITH the json + icu extensions (the UNNEST lowering
+  rides `json_each`; timezone-aware temporals need icu) — the PoC repo's
+  `rebuild_fs_all.sh` produces it.
+- ✅ **Conformance: 972 / 994 = 97.79% — EXACT parity with the cgo backend.**
+  Identical pass/fail/skip sets: the 14 failures are the same out-of-scope
+  `bigquery/functions/{search,objectref}` external-service cases the cgo
+  baseline fails, and the 8 skips match. Run it pure-Go with:
+  `CGO_ENABLED=0 GOWORK=off GOFLAGS=-mod=mod go test -vet=off
+  -gcflags='duckdbconverge/genpkg=-N -l -c=16' -c -o gsx.test . &&
+  ./gsx.test -test.run 'TestSpec/(googlesql|bigquery)' -test.parallel 4`.
 - Known latent issue (backend-independent): a DuckDB-level failure inside
   `catalog.Sync` can leave a transaction open on the pooled connection
   ("cannot start a transaction within a transaction" on later queries) — the
