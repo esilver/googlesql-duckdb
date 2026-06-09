@@ -7,6 +7,12 @@ cases:
       INTERSECT DISTINCT
       (SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4)
     expected:
+      # INTERSECT DISTINCT has no ORDER BY, so GoogleSQL leaves the row
+      # order unspecified. DuckDB's hash set-intersection emits these rows
+      # in an arbitrary, run-to-run-unstable order (the source of the
+      # pre-existing flake here), so assert set-equality on the shared
+      # values 2,3 rather than a fixed sequence.
+      unordered: true
       rows:
         - [2]
         - [3]

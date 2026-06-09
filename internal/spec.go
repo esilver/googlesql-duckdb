@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"time"
 
@@ -109,10 +110,26 @@ func (s *FunctionSpec) CallSQL(ctx context.Context, callNode *ResolvedBaseFuncti
 	} else {
 		body = s.Body
 	}
-	for i := 0; i < len(s.Args); i++ {
-		argRef := fmt.Sprintf("@%s", s.Args[i].Name)
+	// Substitute longer argument names first so a parameter named `x`
+	// cannot clobber the `$x...` prefix of a sibling named `x2`.
+	order := make([]int, len(s.Args))
+	for i := range s.Args {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		return len(s.Args[order[a]].Name) > len(s.Args[order[b]].Name)
+	})
+	for _, i := range order {
 		value := argValues[i]
-		body = strings.Replace(body, argRef, value, -1)
+		// Argument references reach the body under two sigils depending
+		// on the function language. SQL-expression bodies are formatted
+		// through ArgumentRefNode, which on the DuckDB target renders an
+		// argument as `$name`; the JavaScript path (newFunctionSpec)
+		// hand-builds its googlesqlite_eval_javascript call with `@name`
+		// placeholders. Substitute both so either body form binds the
+		// caller's value.
+		body = strings.ReplaceAll(body, fmt.Sprintf("@%s", s.Args[i].Name), value)
+		body = strings.ReplaceAll(body, fmt.Sprintf("$%s", s.Args[i].Name), value)
 	}
 	return fmt.Sprintf("( %s )", body), nil
 }

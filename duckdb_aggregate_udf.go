@@ -76,18 +76,23 @@ static void agg_destroy_cb(duckdb_aggregate_state *states, idx_t count) {
 // ARRAY input), and the Go value decoder re-types it. The result is VARCHAR
 // because every aggregate here produces a richer value-layer type that
 // EncodeValue renders as the base64 VARCHAR envelope.
-static duckdb_aggregate_function build_one_overload(const char *name, idx_t param_count, void *extra_info) {
+static duckdb_aggregate_function build_one_overload(const char *name, idx_t param_count, duckdb_type result_type_id, void *extra_info) {
     duckdb_aggregate_function fn = duckdb_create_aggregate_function();
     duckdb_aggregate_function_set_name(fn, name);
 
     duckdb_logical_type any_type = duckdb_create_logical_type(DUCKDB_TYPE_ANY);
-    duckdb_logical_type varchar = duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR);
+    // Most aggregates here produce a value-layer envelope and declare VARCHAR;
+    // the differential-privacy aggregates produce a native DOUBLE / BIGINT
+    // because their result is consumed by ordinary SQL (CAST AS INT64, ABS,
+    // arithmetic) and by the result-set materializer, neither of which decode
+    // the base64 envelope.
+    duckdb_logical_type result_type = duckdb_create_logical_type(result_type_id);
     for (idx_t i = 0; i < param_count; i++) {
         duckdb_aggregate_function_add_parameter(fn, any_type);
     }
-    duckdb_aggregate_function_set_return_type(fn, varchar);
+    duckdb_aggregate_function_set_return_type(fn, result_type);
     duckdb_destroy_logical_type(&any_type);
-    duckdb_destroy_logical_type(&varchar);
+    duckdb_destroy_logical_type(&result_type);
 
     duckdb_aggregate_function_set_functions(
         fn, agg_state_size_cb, agg_init_cb, agg_update_cb, agg_combine_cb, agg_finalize_cb);
@@ -109,10 +114,10 @@ static duckdb_aggregate_function build_one_overload(const char *name, idx_t para
 // binder match whatever arity arrives; the Go body only reads the arguments it
 // needs and ignores the rest. Returns DuckDBError / DuckDBSuccess.
 static duckdb_state register_googlesqlite_aggregate(
-        duckdb_connection con, const char *name, idx_t min_params, idx_t max_params, void *extra_info) {
+        duckdb_connection con, const char *name, idx_t min_params, idx_t max_params, duckdb_type result_type_id, void *extra_info) {
     duckdb_aggregate_function_set set = duckdb_create_aggregate_function_set(name);
     for (idx_t p = min_params; p <= max_params; p++) {
-        duckdb_aggregate_function fn = build_one_overload(name, p, extra_info);
+        duckdb_aggregate_function fn = build_one_overload(name, p, result_type_id, extra_info);
         duckdb_state add_state = duckdb_add_aggregate_function_to_set(set, fn);
         duckdb_destroy_aggregate_function(&fn);
         if (add_state == DuckDBError) {
@@ -246,6 +251,16 @@ static const char *agg_read_string_ptr(duckdb_vector v, idx_t r) {
 static void agg_write_string(duckdb_vector v, idx_t r, const char *s, idx_t len) {
     duckdb_vector_assign_string_element_len(v, r, s, len);
 }
+// agg_write_double / agg_write_int64 assign one native numeric result element.
+// Used by the differential-privacy aggregates whose result vector is declared
+// DOUBLE / BIGINT (so the surrounding SQL's CAST / arithmetic operate on a real
+// number rather than the base64 value-layer envelope).
+static void agg_write_double(duckdb_vector v, idx_t r, double d) {
+    ((double *)duckdb_vector_get_data(v))[r] = d;
+}
+static void agg_write_int64(duckdb_vector v, idx_t r, int64_t i) {
+    ((int64_t *)duckdb_vector_get_data(v))[r] = i;
+}
 // agg_write_null marks one result element NULL.
 static void agg_write_null(duckdb_vector v, idx_t r) {
     duckdb_vector_ensure_validity_writable(v);
@@ -286,8 +301,10 @@ import (
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
 
-	"github.com/goccy/googlesqlite/internal/functions/helper"
+	"github.com/goccy/googlesqlite/internal/functions/aggregate"
 	geofn "github.com/goccy/googlesqlite/internal/functions/geography"
+	"github.com/goccy/googlesqlite/internal/functions/helper"
+	"github.com/goccy/googlesqlite/internal/functions/hll"
 	"github.com/goccy/googlesqlite/internal/functions/kll"
 	"github.com/goccy/googlesqlite/internal/value"
 )
@@ -309,6 +326,11 @@ type aggSpec struct {
 	minParams C.idx_t
 	maxParams C.idx_t
 	newAgg    func() *helper.Aggregator
+	// resultType is the DuckDB result type to declare. Zero value means
+	// VARCHAR (the value-layer envelope every non-DP aggregate returns).
+	// The differential-privacy aggregates declare DOUBLE / BIGINT so their
+	// numeric result flows through native SQL and the result materializer.
+	resultType C.duckdb_type
 	// singleState routes every input row to states[0] in the update callback
 	// instead of scattering row r to states[r]. It is set for aggregates that
 	// only ever run through DuckDB's window path under OVER () (tf_idf): there
@@ -327,6 +349,9 @@ type aggSpec struct {
 type aggConstructor struct {
 	newAgg      func() *helper.Aggregator
 	singleState bool
+	// resultType mirrors aggSpec.resultType so the finalize callback can
+	// decide whether to write a native numeric or the VARCHAR envelope.
+	resultType C.duckdb_type
 }
 
 // aggState is the Go side of one DuckDB aggregate state. It accumulates the raw
@@ -359,6 +384,27 @@ func duckdbAggSpecs() []aggSpec {
 		{name: "merge_point_int64", minParams: 1, maxParams: 3, newAgg: kll.BindMergePointInt64()},
 		{name: "merge_point_float64", minParams: 1, maxParams: 3, newAgg: kll.BindMergePointFloat64()},
 
+		// BigQuery HLL_COUNT sketch aggregates (HyperLogLog++). HLL_COUNT.INIT
+		// resolves to the bare leaf `init` and takes the value plus an optional
+		// precision (the analyzer may inject a default trailing arg), so a 1..2
+		// arity band covers both call shapes; the body reads args[0] and the
+		// optional args[1] precision. HLL_COUNT.MERGE resolves to `merge` and
+		// folds the per-group sketch BYTES into one cardinality. The bodies are
+		// the same pure-Go aggregators the SQLite path uses (hll.BindHllCount*).
+		// HLL_COUNT.EXTRACT is a scalar: it rides the googlesqlite_hll_count_extract
+		// UDF registered by registerNormalFuncUDFs (the formatter remaps the bare
+		// `extract` leaf to it). HLL_COUNT.MERGE_PARTIAL stays on the SQLite path
+		// (its spec is status=partial, documentation-only on this target).
+		{name: "init", minParams: 1, maxParams: 2, newAgg: hll.BindHllCountInit()},
+		{name: "merge", minParams: 1, maxParams: 1, newAgg: hll.BindHllCountMerge()},
+
+		// ANY_VALUE(value HAVING { MAX | MIN } key): the formatter lowers
+		// the HAVING modifier to having_any_value(value, key, 'MAX'|'MIN'),
+		// always emitting exactly three arguments. The aggregate buffers
+		// every (value, key) pair and at finalize returns a value tied to
+		// the extremum of key.
+		{name: "having_any_value", minParams: 3, maxParams: 3, newAgg: aggregate.BindHavingAnyValue()},
+
 		// Geography aggregates: single GEOGRAPHY argument (the value-layer
 		// envelope).
 		{name: "st_centroid_agg", minParams: 1, maxParams: 1, newAgg: geofn.BindStCentroidAgg()},
@@ -370,6 +416,39 @@ func duckdbAggSpecs() []aggSpec {
 		// through the native window path (nativeWindowFuncMap), so it arrives
 		// as a clean tf_idf(tokens) OVER () call with no option markers.
 		{name: "tf_idf", minParams: 1, maxParams: 1, newAgg: newTfIdfAggregator, singleState: true},
+
+		// Differential-privacy / anonymization OUTER aggregates. The
+		// analyzer's RewriteAnonymization stage lowers SELECT WITH
+		// ANONYMIZATION / WITH DIFFERENTIAL_PRIVACY into a per-privacy-unit
+		// partial aggregate feeding one of these. The WITH ANONYMIZATION
+		// surface emits the bare catalog names (anon_sum, anon_avg, ...) -
+		// note ANON_COUNT lowers to anon_sum over per-user counts. The WITH
+		// DIFFERENTIAL_PRIVACY surface emits $differential_privacy_* names
+		// that the formatter prefixes to googlesqlite_differential_privacy_*
+		// (and COUNT lowers to _sum likewise). The arity bands span the
+		// minimal (partial only) through the fullest (array, positional,
+		// lo, hi, epsilon, delta = 6) call shapes; each body reads the
+		// arguments it needs via parseDPArgs and ignores the rest.
+		{name: "anon_sum", minParams: 1, maxParams: 5, newAgg: aggregate.BindDifferentialPrivacySum(), resultType: C.DUCKDB_TYPE_DOUBLE},
+		{name: "anon_count", minParams: 1, maxParams: 5, newAgg: aggregate.BindDifferentialPrivacyCount(), resultType: C.DUCKDB_TYPE_BIGINT},
+		{name: "anon_count_star", minParams: 1, maxParams: 5, newAgg: aggregate.BindDifferentialPrivacyCountStar(), resultType: C.DUCKDB_TYPE_BIGINT},
+		{name: "anon_avg", minParams: 1, maxParams: 5, newAgg: aggregate.BindDifferentialPrivacyAvg(), resultType: C.DUCKDB_TYPE_DOUBLE},
+		{name: "anon_var_pop", minParams: 1, maxParams: 5, newAgg: aggregate.BindDifferentialPrivacyVarPop(), resultType: C.DUCKDB_TYPE_DOUBLE},
+		{name: "anon_stddev_pop", minParams: 1, maxParams: 5, newAgg: aggregate.BindDifferentialPrivacyStddevPop(), resultType: C.DUCKDB_TYPE_DOUBLE},
+		{name: "anon_percentile_cont", minParams: 1, maxParams: 6, newAgg: aggregate.BindDifferentialPrivacyPercentileCont(), resultType: C.DUCKDB_TYPE_DOUBLE},
+		// QUANTILES returns an ARRAY of cut points; it stays on the VARCHAR
+		// value-layer envelope. Its examples are nondeterministic (verify the
+		// query runs), so the envelope result is not asserted by value.
+		{name: "anon_quantiles", minParams: 1, maxParams: 6, newAgg: aggregate.BindDifferentialPrivacyQuantiles()},
+
+		{name: "googlesqlite_differential_privacy_sum", minParams: 1, maxParams: 5, newAgg: aggregate.BindDifferentialPrivacySum(), resultType: C.DUCKDB_TYPE_DOUBLE},
+		{name: "googlesqlite_differential_privacy_count", minParams: 1, maxParams: 5, newAgg: aggregate.BindDifferentialPrivacyCount(), resultType: C.DUCKDB_TYPE_BIGINT},
+		{name: "googlesqlite_differential_privacy_count_star", minParams: 1, maxParams: 5, newAgg: aggregate.BindDifferentialPrivacyCountStar(), resultType: C.DUCKDB_TYPE_BIGINT},
+		{name: "googlesqlite_differential_privacy_avg", minParams: 1, maxParams: 5, newAgg: aggregate.BindDifferentialPrivacyAvg(), resultType: C.DUCKDB_TYPE_DOUBLE},
+		{name: "googlesqlite_differential_privacy_var_pop", minParams: 1, maxParams: 5, newAgg: aggregate.BindDifferentialPrivacyVarPop(), resultType: C.DUCKDB_TYPE_DOUBLE},
+		{name: "googlesqlite_differential_privacy_stddev_pop", minParams: 1, maxParams: 5, newAgg: aggregate.BindDifferentialPrivacyStddevPop(), resultType: C.DUCKDB_TYPE_DOUBLE},
+		{name: "googlesqlite_differential_privacy_percentile_cont", minParams: 1, maxParams: 6, newAgg: aggregate.BindDifferentialPrivacyPercentileCont(), resultType: C.DUCKDB_TYPE_DOUBLE},
+		{name: "googlesqlite_differential_privacy_quantiles", minParams: 1, maxParams: 6, newAgg: aggregate.BindDifferentialPrivacyQuantiles()},
 	}
 }
 
@@ -404,7 +483,13 @@ func registerDuckDBAggregates(db *sql.DB) error {
 	}
 
 	for _, spec := range duckdbAggSpecs() {
-		ctor := &aggConstructor{newAgg: spec.newAgg, singleState: spec.singleState}
+		// A zero resultType means "use the default VARCHAR envelope".
+		// DUCKDB_TYPE_INVALID is the C enum's zero value, so resolve it here.
+		resultType := spec.resultType
+		if resultType == C.duckdb_type(0) {
+			resultType = C.DUCKDB_TYPE_VARCHAR
+		}
+		ctor := &aggConstructor{newAgg: spec.newAgg, singleState: spec.singleState, resultType: resultType}
 		h := cgo.NewHandle(ctor)
 		hp := &h
 		liveAggMu.Lock()
@@ -413,7 +498,7 @@ func registerDuckDBAggregates(db *sql.DB) error {
 
 		cName := C.CString(spec.name)
 		state := C.register_googlesqlite_aggregate(
-			rawConn, cName, spec.minParams, spec.maxParams, unsafe.Pointer(hp))
+			rawConn, cName, spec.minParams, spec.maxParams, resultType, unsafe.Pointer(hp))
 		C.free(unsafe.Pointer(cName))
 		if state == C.DuckDBError {
 			return fmt.Errorf("googlesqlite: register aggregate %q failed", spec.name)
@@ -561,7 +646,7 @@ func googlesqliteAggFinalize(info C.duckdb_function_info, source *C.duckdb_aggre
 			return
 		}
 		rowIdx := C.idx_t(i) + offset
-		writeResult(result, rowIdx, out)
+		writeResult(result, rowIdx, out, st.ctor.resultType)
 	}
 }
 
@@ -688,13 +773,34 @@ func normalizeJSONScalar(v any) any {
 	return v
 }
 
-// writeResult writes one aggregate result into the result vector at rowIdx. The
-// declared result type is VARCHAR, and helper.Aggregator.Done returns the
-// value-layer wire form: nil for a NULL result, or the base64 envelope string
-// for the richer types these aggregates produce. A non-string, non-nil result
-// is re-encoded defensively through the value layer so the column still decodes.
-func writeResult(result C.duckdb_vector, rowIdx C.idx_t, out any) {
+// writeResult writes one aggregate result into the result vector at rowIdx.
+// helper.Aggregator.Done returns the value-layer wire form: nil for a NULL
+// result, a bare int64 / float64 / bool for numeric/boolean results, or the
+// base64 envelope string for the richer types.
+//
+// resultType selects the write path. DOUBLE / BIGINT result columns (the
+// differential-privacy aggregates) take the native numeric value directly so
+// the surrounding SQL's CAST / arithmetic and the result-set materializer see a
+// real number. The default VARCHAR column re-encodes a bare primitive back into
+// the value-layer envelope so it round-trips through DecodeValue on scan.
+func writeResult(result C.duckdb_vector, rowIdx C.idx_t, out any, resultType C.duckdb_type) {
 	if out == nil {
+		C.agg_write_null(result, rowIdx)
+		return
+	}
+	switch resultType {
+	case C.DUCKDB_TYPE_DOUBLE:
+		if f, ok := toFloat64Result(out); ok {
+			C.agg_write_double(result, rowIdx, C.double(f))
+			return
+		}
+		C.agg_write_null(result, rowIdx)
+		return
+	case C.DUCKDB_TYPE_BIGINT:
+		if i, ok := toInt64Result(out); ok {
+			C.agg_write_int64(result, rowIdx, C.int64_t(i))
+			return
+		}
 		C.agg_write_null(result, rowIdx)
 		return
 	}
@@ -717,4 +823,41 @@ func writeResult(result C.duckdb_vector, rowIdx C.idx_t, out any) {
 	cs := C.CString(s)
 	C.agg_write_string(result, rowIdx, cs, C.idx_t(len(s)))
 	C.free(unsafe.Pointer(cs))
+}
+
+// toFloat64Result coerces a Done() result (a bare float64 / int64, or a value-
+// layer envelope string the body produced for a FLOAT/INT value) into a
+// float64 for a DOUBLE result column.
+func toFloat64Result(out any) (float64, bool) {
+	switch v := out.(type) {
+	case float64:
+		return v, true
+	case int64:
+		return float64(v), true
+	case string:
+		if dv, err := value.DecodeValue(v); err == nil && dv != nil {
+			if f, err := dv.ToFloat64(); err == nil {
+				return f, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// toInt64Result coerces a Done() result into an int64 for a BIGINT result
+// column.
+func toInt64Result(out any) (int64, bool) {
+	switch v := out.(type) {
+	case int64:
+		return v, true
+	case float64:
+		return int64(v), true
+	case string:
+		if dv, err := value.DecodeValue(v); err == nil && dv != nil {
+			if i, err := dv.ToInt64(); err == nil {
+				return i, true
+			}
+		}
+	}
+	return 0, false
 }

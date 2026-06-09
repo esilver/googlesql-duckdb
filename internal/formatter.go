@@ -194,6 +194,16 @@ func getFuncNameAndArgs(ctx context.Context, node *ResolvedBaseFunctionCallNode,
 		if _, ok := nativelySafeOperatorBuiltins[bare]; ok {
 			existsNormalFuncForSafe = true
 		}
+		// The array-element accessors ($array_at_offset / $array_at_ordinal)
+		// raise on an out-of-range index. Their NULL-on-failure forms are
+		// registered as standalone googlesqlite_safe_array_at_* UDFs (the
+		// default emit below produces that name once the googlesqlite_safe_
+		// prefix is selected), so mark them safe-able too. Without this an
+		// out-of-bounds OFFSET inside IFERROR / ISERROR / NULLIFERROR would
+		// abort the statement instead of folding to NULL.
+		if _, ok := nativelySafeValueLayerBuiltins[bare]; ok {
+			existsNormalFuncForSafe = true
+		}
 	}
 	currentTime := CurrentTime(ctx)
 
@@ -385,6 +395,30 @@ func (n *FunctionCallNode) FormatSQL(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// DuckDB retarget: STRING is an overloaded GoogleSQL name. The JSON
+	// accessor STRING(json) is registered in normalFuncMap (so
+	// getFuncNameAndArgs prefixed funcName to googlesqlite_string), but the
+	// temporal converter STRING(timestamp[, tz]) shares the same name and
+	// must lower to a native CAST instead of the JSON UDF (which rejects the
+	// time.Time DuckDB hands it). Disambiguate on the first argument's type
+	// kind: a temporal first arg is the converter overload.
+	if funcName == "googlesqlite_string" {
+		kinds := argKinds(m1(n.node.ArgumentList()))
+		if len(kinds) >= 1 && isTemporalTypeKind(kinds[0]) {
+			if sql, ok := tryNativeDatetimeFunc("string", args); ok {
+				return sql, nil
+			}
+		}
+	}
+	// DuckDB retarget: HLL_COUNT.EXTRACT resolves to the bare leaf `extract`,
+	// which DuckDB's parser reads as the EXTRACT(part FROM expr) keyword form
+	// and rejects. Remap it to the registered googlesqlite_hll_count_extract
+	// scalar UDF before tryFormatExtract sees the name. The date/INTERVAL
+	// EXTRACT builtin arrives as googlesqlite_extract (the $-prefixed form), so
+	// keying on the bare `extract` leaf does not catch it.
+	if mapped, ok := duckDBExtractFuncRemap[funcName]; ok {
+		funcName = mapped
+	}
 	// DuckDB retarget (PATH B): the GoogleSQL analyzer lowers the basic
 	// operators ($equal, $and, $or, $not, comparisons, arithmetic,
 	// $is_null, $in) to $-builtins that getFuncNameAndArgs turns into
@@ -533,6 +567,17 @@ var duckDBRangeFuncRemap = map[string]string{
 	"generate_range_array": "googlesqlite_generate_range_array",
 }
 
+// duckDBExtractFuncRemap maps the bare GoogleSQL leaf name HLL_COUNT.EXTRACT
+// resolves to (`extract`) onto the googlesqlite_ scalar UDF registered for the
+// HyperLogLog++ cardinality body. The remap both disambiguates the call from
+// DuckDB's EXTRACT(part FROM expr) keyword form (a bare extract(...) call is a
+// parser error) and routes it to the value-layer UDF that decodes the sketch
+// envelope. The date/INTERVAL EXTRACT builtin is the $-prefixed form and lowers
+// to googlesqlite_extract, so it is not affected by this bare-leaf remap.
+var duckDBExtractFuncRemap = map[string]string{
+	"extract": "googlesqlite_hll_count_extract",
+}
+
 // duckDBAeadFuncRemap maps the short names produced by the upstream
 // Encryption catalog for AEAD.ENCRYPT / KEYS.NEW_KEYSET-style calls to the
 // normal UDF names registered for the local pure-Go AEAD bodies.
@@ -577,6 +622,18 @@ var nativeBinaryOperators = map[string]string{
 // so their safe and raising forms are identical.
 var nativelySafeOperatorBuiltins = map[string]struct{}{
 	"divide": {},
+}
+
+// nativelySafeValueLayerBuiltins names the value-layer builtins (resolved as
+// $-prefixed names) whose safe form is a separately-registered
+// googlesqlite_safe_<name> scalar UDF rather than a native operator. In
+// safe-eval / SAFE mode getFuncNameAndArgs selects the googlesqlite_safe_
+// prefix and the default emit produces the registered safe UDF name. These
+// raise on a runtime failure (an out-of-range array index) in their default
+// form, so they must fold to NULL inside IFERROR / ISERROR / NULLIFERROR.
+var nativelySafeValueLayerBuiltins = map[string]struct{}{
+	"array_at_offset":  {},
+	"array_at_ordinal": {},
 }
 
 // nativeNumericAggregates maps a GoogleSQL aggregate (its catalog storage
@@ -776,6 +833,53 @@ func tryNativeOperator(funcName string, args []string, kinds []googlesql.TypeKin
 			return "", false
 		}
 		return fmt.Sprintf("(%s IN (%s))", args[0], strings.Join(args[1:], ", ")), true
+	case "bitwise_and", "bitwise_or", "bitwise_left_shift", "bitwise_right_shift":
+		// GoogleSQL bitwise &, |, <<, >> map to the identically spelled
+		// DuckDB infix operators. The operands must be integer-typed; a
+		// value-layer array element (json_each.value) reaches DuckDB
+		// JSON-typed, so cast each operand to its analyzer-resolved scalar
+		// type (BIGINT for INT64) the way the arithmetic operators do. The
+		// cast is idempotent for already-native literals.
+		if len(args) != 2 {
+			return "", false
+		}
+		bitwiseTok := map[string]string{
+			"bitwise_and":         "&",
+			"bitwise_or":          "|",
+			"bitwise_left_shift":  "<<",
+			"bitwise_right_shift": ">>",
+		}[op]
+		return fmt.Sprintf("(%s %s %s)", castOperandToKind(args[0], kindAt(kinds, 0)), bitwiseTok, castOperandToKind(args[1], kindAt(kinds, 1))), true
+	case "bitwise_xor":
+		// DuckDB spells bitwise XOR as the xor(a, b) function. (The infix
+		// `^` is exponentiation in this DuckDB build, and `#` is not
+		// accepted, so neither can stand in for GoogleSQL's `^`.)
+		if len(args) != 2 {
+			return "", false
+		}
+		return fmt.Sprintf("xor(%s, %s)", castOperandToKind(args[0], kindAt(kinds, 0)), castOperandToKind(args[1], kindAt(kinds, 1))), true
+	case "bitwise_not":
+		// GoogleSQL unary ~ maps to DuckDB's unary ~ on integer operands.
+		if len(args) != 1 {
+			return "", false
+		}
+		return fmt.Sprintf("(~%s)", castOperandToKind(args[0], kindAt(kinds, 0))), true
+	case "is_distinct_from", "is_not_distinct_from":
+		// GoogleSQL IS [NOT] DISTINCT FROM has NULL-aware equality
+		// semantics (NULL IS NOT DISTINCT FROM NULL is TRUE). DuckDB
+		// implements the same multi-word infix operators with matching
+		// NULL handling, so lower directly. Operands keep their
+		// value-layer form (no cast) the way the comparison operators do -
+		// struct / string distinctness relies on the byte-identical
+		// envelope, and json_each.value numerics compare correctly.
+		distinctTok := "IS DISTINCT FROM"
+		if op == "is_not_distinct_from" {
+			distinctTok = "IS NOT DISTINCT FROM"
+		}
+		if len(args) != 2 {
+			return "", false
+		}
+		return fmt.Sprintf("(%s %s %s)", args[0], distinctTok, args[1]), true
 	}
 	return "", false
 }
@@ -1716,13 +1820,64 @@ func (n *FunctionCallNode) formatErrorHandling(ctx context.Context, funcName str
 		if len(args) < 2 {
 			return "", fmt.Errorf("IFERROR: needs catch_expression")
 		}
-		return fmt.Sprintf("CASE WHEN (%s) IS NULL THEN %s ELSE (%s) END", safeX, args[1], safeX), nil
+		// Both arms of IFERROR(T1, T1) share the result type T1, but the
+		// try arm can reach the binder as a value-layer envelope VARCHAR
+		// (an array element from $array_at_offset, a scalar subquery whose
+		// column is value-layer-encoded) while the catch arm is a native
+		// literal. DuckDB then rejects `CASE WHEN ... THEN <int literal>
+		// ELSE <varchar> END` as a mixed-type CASE. When T1 is a value-layer
+		// scalar AND the try arm actually produces the envelope, decode it
+		// back to its native form so both arms agree; the row decoder accepts
+		// the native result for the column just as it accepts the envelope. A
+		// try arm that is already native (e.g. arithmetic like 1 + 2) is left
+		// untouched - decoding it would pass a BIGINT to googlesqlite_decode_
+		// scalar, which only binds VARCHAR. Non-scalar result types (STRING /
+		// STRUCT / ARRAY / temporal) also keep the untouched form.
+		tryArm := iferrorTryArmSQL(n, safeX)
+		return fmt.Sprintf("CASE WHEN (%s) IS NULL THEN %s ELSE (%s) END", tryArm, args[1], tryArm), nil
 	case "googlesqlite_iserror":
 		return fmt.Sprintf("((%s) IS NULL)", safeX), nil
 	case "googlesqlite_nulliferror":
 		return fmt.Sprintf("(%s)", safeX), nil
 	}
 	return safeX, nil
+}
+
+// iferrorTryArmSQL returns the SQL for IFERROR's try arm. It decodes the
+// safe-evaluated inner expression back to its native form via
+// googlesqlite_decode_scalar + CAST (mirrors GetStructFieldNode's scalar-field
+// decode) only when both hold: the call's result type is a value-layer scalar
+// (INT / FLOAT / BOOL), and the formatted try arm is itself a value-layer
+// envelope (safeXIsValueLayerEnvelope). A try arm that lowers to a native
+// scalar - arithmetic like 1 + 2, a native literal or column - is returned
+// unchanged, because wrapping it in googlesqlite_decode_scalar would pass a
+// native BIGINT / DOUBLE to a UDF that only binds VARCHAR.
+func iferrorTryArmSQL(n *FunctionCallNode, safeX string) string {
+	if t, _ := n.node.Type(); t != nil {
+		if k, err := t.Kind(); err == nil {
+			if castType, ok := valueLayerScalarCastType(k); ok && safeXIsValueLayerEnvelope(safeX) {
+				return fmt.Sprintf("CAST(googlesqlite_decode_scalar(%s) AS %s)", safeX, castType)
+			}
+		}
+	}
+	return safeX
+}
+
+// safeXIsValueLayerEnvelope reports whether a safe-evaluated inner expression
+// is rendered as a value-layer envelope VARCHAR rather than a native scalar.
+// Every envelope-producing lowering on the DuckDB path either calls a
+// googlesqlite_ UDF (the array-element accessors googlesqlite_safe_array_at_*,
+// the googlesqlite_cast the analyzer inserts to coerce ERROR()/other arms, the
+// JSON / struct accessors) or extracts the value through a scalar subquery
+// (SELECT ...). A native scalar produced by tryNativeOperator (e.g.
+// `(CAST(1 AS BIGINT) + CAST(2 AS BIGINT))`) contains neither marker, so it is
+// left undecoded. Keeping this a syntactic test avoids re-walking the resolved
+// inner node, whose envelope-ness depends on analyzer-inserted casts that are
+// only visible after formatting.
+func safeXIsValueLayerEnvelope(safeX string) bool {
+	return strings.Contains(safeX, "googlesqlite_") ||
+		strings.Contains(safeX, "SELECT ") ||
+		strings.Contains(safeX, "SELECT*")
 }
 
 // formatErrorBuiltin lowers ERROR / SAFE_ERROR. Inside a safe-eval
@@ -1825,18 +1980,27 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 			}
 		}
 		kindLit, _ := literalFromValue(value.StringValue(kind))
+		// The bare name matches the aggregate registered in duckdbAggSpecs()
+		// (the DuckDB cgo path registers aggregates under their bare lowered
+		// name, unlike the googlesqlite_-prefixed scalar UDFs).
 		return fmt.Sprintf(
-			"googlesqlite_having_any_value(%s,%s,%s)",
+			"having_any_value(%s,%s,%s)",
 			strings.Join(args, ","), havingExpr, kindLit,
 		), nil
 	}
 	// When formatting inside a DifferentialPrivacyAggregateScan /
-	// AnonymizedAggregateScan, append (epsilon, delta) to every
-	// $differential_privacy_* or $anon_* call so the runtime UDF
-	// can size the Laplace noise from the scan's privacy budget.
-	if dp := dpOptionsFromContext(ctx); dp != nil &&
-		(strings.HasPrefix(funcName, "googlesqlite_differential_privacy_") ||
-			strings.HasPrefix(funcName, "googlesqlite_anon_")) {
+	// AnonymizedAggregateScan, append (epsilon, delta) to every DP /
+	// anonymization aggregate call so the runtime UDF can size the
+	// Laplace noise from the scan's privacy budget. The WITH
+	// DIFFERENTIAL_PRIVACY surface lowers to $-builtin
+	// $differential_privacy_* names that pick up the googlesqlite_
+	// prefix; the WITH ANONYMIZATION surface's RewriteAnonymization
+	// emits the catalog aggregate names anon_* / $anon_* directly, so
+	// match both the bare and prefixed anon spellings. Without the
+	// trailing budget, the high-epsilon "without noise" examples
+	// (epsilon=1e20) could not size noise to ~0 and would diverge from
+	// the asserted exact values.
+	if dp := dpOptionsFromContext(ctx); dp != nil && isDPAggregateName(funcName) {
 		epsLit, _ := literalFromValue(value.FloatValue(dp.Epsilon))
 		delLit, _ := literalFromValue(value.FloatValue(dp.Delta))
 		args = append(args, epsLit, delLit)
@@ -2242,6 +2406,18 @@ func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName 
 	if sqliteName == "quantile_cont" && len(valueArgs) >= 1 {
 		valueArgs[0] = fmt.Sprintf("CAST(%s AS DOUBLE)", valueArgs[0])
 	}
+	// SUM / AVG in OVER context reject the JSON value-layer encoding the
+	// UNNEST source produces (`sum(JSON)` does not bind), the same way the
+	// non-window aggregate path casts these to DOUBLE. Cast the value arg
+	// to DOUBLE only when its analyzer-resolved kind is a value-layer
+	// numeric (INT/FLOAT) so a real native-numeric column is unaffected.
+	// MIN / MAX / COUNT bind against JSON directly, so they are left alone.
+	if (sqliteName == "sum" || sqliteName == "avg") && len(valueArgs) >= 1 {
+		kinds := argKinds(m1(n.node.ResolvedFunctionCallBase.ArgumentList()))
+		if _, ok := valueLayerScalarCastType(kindAt(kinds, 0)); ok {
+			valueArgs[0] = fmt.Sprintf("CAST(%s AS DOUBLE)", valueArgs[0])
+		}
+	}
 	// $count_star resolves with no value arguments; DuckDB's native
 	// COUNT requires the * argument in OVER context.
 	if sqliteName == "count" && len(valueArgs) == 0 {
@@ -2542,6 +2718,21 @@ func argKinds(args []googlesql.ResolvedExprNode) []googlesql.TypeKind {
 		}
 	}
 	return kinds
+}
+
+// isTemporalTypeKind reports whether k is one of the GoogleSQL civil /
+// instant temporal types (DATE / TIME / DATETIME / TIMESTAMP). Used to
+// disambiguate overloaded builtins (e.g. STRING) whose temporal overload
+// must lower to a native cast rather than the JSON-accessor UDF.
+func isTemporalTypeKind(k googlesql.TypeKind) bool {
+	switch k {
+	case googlesql.TypeKindTypeDate,
+		googlesql.TypeKindTypeTime,
+		googlesql.TypeKindTypeDatetime,
+		googlesql.TypeKindTypeTimestamp:
+		return true
+	}
+	return false
 }
 
 // kindAt returns the kind at index i, or TypeKindTypeUnknown when the
@@ -3037,8 +3228,17 @@ func (n *SubqueryExprNode) FormatSQL(ctx context.Context) (string, error) {
 		// VARCHAR. COALESCE over an empty list keeps an all-NULL / zero-row
 		// subquery from folding to SQL NULL before the envelope wrap, matching
 		// GoogleSQL's empty-ARRAY result.
+		//
+		// DuckDB's array_agg is order-insensitive without an in-aggregate
+		// ORDER BY, so a bare array_agg returns the subquery rows in an
+		// arbitrary (run-to-run unstable) order. GoogleSQL's ARRAY(subquery)
+		// preserves the subquery's row order (its ORDER BY when present, else
+		// the producing order). Stamp each row with row_number() OVER () -
+		// which is assigned in the subquery's output order, after any inner
+		// ORDER BY - and aggregate ORDER BY that stamp so the materialised
+		// array keeps the subquery's order deterministically.
 		return fmt.Sprintf(
-			"googlesqlite_array_from_native(COALESCE((SELECT array_agg(\"%s\") FROM (%s)), []))",
+			"googlesqlite_array_from_native(COALESCE((SELECT array_agg(\"%s\" ORDER BY __gsx_array_subq_rn) FROM (SELECT *, row_number() OVER () AS __gsx_array_subq_rn FROM (%s))), []))",
 			colName, sql,
 		), nil
 	case googlesql.ResolvedSubqueryExprEnums_SubqueryTypeExists:
@@ -3087,17 +3287,18 @@ func (n *TableScanNode) FormatSQL(ctx context.Context) (string, error) {
 		}
 		return fmt.Sprintf("(SELECT %s FROM (%s))", strings.Join(columns, ","), query), nil
 	}
-	// INFORMATION_SCHEMA scans route through the corresponding
-	// vtab module. The dataset filter is pushed into the WHERE so
-	// xBestIndex picks the constrained scan.
+	// INFORMATION_SCHEMA scans materialise the catalog's live rows as
+	// an inline DuckDB relation. The SQLite fork served these through
+	// an eponymous virtual-table module, but the DuckDB engine has no
+	// vtab layer, so we splice a self-contained subquery exposing the
+	// view's columns instead. The dataset filter is applied while the
+	// rows are built (BuildRows takes meta.dataset), so the outer
+	// projection only needs the column names.
 	if a := analyzerFromContext(ctx); a != nil && a.catalog != nil {
-		if meta := a.catalog.infoSchemaTableMetaFor(table); meta != nil {
-			return fmt.Sprintf(
-				"(SELECT %s FROM %s WHERE __schema = '%s')",
-				strings.Join(columns, ","),
-				meta.view.Module,
-				strings.ReplaceAll(meta.dataset, "'", "''"),
-			), nil
+		if relation, ok, err := a.catalog.infoSchemaInlineRelationFor(table); err != nil {
+			return "", err
+		} else if ok {
+			return fmt.Sprintf("(SELECT %s FROM %s)", strings.Join(columns, ","), relation), nil
 		}
 	}
 	tableName, err := getTableName(ctx, n.node)
@@ -3140,9 +3341,158 @@ func (n *JoinScanNode) FormatSQL(ctx context.Context) (string, error) {
 	case googlesql.ResolvedJoinScanEnums_JoinTypeRight:
 		return fmt.Sprintf("%s RIGHT JOIN %s ON %s", left, right, joinExpr), nil
 	case googlesql.ResolvedJoinScanEnums_JoinTypeFull:
+		// ARRAY_ZIP(..., mode => 'PAD') lowers to a FULL OUTER JOIN of the
+		// per-array UNNEST(json_each) scans, keyed on their generated offset
+		// columns (for N arrays the joins nest: (A FULL B) FULL C ...).
+		// DuckDB cannot flatten a correlated subquery that contains a FULL
+		// OUTER JOIN ("Unsupported join type for flattening correlated
+		// subquery"), and the ARRAY_ZIP body always nests this join inside a
+		// correlated array_agg subquery. INNER / LEFT / RIGHT joins of the
+		// same correlated scans flatten fine, so only the FULL OUTER shape
+		// needs retargeting. Rewrite the offset-keyed positional outer join to
+		// a range-driven pair of LEFT JOINs that DuckDB can decorrelate while
+		// exposing the identical columns of both operands; fall back to the
+		// literal FULL OUTER JOIN for any join that is not an offset-keyed
+		// positional zip (e.g. a user FULL OUTER JOIN on element values).
+		if rewritten, ok, err := tryFormatFullOuterOffsetZip(ctx, n.node, left, right); err != nil {
+			return "", err
+		} else if ok {
+			return rewritten, nil
+		}
 		return fmt.Sprintf("%s FULL OUTER JOIN %s ON %s", left, right, joinExpr), nil
 	}
 	return "", fmt.Errorf("unexpected join type %d", m1(n.node.JoinType()))
+}
+
+// tryFormatFullOuterOffsetZip retargets the FULL OUTER JOIN that ARRAY_ZIP's
+// PAD mode emits. It fires only when the join condition equates two generated
+// UNNEST offset columns (the `$array_offset` / `$full_join` positional keys)
+// and both operands are UNNEST-derived. For that shape the FULL OUTER JOIN is
+// a positional outer zip: a row exists for every position 0..max(len)-1, with
+// the shorter side's columns NULL. Such offset columns are dense 0-based
+// indices, so the join is reproducible by driving the row set from a range
+// and re-joining each operand on its own positional key.
+//
+// The replacement keeps both operands verbatim (so every column they expose,
+// including any nested coalesce-of-offset columns the enclosing projections
+// read, flows through unchanged) and rewrites only the join shape:
+//
+//	range(0, greatest(count(left), count(right))) AS d(k)
+//	  LEFT JOIN (left)  ON leftOffset  = k
+//	  LEFT JOIN (right) ON rightOffset = k
+//
+// range() and the UNNEST operands stay correlated to the outer array columns,
+// which DuckDB decorrelates without trouble; the unsupported FULL OUTER node
+// is gone. Driving by count(*) of each operand (rather than the source array
+// length) keeps the rewrite agnostic to how deep the operand is, so a nested
+// (A FULL B) FULL C chain rewrites one join at a time. Any join that is not an
+// offset-keyed positional zip returns ok=false so the caller keeps the literal
+// FULL OUTER JOIN emission.
+func tryFormatFullOuterOffsetZip(ctx context.Context, join *googlesql.ResolvedJoinScan, left, right string) (string, bool, error) {
+	keyA, keyB, ok := offsetEqualityKeys(ctx, m1(join.JoinExpr()))
+	if !ok {
+		return "", false, nil
+	}
+	// Both operands must be UNNEST-derived for the positional-zip rewrite to
+	// be valid. ARRAY_ZIP's scans always lower through json_each; a user FULL
+	// OUTER JOIN on real tables never contains it. This also keeps the
+	// count(*) row-position assumption (dense 0-based offsets) sound.
+	if !strings.Contains(left, "json_each(") || !strings.Contains(right, "json_each(") {
+		return "", false, nil
+	}
+	// Map each offset key to the operand that exposes it. The formatter renders
+	// the key as a quoted unique name, so membership is a substring test on the
+	// already-formatted operand SQL.
+	leftKey, rightKey, ok := assignKeysToOperands(left, right, keyA, keyB)
+	if !ok {
+		return "", false, nil
+	}
+	driver := fmt.Sprintf(
+		"range(CAST(0 AS BIGINT), CAST(greatest((SELECT count(*) FROM %s),(SELECT count(*) FROM %s)) AS BIGINT)) AS __zip_drv(__zip_k)",
+		wrapZipOperand(left), wrapZipOperand(right),
+	)
+	return fmt.Sprintf(
+		"%s LEFT JOIN %s ON \"%s\" = __zip_drv.__zip_k LEFT JOIN %s ON \"%s\" = __zip_drv.__zip_k",
+		driver, wrapZipOperand(left), leftKey, wrapZipOperand(right), rightKey,
+	), true, nil
+}
+
+// offsetEqualityKeys returns the two column unique names of a join condition
+// of the form `<offsetA> = <offsetB>`, but only when both sides are bare
+// ColumnRefs to generated UNNEST offset columns (table name `$array_offset`
+// for a leaf UNNEST or `$full_join` for a prior outer-zip key). It returns
+// ok=false for any other predicate so the FULL OUTER retarget stays scoped to
+// the positional zip ARRAY_ZIP emits.
+func offsetEqualityKeys(ctx context.Context, joinExpr googlesql.ResolvedExprNode) (string, string, bool) {
+	call, ok := joinExpr.(*googlesql.ResolvedFunctionCall)
+	if !ok {
+		return "", "", false
+	}
+	name, err := getFuncName(ctx, call)
+	if err != nil || (name != "$equal" && !strings.HasSuffix(name, ".$equal")) {
+		return "", "", false
+	}
+	args := m1(call.ArgumentList())
+	if len(args) != 2 {
+		return "", "", false
+	}
+	colA, okA := offsetColumnName(ctx, args[0])
+	colB, okB := offsetColumnName(ctx, args[1])
+	if !okA || !okB {
+		return "", "", false
+	}
+	return colA, colB, true
+}
+
+// offsetColumnName returns the unique name of a ColumnRef to a generated
+// UNNEST offset column, and ok=false for any other expression. The positional
+// offset columns ARRAY_ZIP joins on live in the analyzer's `$array_offset`
+// (leaf UNNEST) and `$full_join` (a prior outer-zip's coalesced key) internal
+// ranges; restricting to those names avoids treating a value-based join key as
+// a position.
+func offsetColumnName(ctx context.Context, expr googlesql.ResolvedExprNode) (string, bool) {
+	ref, ok := expr.(*googlesql.ResolvedColumnRef)
+	if !ok {
+		return "", false
+	}
+	col := m1(ref.Column())
+	switch m1(col.TableName()) {
+	case "$array_offset", "$full_join":
+		return uniqueColumnName(ctx, col), true
+	}
+	return "", false
+}
+
+// assignKeysToOperands decides which of the two offset keys belongs to the
+// left operand and which to the right by testing which formatted operand SQL
+// contains each quoted key name. It returns ok=false when the mapping is
+// ambiguous (neither or both operands contain a key), leaving the literal
+// FULL OUTER JOIN in place.
+func assignKeysToOperands(left, right, keyA, keyB string) (string, string, bool) {
+	qa := fmt.Sprintf("\"%s\"", keyA)
+	qb := fmt.Sprintf("\"%s\"", keyB)
+	leftHasA := strings.Contains(left, qa)
+	leftHasB := strings.Contains(left, qb)
+	rightHasA := strings.Contains(right, qa)
+	rightHasB := strings.Contains(right, qb)
+	if leftHasA && rightHasB && !leftHasB && !rightHasA {
+		return keyA, keyB, true
+	}
+	if leftHasB && rightHasA && !leftHasA && !rightHasB {
+		return keyB, keyA, true
+	}
+	return "", "", false
+}
+
+// wrapZipOperand wraps a formatted scan operand as a parenthesised subquery so
+// it can sit on either side of a JOIN and be probed by `SELECT count(*) FROM`.
+// A scan that already starts with `(` is left as-is.
+func wrapZipOperand(operand string) string {
+	trimmed := strings.TrimSpace(operand)
+	if strings.HasPrefix(trimmed, "(") {
+		return trimmed
+	}
+	return fmt.Sprintf("(%s)", trimmed)
 }
 
 func (n *ArrayScanNode) FormatSQL(ctx context.Context) (string, error) {
@@ -3530,6 +3880,19 @@ func dpOptionsFromContext(ctx context.Context) *dpOptions {
 		return v
 	}
 	return nil
+}
+
+// isDPAggregateName reports whether funcName is one of the differential
+// privacy / anonymization aggregate calls that the (epsilon, delta)
+// budget should be appended to. The DIFFERENTIAL_PRIVACY surface arrives
+// as googlesqlite_differential_privacy_*; the ANONYMIZATION surface's
+// rewriter emits anon_* (bare) or $anon_* (which the prefix logic turns
+// into googlesqlite_anon_*). All variants want the budget so the runtime
+// can size Laplace noise.
+func isDPAggregateName(funcName string) bool {
+	return strings.HasPrefix(funcName, "googlesqlite_differential_privacy_") ||
+		strings.HasPrefix(funcName, "googlesqlite_anon_") ||
+		strings.HasPrefix(funcName, "anon_")
 }
 
 func withDPOptions(ctx context.Context, dp *dpOptions) context.Context {

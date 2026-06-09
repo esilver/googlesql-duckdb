@@ -34,7 +34,7 @@ func (a *CreateTableStmtAction) Prepare(ctx context.Context, conn *Conn) (driver
 	if a.spec.CreateMode == googlesql.ResolvedCreateStatementEnums_CreateModeCreateOrReplace {
 		if _, err := conn.ExecContext(
 			ctx,
-			fmt.Sprintf("DROP TABLE IF EXISTS `%s`", a.spec.TableName()),
+			fmt.Sprintf("DROP TABLE IF EXISTS %q", a.spec.TableName()),
 		); err != nil {
 			return nil, err
 		}
@@ -53,7 +53,7 @@ func (a *CreateTableStmtAction) createIndexAutomatically(ctx context.Context, co
 		}
 		indexName := fmt.Sprintf("googlesqlite_autoindex_%s_%s", col.Name, strings.Join(a.spec.NamePath, "_"))
 		createIndexQuery := fmt.Sprintf(
-			"CREATE INDEX IF NOT EXISTS %s ON `%s`(`%s`)",
+			"CREATE INDEX IF NOT EXISTS %s ON %q(%q)",
 			indexName,
 			a.spec.TableName(),
 			col.Name,
@@ -74,7 +74,7 @@ func (a *CreateTableStmtAction) exec(ctx context.Context, conn *Conn) error {
 	if a.spec.CreateMode == googlesql.ResolvedCreateStatementEnums_CreateModeCreateOrReplace || a.spec.IsTemp {
 		if _, err := conn.ExecContext(
 			ctx,
-			fmt.Sprintf("DROP TABLE IF EXISTS `%s`", a.spec.TableName()),
+			fmt.Sprintf("DROP TABLE IF EXISTS %q", a.spec.TableName()),
 		); err != nil {
 			return err
 		}
@@ -121,7 +121,7 @@ func (a *CreateTableStmtAction) Cleanup(ctx context.Context, conn *Conn) error {
 
 	if _, err := conn.ExecContext(
 		ctx,
-		fmt.Sprintf("DROP TABLE IF EXISTS `%s`", a.spec.TableName()),
+		fmt.Sprintf("DROP TABLE IF EXISTS %q", a.spec.TableName()),
 	); err != nil {
 		return fmt.Errorf("failed to cleanup table %s: %w", a.spec.TableName(), err)
 	}
@@ -141,7 +141,7 @@ func (a *CreateViewStmtAction) Prepare(ctx context.Context, conn *Conn) (driver.
 	if a.spec.CreateMode == googlesql.ResolvedCreateStatementEnums_CreateModeCreateOrReplace {
 		if _, err := conn.ExecContext(
 			ctx,
-			fmt.Sprintf("DROP VIEW IF EXISTS `%s`", a.spec.TableName()),
+			fmt.Sprintf("DROP VIEW IF EXISTS %q", a.spec.TableName()),
 		); err != nil {
 			return nil, err
 		}
@@ -157,7 +157,7 @@ func (a *CreateViewStmtAction) exec(ctx context.Context, conn *Conn) error {
 	if a.spec.CreateMode == googlesql.ResolvedCreateStatementEnums_CreateModeCreateOrReplace {
 		if _, err := conn.ExecContext(
 			ctx,
-			fmt.Sprintf("DROP VIEW IF EXISTS `%s`", a.spec.TableName()),
+			fmt.Sprintf("DROP VIEW IF EXISTS %q", a.spec.TableName()),
 		); err != nil {
 			return err
 		}
@@ -193,7 +193,7 @@ func (a *CreateViewStmtAction) Cleanup(ctx context.Context, conn *Conn) error {
 	}
 	if _, err := conn.ExecContext(
 		ctx,
-		fmt.Sprintf("DROP VIEW IF EXISTS `%s`", a.spec.TableName()),
+		fmt.Sprintf("DROP VIEW IF EXISTS %q", a.spec.TableName()),
 	); err != nil {
 		return fmt.Errorf("failed to cleanup view %s: %w", a.spec.TableName(), err)
 	}

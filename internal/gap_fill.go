@@ -302,13 +302,25 @@ func parseValueColumnsArray(s string) []gapFillValueCol {
 //
 // The lowered SQL is structured as a chain of nested subqueries:
 //
-//	level 0: __gf_aligned   — input rows tagged with their bucket
-//	level 1: __gf_ticks     — generated bucket boundaries
-//	level 2: __gf_joined    — LEFT JOIN of ticks vs aligned
-//	level 3: __gf_grouped   — COUNT(col) OVER as a per-column LOCF
-//	                          group id (the standard SQL idiom for
-//	                          IGNORE NULLS without engine support)
-//	level 4: final SELECT   — null / locf / linear projection
+//	__gf_src       — input rows tagged with their bucket
+//	__gf_ticks     — generated bucket boundaries (native timestamps,
+//	                 via a recursive CTE; see tick-generation note)
+//	__gf_joined    — LEFT JOIN of ticks vs aligned
+//	__gf_grouped   — COUNT(col) OVER as a per-column LOCF group id
+//	                 (the standard SQL idiom for IGNORE NULLS without
+//	                 engine support)
+//	final SELECT   — null / locf / linear projection
+//
+// Tick-generation note: bucket boundaries are produced by a
+// WITH RECURSIVE CTE that steps TIMESTAMP_ADD(prev, bucket_width)
+// from the floor bucket to the ceiling bucket, rather than by
+// GENERATE_TIMESTAMP_ARRAY. The bucket column (TIMESTAMP_BUCKET) and
+// the source time column both lower to native DuckDB timestamps,
+// while GENERATE_TIMESTAMP_ARRAY returns the value-layer base64
+// envelope; joining the two representations is what made the
+// envelope ticks uncomparable to the native bucket column. Stepping
+// with TIMESTAMP_ADD keeps every tick in the same native domain as
+// the join key.
 func rewriteGapFill(rawArgs string) (string, error) {
 	args, err := parseGapFillArgs(rawArgs)
 	if err != nil {
@@ -325,6 +337,14 @@ func rewriteGapFill(rawArgs string) (string, error) {
 		origin = "TIMESTAMP '1950-01-01 00:00:00+00'"
 	}
 
+	// The recursive step advances one bucket at a time. TIMESTAMP_ADD
+	// needs an INTERVAL <count> <part> literal, so split the raw
+	// bucket_width text back into its count and part.
+	stepInterval, err := normalizeIntervalLiteral(bw)
+	if err != nil {
+		return "", err
+	}
+
 	var partitionExprs []string
 	for _, c := range args.partitioningCols {
 		partitionExprs = append(partitionExprs, "`"+c+"`")
@@ -338,23 +358,35 @@ func rewriteGapFill(rawArgs string) (string, error) {
 		ts, bw, origin, ts, ts, inputRef,
 	)
 
-	// Bucket-tick generation. Single-partition form when no
-	// partitioning_columns are present, per-partition CROSS JOIN
-	// against the partition bounds otherwise.
-	var ticks string
+	// Bucket-tick generation via a recursive CTE. The anchor reads
+	// the floor / ceiling bucket boundaries (already bucket-aligned
+	// because TIMESTAMP_BUCKET is monotonic, so MIN/MAX of the
+	// bucketed source equals the bucket of MIN/MAX); each recursive
+	// step adds one bucket_width and stops once it passes the
+	// ceiling. The ceiling is carried as a column so the recursive
+	// term can reference it. Native throughout: the tick column has
+	// the same TIMESTAMP type as the join key.
+	var ticksCTE string
 	if partitionList == "" {
-		ticks = fmt.Sprintf(
-			"SELECT bucket_ts AS `%s` "+
-				"FROM (SELECT MIN(`%s`) AS mn, MAX(`%s`) AS mx FROM (%s)), "+
-				"UNNEST(GENERATE_TIMESTAMP_ARRAY(TIMESTAMP_BUCKET(mn, %s, %s), TIMESTAMP_BUCKET(mx, %s, %s), %s)) AS bucket_ts",
-			ts, ts, ts, alignedSelect, bw, origin, bw, origin, bw,
+		ticksCTE = fmt.Sprintf(
+			"`__gf_ticks` AS ("+
+				"SELECT `__gf_lo` AS `%s`, `__gf_hi` AS `__gf_hi` FROM (SELECT MIN(`%s`) AS `__gf_lo`, MAX(`%s`) AS `__gf_hi` FROM (%s)) "+
+				"WHERE `__gf_lo` IS NOT NULL "+
+				"UNION ALL "+
+				"SELECT TIMESTAMP_ADD(`%s`, %s) AS `%s`, `__gf_hi` AS `__gf_hi` FROM `__gf_ticks` WHERE TIMESTAMP_ADD(`%s`, %s) <= `__gf_hi`"+
+				")",
+			ts, ts, ts, alignedSelect, ts, stepInterval, ts, ts, stepInterval,
 		)
 	} else {
-		ticks = fmt.Sprintf(
-			"SELECT bucket_ts AS `%s`, %s "+
-				"FROM (SELECT %s, MIN(`%s`) AS mn, MAX(`%s`) AS mx FROM (%s) GROUP BY %s), "+
-				"UNNEST(GENERATE_TIMESTAMP_ARRAY(TIMESTAMP_BUCKET(mn, %s, %s), TIMESTAMP_BUCKET(mx, %s, %s), %s)) AS bucket_ts",
-			ts, partitionList, partitionList, ts, ts, alignedSelect, partitionList, bw, origin, bw, origin, bw,
+		ticksCTE = fmt.Sprintf(
+			"`__gf_ticks` AS ("+
+				"SELECT `__gf_lo` AS `%s`, `__gf_hi` AS `__gf_hi`, %s FROM (SELECT %s, MIN(`%s`) AS `__gf_lo`, MAX(`%s`) AS `__gf_hi` FROM (%s) GROUP BY %s) "+
+				"WHERE `__gf_lo` IS NOT NULL "+
+				"UNION ALL "+
+				"SELECT TIMESTAMP_ADD(`%s`, %s) AS `%s`, `__gf_hi` AS `__gf_hi`, %s FROM `__gf_ticks` WHERE TIMESTAMP_ADD(`%s`, %s) <= `__gf_hi`"+
+				")",
+			ts, partitionList, partitionList, ts, ts, alignedSelect, partitionList,
+			ts, stepInterval, ts, partitionList, ts, stepInterval,
 		)
 	}
 
@@ -364,9 +396,13 @@ func rewriteGapFill(rawArgs string) (string, error) {
 	for _, c := range args.partitioningCols {
 		joinUsing += ", `" + c + "`"
 	}
+	ticksProject := "`" + ts + "`"
+	for _, c := range args.partitioningCols {
+		ticksProject += ", `" + c + "`"
+	}
 	joined := fmt.Sprintf(
-		"SELECT * FROM (%s) AS `__gf_ticks` LEFT JOIN (%s) AS `__gf_src` USING (%s)",
-		ticks, alignedSelect, joinUsing,
+		"SELECT * FROM (SELECT %s FROM `__gf_ticks`) AS `__gf_t` LEFT JOIN (%s) AS `__gf_src` USING (%s)",
+		ticksProject, alignedSelect, joinUsing,
 	)
 
 	// For LOCF / linear we need a per-column "group id" computed as
@@ -379,6 +415,7 @@ func rewriteGapFill(rawArgs string) (string, error) {
 	var groupedCols []string
 	groupedCols = append(groupedCols, "*")
 	needGroups := false
+	hasLinear := false
 	for _, vc := range args.valueCols {
 		if vc.method == "locf" || vc.method == "linear" {
 			needGroups = true
@@ -388,6 +425,7 @@ func rewriteGapFill(rawArgs string) (string, error) {
 			))
 		}
 		if vc.method == "linear" {
+			hasLinear = true
 			// Also need the forward-looking group id, for the
 			// "next non-null" lookup.
 			groupedCols = append(groupedCols, fmt.Sprintf(
@@ -396,10 +434,59 @@ func rewriteGapFill(rawArgs string) (string, error) {
 			))
 		}
 	}
+	// Linear interpolation works in epoch seconds rather than on the
+	// timestamps directly: MIN/MAX of a TIMESTAMP resolves to the
+	// value-layer envelope (a VARCHAR), which TIMESTAMP_DIFF then
+	// cannot bind natively. UNIX_SECONDS lowers to a native BIGINT, so
+	// carrying the tick as __gf_secs and aggregating that keeps every
+	// anchor and span in the native integer domain.
+	if hasLinear {
+		groupedCols = append(groupedCols, fmt.Sprintf("UNIX_SECONDS(`%s`) AS `__gf_secs`", ts))
+	}
 
 	grouped := joined
 	if needGroups {
 		grouped = fmt.Sprintf("SELECT %s FROM (%s) AS `__gf_j`", strings.Join(groupedCols, ", "), joined)
+	}
+
+	// Linear interpolation needs the bracketing non-null anchors
+	// (value + timestamp on each side) materialized as plain columns
+	// before the arithmetic runs. Computing them as window functions
+	// inline in the final projection made the analyzer resolve some
+	// TIMESTAMP_DIFF instances to the value-layer envelope and others
+	// natively (the asymmetry depended on whether an argument was a
+	// bare column or a window call), leaving the division with a
+	// VARCHAR operand. Emitting them here as their own columns makes
+	// every downstream reference a uniform native column.
+	anchored := grouped
+	var anchorCols []string
+	anchorCols = append(anchorCols, "*")
+	needAnchors := false
+	for _, vc := range args.valueCols {
+		if vc.method != "linear" {
+			continue
+		}
+		needAnchors = true
+		prevPart := "PARTITION BY `__gf_grp_" + vc.name + "`"
+		nextPart := "PARTITION BY `__gf_fgrp_" + vc.name + "`"
+		if partitionList != "" {
+			prevPart = "PARTITION BY " + partitionList + ", `__gf_grp_" + vc.name + "`"
+			nextPart = "PARTITION BY " + partitionList + ", `__gf_fgrp_" + vc.name + "`"
+		}
+		// __gf_grp increments at each non-null, so a group's earliest
+		// row is its non-null anchor (MIN epoch seconds); __gf_fgrp
+		// decrements going forward, so a group's latest row is the
+		// next non-null anchor (MAX epoch seconds). MAX(value) over
+		// each group surfaces the single non-null value.
+		anchorCols = append(anchorCols,
+			fmt.Sprintf("MAX(`%s`) OVER (%s) AS `__gf_prevv_%s`", vc.name, prevPart, vc.name),
+			fmt.Sprintf("MAX(`%s`) OVER (%s) AS `__gf_nextv_%s`", vc.name, nextPart, vc.name),
+			fmt.Sprintf("MIN(`__gf_secs`) OVER (%s) AS `__gf_prevt_%s`", prevPart, vc.name),
+			fmt.Sprintf("MAX(`__gf_secs`) OVER (%s) AS `__gf_nextt_%s`", nextPart, vc.name),
+		)
+	}
+	if needAnchors {
+		anchored = fmt.Sprintf("SELECT %s FROM (%s) AS `__gf_a`", strings.Join(anchorCols, ", "), grouped)
 	}
 
 	// Final projection.
@@ -423,30 +510,43 @@ func rewriteGapFill(rawArgs string) (string, error) {
 				"MAX(`%s`) OVER (%s) AS `%s`", vc.name, locfPart, vc.name,
 			))
 		case "linear":
-			// Linear interpolation: find previous non-null
-			// (value + timestamp) via PARTITION BY __gf_grp_X,
-			// next non-null via PARTITION BY __gf_fgrp_X, then
-			// linearly interpolate.
-			prevPart := "PARTITION BY `__gf_grp_" + vc.name + "`"
-			nextPart := "PARTITION BY `__gf_fgrp_" + vc.name + "`"
-			if partitionList != "" {
-				prevPart = "PARTITION BY " + partitionList + ", `__gf_grp_" + vc.name + "`"
-				nextPart = "PARTITION BY " + partitionList + ", `__gf_fgrp_" + vc.name + "`"
-			}
-			prevV := fmt.Sprintf("MAX(`%s`) OVER (%s)", vc.name, prevPart)
-			nextV := fmt.Sprintf("MAX(`%s`) OVER (%s)", vc.name, nextPart)
-			prevT := fmt.Sprintf("MAX(IF(`%s` IS NULL, NULL, `%s`)) OVER (%s)", vc.name, ts, prevPart)
-			nextT := fmt.Sprintf("MAX(IF(`%s` IS NULL, NULL, `%s`)) OVER (%s)", vc.name, ts, nextPart)
+			// Linear interpolation between the bracketing non-null
+			// anchors, all read from the materialized __gf_*_<col>
+			// columns produced by the anchored layer (epoch seconds for
+			// the timestamps).
+			prevV := fmt.Sprintf("`__gf_prevv_%s`", vc.name)
+			nextV := fmt.Sprintf("`__gf_nextv_%s`", vc.name)
+			prevT := fmt.Sprintf("`__gf_prevt_%s`", vc.name)
+			nextT := fmt.Sprintf("`__gf_nextt_%s`", vc.name)
+			// IEEE_DIVIDE rather than `/`: its lowering casts both operands
+			// to a native DOUBLE, whereas `/` coerces them through the
+			// value-layer envelope and then cannot bind the native `* 1.0`
+			// lift against a VARCHAR. The span-zero guard already excludes
+			// the single-point segment, so the IEEE +/-Inf-on-zero
+			// behaviour is never reached.
+			frac := fmt.Sprintf("IEEE_DIVIDE(UNIX_SECONDS(`%s`) - %s, %s - %s)", ts, prevT, nextT, prevT)
+			// The interpolated ELSE branch is a native DOUBLE (IEEE_DIVIDE
+			// forces a native cast), but a value passed straight through is
+			// value-layer INT64 (a VARCHAR envelope), and DuckDB's CASE
+			// refuses to mix DOUBLE with VARCHAR. Adding a native DOUBLE
+			// zero (IEEE_DIVIDE(0, 1)) lifts each passthrough branch into
+			// the native DOUBLE domain without changing its value, so every
+			// branch unifies on DOUBLE.
+			nativeZero := "IEEE_DIVIDE(0, 1)"
+			// The no-anchor branch is a typed FLOAT64 NULL rather than a
+			// bare NULL: an untyped NULL arm leaves the analyzer unable to
+			// resolve the CASE type, so it defaults the output column to
+			// STRING and then cannot accept the native DOUBLE the other
+			// arms produce.
 			interp := fmt.Sprintf(
-				"CASE WHEN `%s` IS NOT NULL THEN `%s` "+
-					"WHEN (%s) IS NULL OR (%s) IS NULL THEN NULL "+
-					"WHEN TIMESTAMP_DIFF((%s), (%s), SECOND) = 0 THEN (%s) "+
-					"ELSE (%s) + (TIMESTAMP_DIFF(`%s`, (%s), SECOND) * CAST(((%s) - (%s)) AS FLOAT64) / TIMESTAMP_DIFF((%s), (%s), SECOND)) END",
-				vc.name, vc.name,
+				"CASE WHEN `%s` IS NOT NULL THEN (`%s` + %s) "+
+					"WHEN %s IS NULL OR %s IS NULL THEN CAST(NULL AS FLOAT64) "+
+					"WHEN (%s - %s) = 0 THEN (%s + %s) "+
+					"ELSE %s + %s * (%s - %s) END",
+				vc.name, vc.name, nativeZero,
 				prevV, nextV,
-				nextT, prevT, prevV,
-				prevV, ts, prevT,
-				nextV, prevV, nextT, prevT,
+				nextT, prevT, prevV, nativeZero,
+				prevV, frac, nextV, prevV,
 			)
 			projCols = append(projCols, fmt.Sprintf("%s AS `%s`", interp, vc.name))
 		case "null", "":
@@ -457,9 +557,32 @@ func rewriteGapFill(rawArgs string) (string, error) {
 	}
 
 	out := fmt.Sprintf(
-		"(SELECT %s FROM (%s) AS `__gf_g` ORDER BY `%s`)",
+		"(WITH RECURSIVE %s SELECT %s FROM (%s) AS `__gf_g` ORDER BY `%s`)",
+		ticksCTE,
 		strings.Join(projCols, ", "),
-		grouped, ts,
+		anchored, ts,
 	)
 	return out, nil
+}
+
+// normalizeIntervalLiteral takes the raw bucket_width text (e.g.
+// "INTERVAL 1 MINUTE") and returns a canonical single-part
+// "INTERVAL <count> <part>" literal usable as the second argument of
+// TIMESTAMP_ADD. Multi-part intervals (e.g. "INTERVAL '1:30' HOUR TO
+// MINUTE") are not supported by the recursive single-step generator
+// and are rejected so the caller leaves the GAP_FILL call untouched.
+func normalizeIntervalLiteral(raw string) (string, error) {
+	s := strings.TrimSpace(raw)
+	up := strings.ToUpper(s)
+	if !strings.HasPrefix(up, "INTERVAL") {
+		return "", fmt.Errorf("GAP_FILL: bucket_width must be an INTERVAL literal, got %q", raw)
+	}
+	rest := strings.TrimSpace(s[len("INTERVAL"):])
+	fields := strings.Fields(rest)
+	if len(fields) != 2 {
+		return "", fmt.Errorf("GAP_FILL: unsupported bucket_width %q", raw)
+	}
+	count := fields[0]
+	part := strings.ToUpper(fields[1])
+	return fmt.Sprintf("INTERVAL %s %s", count, part), nil
 }

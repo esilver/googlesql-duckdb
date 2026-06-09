@@ -12,6 +12,11 @@ cases:
     sql: |-
       (SELECT 1 AS x UNION ALL SELECT 2) UNION DISTINCT (SELECT 2 UNION ALL SELECT 3)
     expected:
+      # UNION DISTINCT has no ORDER BY, so GoogleSQL leaves the row order
+      # unspecified. DuckDB's hash-dedup emits these rows in an arbitrary,
+      # run-to-run-unstable order, so assert set-equality rather than a
+      # fixed sequence (1,2,3 are the deduplicated result regardless of order).
+      unordered: true
       rows:
         - [1]
         - [2]
