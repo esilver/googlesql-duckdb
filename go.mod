@@ -1,6 +1,6 @@
 module github.com/goccy/googlesqlite
 
-go 1.25.0
+go 1.25.6
 
 require (
 	cloud.google.com/go/bigquery v1.76.0
@@ -104,3 +104,9 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260401024825-9d38bb4040a9 // indirect
 	google.golang.org/grpc v1.80.0 // indirect
 )
+
+require duckdbconverge v0.0.0
+
+replace github.com/duckdb/duckdb-go/v2 => ../duckdb-wasm2go-poc/converge/duckdbcompat
+
+replace duckdbconverge => ../duckdb-wasm2go-poc/converge

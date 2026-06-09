@@ -64,21 +64,13 @@ func loadSpatialExtension(_ *sql.DB) error {
 // short-lived handle (rather than a caller-supplied one) keeps the
 // extension loader off any database that is concurrently serving queries.
 func doLoadSpatialExtension() error {
-	db, err := sql.Open(internalDriverName, ":memory:")
-	if err != nil {
-		return fmt.Errorf("googlesqlite: spatial bootstrap open: %w", err)
-	}
-	defer db.Close()
-	conn, err := db.Conn(context.Background())
-	if err != nil {
-		return fmt.Errorf("googlesqlite: spatial conn: %w", err)
-	}
-	defer conn.Close()
-	for _, stmt := range []string{"INSTALL spatial", "LOAD spatial"} {
-		if _, err := conn.ExecContext(context.Background(), stmt); err != nil {
-			return fmt.Errorf("googlesqlite: %q: %w", stmt, err)
-		}
-	}
+	// duckdbcompat (pure-Go, CGO_ENABLED=0) backend: the native DuckDB spatial
+	// extension is NOT available (no extension repository, no home directory in
+	// the wasm2go engine) and is NOT needed — the entire geography family lowers
+	// to the pure-Go googlesqlite_st_* / googlesqlite_s2_* scalar UDFs registered
+	// by registerGeographyUDFs. The native INSTALL/LOAD here was only a dead
+	// parity probe (see the comment above loadSpatialExtension), so on this
+	// backend it is a no-op. SWAP-BLUEPRINT §1.5.
 	return nil
 }
 

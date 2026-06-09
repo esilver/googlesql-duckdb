@@ -1,3 +1,5 @@
+//go:build cgo
+
 package googlesqlite
 
 // This file is a CONTAINED cgo bridge that registers GoogleSQL aggregate /
