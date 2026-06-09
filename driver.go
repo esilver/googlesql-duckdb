@@ -205,6 +205,12 @@ func newDBAndCatalog(name string) (*sql.DB, *internal.Catalog, error) {
 	if err := registerDuckDBGeography(db); err != nil {
 		return nil, nil, err
 	}
+	if err := registerDuckDBAggregates(db); err != nil {
+		return nil, nil, err
+	}
+	if err := registerKLLExtractScalars(db); err != nil {
+		return nil, nil, err
+	}
 	catalog := internal.NewCatalog(db)
 	nameToDBMap[name] = db
 	nameToCatalogMap[name] = catalog
@@ -286,6 +292,12 @@ func (d *Driver) OpenConnector(name string) (driver.Connector, error) {
 			return nil, err
 		}
 		if err := registerDuckDBGeography(inner); err != nil {
+			return nil, err
+		}
+		if err := registerDuckDBAggregates(inner); err != nil {
+			return nil, err
+		}
+		if err := registerKLLExtractScalars(inner); err != nil {
 			return nil, err
 		}
 		catalog := internal.NewCatalog(inner)
