@@ -441,6 +441,14 @@ func (n *FunctionCallNode) FormatSQL(ctx context.Context) (string, error) {
 	// family to the googlesqlite_ namespace so every call - including the
 	// constructor nested inside GENERATE_RANGE_ARRAY - binds to our UDFs.
 	if mapped, ok := duckDBRangeFuncRemap[funcName]; ok {
+		// RANGE bounds and the RANGE_CONTAINS point reach the UDF as
+		// native DuckDB DATE / DATETIME / TIMESTAMP literals, but the
+		// googlesqlite_range* UDFs declare VARCHAR inputs and the
+		// constructor body needs the element-type header that only the
+		// value-layer envelope carries. Re-encode every temporal-typed
+		// argument into its envelope form so the call binds and the
+		// DATE / DATETIME / TIMESTAMP distinction survives.
+		args = rangeEnvelopeArgs(m1(n.node.ArgumentList()), args)
 		funcName = mapped
 	}
 	if mapped, ok := duckDBAeadFuncRemap[funcName]; ok {
@@ -1455,6 +1463,19 @@ func (n *FunctionCallNode) tryFormatExtract(_ context.Context, funcName string, 
 	if len(args) < 2 {
 		return "", false, fmt.Errorf("EXTRACT: expected expr and part, got %d args", len(args))
 	}
+	// EXTRACT(part FROM INTERVAL ...) has no DuckDB-native date_part
+	// overload: the operand reaches DuckDB as the value-layer interval
+	// envelope (a VARCHAR), so date_part(STRING, STRING) is ambiguous.
+	// Keep the call on the registered googlesqlite_extract value-layer
+	// UDF, whose pure-Go body (date.BindExtract) decodes the envelope
+	// and reads the requested interval field directly.
+	if argList, _ := n.node.ArgumentList(); len(argList) > 0 && argList[0] != nil {
+		if t, _ := argList[0].Type(); t != nil {
+			if k, err := t.Kind(); err == nil && k == googlesql.TypeKindTypeInterval {
+				return fmt.Sprintf("%s(%s)", funcName, strings.Join(args, ",")), true, nil
+			}
+		}
+	}
 	body, ok := decodeLiteralArgBody(args[1])
 	if !ok {
 		return "", false, fmt.Errorf("EXTRACT: unrecognized part argument %q", args[1])
@@ -1978,6 +1999,14 @@ var nativeWindowFuncMap = map[string]string{
 	"count": "count",
 	"min":   "min",
 	"max":   "max",
+	// TF_IDF is registered as a DuckDB aggregate (see duckdb_aggregate_udf.go),
+	// and DuckDB runs any aggregate as a window function under OVER (). Routing
+	// it through the native window path emits a clean `tf_idf(tokens) OVER (...)`
+	// call without the option markers (ignore_nulls / window_rowid) the
+	// emulation path appends - those marker UDFs are not registered on the
+	// DuckDB backend, and the registered aggregate computes the per-row scores
+	// itself.
+	"tf_idf": "tf_idf",
 }
 
 // customNativeWindowFuncMap lists googlesql window functions whose
@@ -2442,6 +2471,58 @@ func isArithmeticOperator(op string) bool {
 		return true
 	}
 	return false
+}
+
+// rangeEnvelopeArgs rewrites the formatted SQL of each temporal-typed
+// RANGE-family argument into its value-layer envelope literal. The
+// formatted form produced by the default path is a native DuckDB DATE /
+// DATETIME / TIMESTAMP literal (literalFromValue's temporal shortcut),
+// which the VARCHAR-typed googlesqlite_range* UDFs cannot bind and which
+// loses the DATE-vs-TIMESTAMP element type once duckdb-go maps both to a
+// bare Go time.Time. Only literal temporal args are rewritten; a
+// non-literal temporal operand (a column reference, a nested RANGE
+// accessor) already flows as the envelope VARCHAR, so it is left
+// untouched. Non-temporal args (the BOOL last_partial_range flag, the
+// INTERVAL step which lowers to googlesqlite_interval, an UNBOUNDED NULL)
+// also pass through unchanged.
+func rangeEnvelopeArgs(argNodes []googlesql.ResolvedExprNode, args []string) []string {
+	if len(argNodes) != len(args) {
+		return args
+	}
+	out := make([]string, len(args))
+	copy(out, args)
+	for i, node := range argNodes {
+		if node == nil {
+			continue
+		}
+		t, _ := node.Type()
+		if t == nil {
+			continue
+		}
+		k, err := t.Kind()
+		if err != nil {
+			continue
+		}
+		switch k {
+		case googlesql.TypeKindTypeDate,
+			googlesql.TypeKindTypeDatetime,
+			googlesql.TypeKindTypeTimestamp:
+			lit, ok := node.(*googlesql.ResolvedLiteral)
+			if !ok {
+				continue
+			}
+			v, err := valueFromGoogleSQLValue(*m1(lit.Value()))
+			if err != nil || v == nil {
+				continue
+			}
+			env, err := envelopeLiteralFromValue(v)
+			if err != nil {
+				continue
+			}
+			out[i] = env
+		}
+	}
+	return out
 }
 
 // argKinds returns the resolved TypeKind of each function argument, in

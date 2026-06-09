@@ -149,6 +149,31 @@ func literalFromGoogleSQLValue(v googlesql.Value) (string, error) {
 	return literalFromValue(value)
 }
 
+// envelopeLiteralFromValue renders v as the value-layer base64 envelope
+// SQL literal unconditionally, bypassing literalFromValue's native-typed
+// shortcuts for temporal kinds. The RANGE family needs its DATE /
+// DATETIME / TIMESTAMP bounds to arrive at the googlesqlite_range UDF in
+// the envelope form (which carries the element-type header the
+// constructor reads), not as a native DuckDB DATE / TIMESTAMP literal
+// that the VARCHAR-typed UDF cannot bind and that erases the DATE vs
+// midnight-TIMESTAMP distinction once duckdb-go maps both to a bare Go
+// time.Time.
+func envelopeLiteralFromValue(v value.Value) (string, error) {
+	if v == nil {
+		return "null", nil
+	}
+	layout, err := value.ValueLayoutFromValue(v)
+	if err != nil {
+		return "", err
+	}
+	b, err := json.Marshal(layout)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode value: %w", err)
+	}
+	encoded := base64.StdEncoding.EncodeToString(b)
+	return "'" + strings.ReplaceAll(encoded, "'", "''") + "'", nil
+}
+
 func valueFromGoogleSQLValue(v googlesql.Value) (value.Value, error) {
 	if m1(v.IsNull()) {
 		return nil, nil

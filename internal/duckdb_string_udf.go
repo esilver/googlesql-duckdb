@@ -62,6 +62,21 @@ var duckDBNormalResultKinds = map[string]DuckDBUDFResultKind{
 	"contains_substr":    DuckDBResultBoolean,
 	"like":               DuckDBResultBoolean,
 	"keys_keyset_length": DuckDBResultBigint,
+	// Hash + bit functions whose pure-Go body returns IntValue must
+	// declare BIGINT so the value-layer bridge hands DuckDB a native
+	// integer rather than the envelope VARCHAR. FARM_FINGERPRINT and
+	// BIT_COUNT return INT64; the BIT_CAST_TO_* family carries its
+	// reinterpreted width as INT64 on this layer.
+	"farm_fingerprint":   DuckDBResultBigint,
+	"bit_count":          DuckDBResultBigint,
+	"bit_cast_to_int32":  DuckDBResultBigint,
+	"bit_cast_to_int64":  DuckDBResultBigint,
+	"bit_cast_to_uint32": DuckDBResultBigint,
+	"bit_cast_to_uint64": DuckDBResultBigint,
+	// EXTRACT(part FROM INTERVAL ...) returns the requested field as
+	// an INT64; the date/timestamp EXTRACT forms never reach this UDF
+	// (tryFormatExtract lowers them to native date_part / CAST).
+	"extract": DuckDBResultBigint,
 }
 
 var duckDBVolatileUDFNames = map[string]struct{}{
@@ -170,6 +185,40 @@ var duckDBNormalUDFNames = append(append([]string{}, stringFamilyUDFNames...),
 	"dlp_key_chain",
 	"dlp_deterministic_encrypt",
 	"dlp_deterministic_decrypt",
+	// Hash family: MD5 / SHA* / HIGHWAY_FINGERPRINT128 return BYTES
+	// (envelope VARCHAR, consumed by TO_HEX / BYTE_LENGTH which are
+	// already value-layer UDFs); FARM_FINGERPRINT returns INT64.
+	// Routing these through the value-layer bridge decodes the BYTES
+	// envelope to the raw payload before hashing, instead of hashing
+	// the base64 envelope string DuckDB's native md5/sha256 would see.
+	"md5",
+	"sha1",
+	"sha256",
+	"sha512",
+	"farm_fingerprint",
+	"highway_fingerprint128",
+	// Bit family: BIT_CAST_TO_* reinterpret the integer bit pattern;
+	// BIT_COUNT popcounts an INT64 / BYTES input. All return INT64.
+	"bit_cast_to_int32",
+	"bit_cast_to_int64",
+	"bit_cast_to_uint32",
+	"bit_cast_to_uint64",
+	"bit_count",
+	// Numeric parsers: PARSE_NUMERIC / PARSE_BIGNUMERIC return a
+	// NUMERIC / BIGNUMERIC value (envelope VARCHAR), CAST to STRING by
+	// the spec.
+	"parse_numeric",
+	"parse_bignumeric",
+	// Interval constructors / normalizers return an INTERVAL value
+	// (envelope VARCHAR); the specs only assert IS NOT NULL.
+	"make_interval",
+	"justify_days",
+	"justify_hours",
+	"justify_interval",
+	// EXTRACT(part FROM INTERVAL ...) is routed here by tryFormatExtract
+	// (no DuckDB-native date_part overload accepts the interval
+	// envelope). The extracted interval field is an INT64.
+	"extract",
 )
 
 // StringFamilyUDFSpecs returns the DuckDB scalar UDF specs for the string

@@ -104,6 +104,14 @@ func DecodeValue(v any) (Value, error) {
 		return FloatValue(float64(vv)), nil
 	case bool:
 		return BoolValue(vv), nil
+	case []byte:
+		// DuckDB hands a BLOB column / BLOB-returning UDF result back as a
+		// Go []byte. The raw-BYTES geography serializers (ST_ASBINARY -> WKB
+		// declared TYPE_BLOB) flow their result into a value-layer UDF
+		// wrapper (TO_HEX / BYTE_LENGTH); without this case the wrapper's
+		// ConvertArgs rejects the []byte. Wrap it as the BYTES value the
+		// body expects.
+		return BytesValue(vv), nil
 	case *big.Int:
 		// DuckDB returns HUGEINT (128-bit) results as *big.Int, which the
 		// SQLite backend never produced. COUNT / COUNTIF / SUM(INTEGER)
