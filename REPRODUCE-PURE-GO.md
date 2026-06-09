@@ -72,10 +72,15 @@ surface the emulator already uses. (See `SWAP-BLUEPRINT.md` in the PoC repo.)
   Needs an engine built WITH the json + icu extensions (the UNNEST lowering
   rides `json_each`; timezone-aware temporals need icu) — the PoC repo's
   `rebuild_fs_all.sh` produces it.
-- ✅ **Conformance: 972 / 994 = 97.79% — EXACT parity with the cgo backend.**
-  Identical pass/fail/skip sets: the 14 failures are the same out-of-scope
-  `bigquery/functions/{search,objectref}` external-service cases the cgo
-  baseline fails, and the 8 skips match. Run it pure-Go with:
+- ✅ **Conformance: 986 PASS / 0 FAIL / 8 SKIP over 994 — EXCEEDS the cgo
+  baseline (972/994).** The cgo build's 14 `bigquery/functions/{search,
+  objectref}` failures turned out to be a wiring gap, not external-service
+  scope: the pure-Go bodies (textfn.BindSearch, extras.BindObj*) always
+  existed — they were never routed on the DuckDB path. A formatter retarget
+  (trySearchObjectRefFunc) plus five entries in the DuckDB UDF allow-list
+  (SEARCH declared BOOL) fixed all 14; the same patch would fix the cgo
+  backend. The 8 skips are proto/graph features with no assertable cases.
+  Run it pure-Go with:
   `CGO_ENABLED=0 GOWORK=off GOFLAGS=-mod=mod go test -vet=off
   -gcflags='duckdbconverge/genpkg=-N -l -c=16' -c -o gsx.test . &&
   ./gsx.test -test.run 'TestSpec/(googlesql|bigquery)' -test.parallel 4`.

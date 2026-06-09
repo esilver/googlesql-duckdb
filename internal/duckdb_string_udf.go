@@ -60,6 +60,7 @@ var stringFamilyResultKinds = map[string]DuckDBUDFResultKind{
 
 var duckDBNormalResultKinds = map[string]DuckDBUDFResultKind{
 	"contains_substr":    DuckDBResultBoolean,
+	"search":             DuckDBResultBoolean,
 	"like":               DuckDBResultBoolean,
 	"keys_keyset_length": DuckDBResultBigint,
 	// Hash + bit functions whose pure-Go body returns IntValue must
@@ -231,6 +232,15 @@ var duckDBNormalUDFNames = append(append([]string{}, stringFamilyUDFNames...),
 	// remaps that leaf to googlesqlite_hll_count_extract (duckDBExtractFuncRemap)
 	// and the body is the same hll.BindHllCountExtract registered in normalFuncs.
 	"hll_count_extract",
+	// SEARCH and the ObjectRef (OBJ.*) family: pure-Go value-layer bodies
+	// (textfn.BindSearch, extras.BindObj*). SEARCH returns a native BOOL;
+	// the OBJ.* constructors/accessors return richer values (ObjectRef JSON,
+	// URLs) that stay on the envelope VARCHAR and re-type at decode.
+	"search",
+	"obj_make_ref",
+	"obj_fetch_metadata",
+	"obj_get_access_url",
+	"obj_get_read_url",
 )
 
 // StringFamilyUDFSpecs returns the DuckDB scalar UDF specs for the string

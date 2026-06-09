@@ -465,6 +465,16 @@ func (n *FunctionCallNode) FormatSQL(ctx context.Context) (string, error) {
 	if sql, ok := tryArrayValueLayerFunc(funcName, args); ok {
 		return sql, nil
 	}
+	// DuckDB retarget: the SEARCH and ObjectRef (OBJ.*) families are served by
+	// pure-Go value-layer bodies (textfn.BindSearch, extras.BindObj*) that
+	// registerNormalFuncUDFs already installs as googlesqlite_* scalar UDFs;
+	// their bare resolved names have no DuckDB native and previously fell
+	// through to an unknown-function error (the conformance suite's last 14
+	// failures, historically waved off as "external services"). Route them to
+	// the registered UDFs exactly like the array value-layer family.
+	if sql, ok := trySearchObjectRefFunc(funcName, args); ok {
+		return sql, nil
+	}
 	// DuckDB retarget: the RANGE family has no DuckDB-native type and is
 	// served by googlesqlite_* scalar UDFs registered against the engine
 	// (see registerRangeUDFs). The analyzer resolves these to their bare
@@ -935,6 +945,28 @@ var arrayValueLayerFuncs = map[string]string{
 // the caller falls through to the default formatter.
 func tryArrayValueLayerFunc(funcName string, args []string) (string, bool) {
 	if target, ok := arrayValueLayerFuncs[funcName]; ok {
+		return fmt.Sprintf("%s(%s)", target, strings.Join(args, ",")), true
+	}
+	return "", false
+}
+
+// searchObjectRefFuncs maps the SEARCH / ObjectRef family's bare resolved
+// names to their registered googlesqlite_* scalar UDFs (value-layer bodies in
+// internal/functions/{text,extras}; results are the base64 envelope the row
+// decoder re-types against the analyzer-resolved column type).
+var searchObjectRefFuncs = map[string]string{
+	"search":             "googlesqlite_search",
+	"obj_make_ref":       "googlesqlite_obj_make_ref",
+	"obj_fetch_metadata": "googlesqlite_obj_fetch_metadata",
+	"obj_get_access_url": "googlesqlite_obj_get_access_url",
+	"obj_get_read_url":   "googlesqlite_obj_get_read_url",
+}
+
+// trySearchObjectRefFunc rewrites a bare SEARCH / OBJ.* builtin call to its
+// registered googlesqlite_<name> UDF form (same shape as
+// tryArrayValueLayerFunc).
+func trySearchObjectRefFunc(funcName string, args []string) (string, bool) {
+	if target, ok := searchObjectRefFuncs[funcName]; ok {
 		return fmt.Sprintf("%s(%s)", target, strings.Join(args, ",")), true
 	}
 	return "", false
