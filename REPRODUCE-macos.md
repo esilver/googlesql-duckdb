@@ -1,12 +1,54 @@
 # Reproduce on another Mac - cgo DuckDB-backed BigQuery engine
 
-This fork retargets [goccy/googlesqlite](https://github.com/goccy/googlesqlite)'s
-GoogleSQL engine from SQLite to **DuckDB** via cgo
-(`github.com/duckdb/duckdb-go/v2`, DuckDB **v1.5.3**). On this commit it passes
-**972 / 994 = 97.79%** of the GoogleSQL + BigQuery conformance suite (Spanner
-excluded) - i.e. **100% of the in-scope, assertable cases**. The only remaining
-fails are external-service stubs (`bigquery/functions/search`, `objectref`) and
-spec-status-gated documentation-only cases.
+## What this repo is
+
+A **local BigQuery emulator backed by DuckDB** - run BigQuery GoogleSQL (dbt models,
+ad-hoc queries, CI) on your machine without hitting real BigQuery, with far higher
+SQL fidelity than a SQLite-based emulator gives.
+
+It is a fork of **[goccy/googlesqlite](https://github.com/goccy/googlesqlite)**, the
+GoogleSQL engine behind
+[goccy/bigquery-emulator](https://github.com/goccy/bigquery-emulator). Upstream, that
+engine parses + analyzes BigQuery's GoogleSQL with ZetaSQL and then executes against
+a **SQLite** backend - but SQLite's semantics diverge from BigQuery in many places
+(types, functions, NULL handling), which caps how much real BigQuery SQL it can run
+faithfully.
+
+**What we changed:** retarget the backend from SQLite to **DuckDB**, whose SQL
+semantics are much closer to BigQuery (and which is fast - vectorized, native). The
+ZetaSQL parse/analyze stays; the engine's *formatter* lowers the analyzed query to
+**DuckDB** SQL instead of SQLite, and BigQuery's builtin functions are registered as
+**DuckDB UDFs**.
+
+## How it works
+
+```
+BigQuery GoogleSQL
+  -> ZetaSQL parse + analyze            (go-googlesql; unchanged from upstream)
+  -> resolved AST
+  -> formatter lowers the AST to DuckDB SQL          (this fork's core work)
+  -> BigQuery builtins registered as DuckDB UDFs     (scalar / aggregate / table, cgo)
+  -> DuckDB executes        (github.com/duckdb/duckdb-go/v2, libduckdb v1.5.3)
+```
+
+Aggregates use the C `duckdb_create_aggregate_function` binding. Correctness is
+scored by the conformance suite under `testdata/specs/`, which encodes BigQuery's own
+documented behavior as cases.
+
+## Status & scope
+
+- **Coverage: 972 / 994 = 97.79%** of the GoogleSQL + BigQuery conformance suite
+  (Spanner excluded - not a BigQuery target). That is **100% of the in-scope,
+  assertable cases**; it climbed 8.2% -> 65% -> 79% -> 86% -> 91% -> 97.79% over
+  several rounds.
+- **Out of scope (all 14 remaining fails):** `bigquery/functions/search` (vector/text
+  search indexes) and `objectref` (GCS object references) - these need external Google
+  services and cannot run in an in-process engine. Plus 8 spec-status-gated
+  documentation-only cases the suite itself does not require.
+- **This is the cgo build** (links native libduckdb - fast). A separate experiment
+  proved a *pure-Go, no-cgo* DuckDB (via wasm2go transpile) is also feasible - DuckDB
+  *semantics*, not *speed* (~5-22x slower) - but it lives in its own repo and is not
+  needed here.
 
 These steps take a clean macOS machine to a working build + that conformance number.
 
