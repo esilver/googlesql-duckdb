@@ -273,7 +273,8 @@ export function App({ mode, onToggleMode }: AppProps) {
         <LockIcon sx={{ fontSize: 16 }} color="action" />
         <Typography variant="caption" color="text.secondary">
           Every query runs entirely in your browser — your queries and data are
-          never uploaded to a server.
+          never uploaded to a server. The database is in-memory and resets on
+          reload (your query history is kept).
         </Typography>
       </Box>
 

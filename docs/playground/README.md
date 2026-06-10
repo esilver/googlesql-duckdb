@@ -59,3 +59,26 @@ is never deployed: the worker fetches the gzip-compressed
 and `make build/page` drops the uncompressed copy from `dist/`. The
 same release workflow also attaches `googlesqlite.wasm` to the GitHub
 release as a downloadable asset.
+
+## Wasm mode (fully in-browser, no server)
+
+`make dev` (the default path) runs everything in the tab: the pure-Go DuckDB
+engine, the BigQuery dialect, and the GoogleSQL analyzer compiled into one
+`googlesqlite.wasm`. The database is **in-memory and resets on reload**
+(query history persists via OPFS). Server mode (`VITE_ENGINE=server make dev`)
+remains the fast path for big data.
+
+Measured (node26/V8, M-series):
+
+| metric | value |
+|---|---|
+| module size | 708 MB raw / **123 MB gzipped** |
+| instantiate | ~0.4 s |
+| one-time engine+analyzer init | ~7 s |
+| first analysis | ~216 ms |
+| repeat query (analysis cache) | **~22 ms** |
+| CREATE / INSERT / aggregate | 0.1-0.4 s |
+| memory | ~4.8 GB RSS |
+
+Build it with `make build/wasm` (or let `make dev` do it). Requires node 26
+(`/opt/homebrew/opt/node/bin` on this box; node@22 is broken).

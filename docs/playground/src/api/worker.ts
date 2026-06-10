@@ -10,12 +10,11 @@
 //     API surface and JSON shapes as the wasm engine, so everything
 //     below the engine seam is shared.
 //
-// Persistence is the Origin Private File System (OPFS): the worker
-// acquires synchronous access handles for the database file and the
-// history file before the engine starts. The database handle is
-// handed to the engine's "opfs" SQLite VFS, which reads and writes it
-// directly — so the database persists across reloads with no explicit
-// save step. The history handle stays in the worker.
+// Persistence: only the query/result history persists, in an Origin
+// Private File System (OPFS) file owned by this worker. The
+// DuckDB-backed engine is :memory:-only in the browser — it has no
+// OPFS-backed filesystem the way the previous SQLite "opfs" VFS did —
+// so the database itself is rebuilt from scratch on every load.
 
 import { installWasmFS } from './wasmfs'
 import type {
@@ -88,15 +87,10 @@ function installProcessShim(): void {
 
 // --- OPFS persistence -----------------------------------------------
 
-// OPFS_DB_FILE is the SQLite database file in the Origin Private File
-// System; OPFS_HISTORY_FILE holds the query/result history JSON.
-const OPFS_DB_FILE = 'googlesqlite.db'
+// OPFS_HISTORY_FILE holds the query/result history JSON. (The old
+// SQLite build also kept the database file here; the DuckDB engine is
+// :memory:-only, so only the history file remains.)
 const OPFS_HISTORY_FILE = 'history.json'
-
-// DB_HANDLE_GLOBAL is the globalThis property the engine's "opfs" VFS
-// reads the database handle from. It must match dbHandleGlobal in
-// cmd/googlesqlite/opfsvfs_js.go.
-const DB_HANDLE_GLOBAL = '__googlesqliteDBHandle'
 
 // historyHandle is the OPFS access handle for the history file, or
 // null when OPFS is unavailable.
@@ -127,24 +121,21 @@ async function openOPFSFile(
   throw lastErr
 }
 
-// installOPFS acquires the OPFS access handles before the engine
-// starts. The database handle is published on globalThis for the
-// engine's "opfs" VFS; the history handle stays in the worker.
+// installOPFS acquires the OPFS access handle for the history file.
+// The database is :memory:-only and needs no handle.
 //
 // OPFS needs a secure context (HTTPS, or localhost). When it is absent
 // — for example plain HTTP over a LAN IP — this logs and returns; the
-// engine then falls back to a non-persistent in-memory database.
+// history then simply does not persist across reloads.
 async function installOPFS(): Promise<void> {
   if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) {
     console.warn(
       'googlesqlite: OPFS unavailable (needs a secure context); ' +
-        'the database will not persist across reloads',
+        'the history will not persist across reloads',
     )
     return
   }
   try {
-    ;(globalThis as Record<string, unknown>)[DB_HANDLE_GLOBAL] =
-      await openOPFSFile(OPFS_DB_FILE)
     historyHandle = await openOPFSFile(OPFS_HISTORY_FILE)
   } catch (e) {
     console.error('googlesqlite: opening OPFS failed:', e)
@@ -174,8 +165,8 @@ function writeOPFSText(
 }
 
 // restore loads the persisted query history into the engine. The
-// database itself needs no restore step — SQLite opens the OPFS file
-// directly through the "opfs" VFS.
+// database itself has no restore step: it is :memory:-only and starts
+// empty on every load.
 async function restore(): Promise<void> {
   if (!historyHandle) {
     return
@@ -190,8 +181,8 @@ async function restore(): Promise<void> {
   }
 }
 
-// persist writes the query history back to its OPFS file. The database
-// is already durable — SQLite wrote it straight to OPFS.
+// persist writes the query history back to its OPFS file. The
+// database itself is not persisted (:memory:-only engine).
 async function persist(): Promise<void> {
   if (!historyHandle) {
     return
@@ -387,8 +378,8 @@ async function loadEngine(
 }
 
 // initWASM installs the in-memory filesystem, loads wasm_exec.js and
-// the engine binary, acquires the OPFS handles, starts the Go program
-// and resolves once the engine has installed its API.
+// the engine binary, acquires the OPFS history handle, starts the Go
+// program and resolves once the engine has installed its API.
 async function initWASM(): Promise<void> {
   const base = import.meta.env.BASE_URL
 
@@ -409,8 +400,8 @@ async function initWASM(): Promise<void> {
   const ready = new Promise<void>((resolve) => {
     globalThis.onGoogleSQLiteReady = resolve
   })
-  // The engine reads the OPFS database handle on start-up, so it must
-  // be published before go.run.
+  // Acquire the history file handle before the first request can
+  // persist; the engine itself takes nothing from OPFS.
   await installOPFS()
   // go.run resolves only when the Go program exits. The program parks
   // itself with select{}, so it is intentionally not awaited.

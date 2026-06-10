@@ -112,9 +112,9 @@ if (!first || !first.includes('googlesqlite.wasm.gz') || !first.includes('?v='))
 }
 console.log('engine binary fetched as a versioned .gz')
 
-// OPFS persists the database across reloads — and so across e2e runs
-// against the same origin. Drop any tables a previous run left behind
-// so this run starts from a clean, predictable state.
+// The database is :memory:-only, so a fresh load already starts
+// clean; the DROPs are kept as a cheap belt-and-braces guard (and as
+// the first end-to-end statement execution).
 await runQuery(
   page,
   'DROP TABLE IF EXISTS t;\n' +
@@ -266,8 +266,9 @@ await page.waitForTimeout(200)
 await page.waitForTimeout(400)
 await page.screenshot({ path: 'e2e-desktop.png', fullPage: true })
 
-// Create a sizable table so the reload below exercises that a real,
-// non-trivial database survives in the OPFS-backed file.
+// Create a table so the reload below can verify the :memory:-only
+// contract: the database does NOT survive a reload (only the query
+// history does).
 await runQuery(
   page,
   'CREATE TABLE persist_test (id INT64, payload STRING);\n' +
@@ -284,13 +285,20 @@ await page.reload({ waitUntil: 'load' })
 await waitReady(page)
 console.log(`engine ready (reload, ${Date.now() - reloadStart} ms)`)
 
-// The database must survive the reload: SQLite reads it straight from
-// the OPFS file, so a new page sees the rows the old page wrote.
+// The engine is :memory:-only: the reloaded page gets a fresh, empty
+// database, so querying the old table must fail with "not found"
+// rather than return rows.
 await runQuery(page, 'SELECT COUNT(*) AS n FROM persist_test;')
-if (!(await page.evaluate(() => document.body.innerText)).includes('5000')) {
-  await fail('table data did not survive a reload (persistence failed)')
+const afterReload = await page.evaluate(() => document.body.innerText)
+if (afterReload.includes('5000')) {
+  await fail(
+    'table data survived a reload — the engine is supposed to be :memory:-only',
+  )
 }
-console.log('database persisted across reload OK')
+if (!/not found|does not exist|Unrecognized name|no such table/i.test(afterReload)) {
+  await fail('querying a pre-reload table did not produce a not-found error')
+}
+console.log('database is :memory:-only across reload OK')
 
 // On reload the engine binary must come from Cache Storage — but
 // Cache Storage exists only in a secure context. Over plain HTTP it is
@@ -325,6 +333,13 @@ if (!mobileText.includes('History')) {
   await fail('history drawer did not open on mobile')
 }
 console.log('mobile layout + history drawer OK')
+
+// The query history — unlike the database — lives in an OPFS file
+// owned by the worker and must have survived the reload above.
+if (!mobileText.includes('HISTORY_MARKER')) {
+  await fail('query history did not survive a reload')
+}
+console.log('history persisted across reload OK')
 
 console.log('=== console / errors ===')
 console.log(logs.join('\n') || '(none)')
