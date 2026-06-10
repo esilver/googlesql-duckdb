@@ -2285,18 +2285,25 @@ func (c *Catalog) addTableSpec(spec *TableSpec) error {
 	c.bumpAnalysisGeneration()
 	tableName := spec.TableName()
 	if _, exists := c.tableMap[tableName]; exists {
-		// Refresh the entry in-place: CREATE OR REPLACE TABLE has to
-		// update INFORMATION_SCHEMA's view of columns and options as
-		// well as the resolver-side handle. Replace the existing
-		// pointer in c.tables and re-register through the analyzer
-		// catalog. Mapping the new pointer keeps any cached
-		// re-analysis pinned to the latest spec.
+		// CREATE OR REPLACE TABLE/VIEW (issue #10): swap the spec
+		// pointer in the Go-side registries, then rebuild the
+		// analyzer catalog. The wasm-side SimpleCatalog has no table
+		// removal API and addTableSpecRecursive skips names that are
+		// already registered, so without the rebuild the resolver
+		// keeps the OLD SimpleTable handle — with the old column
+		// set — under every lookup alias. resetCatalog re-registers
+		// every spec from scratch (the same machinery DROP uses via
+		// deleteTableSpecByName), building a fresh handle for the
+		// replaced table and refreshing INFORMATION_SCHEMA too.
 		c.tableMap[tableName] = spec
 		for i := range c.tables {
 			if c.tables[i].TableName() == tableName {
 				c.tables[i] = spec
 				break
 			}
+		}
+		if err := c.resetCatalog(c.tables, c.functions, c.tvfs); err != nil {
+			return fmt.Errorf("failed to rebuild catalog for replaced table %q: %w", tableName, err)
 		}
 		return nil
 	}
