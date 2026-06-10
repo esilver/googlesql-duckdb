@@ -56,19 +56,23 @@ func TestBulkInsertStorageParityComplexTypes(t *testing.T) {
 		colType  string
 		blob     bool   // raw-compare via hex() (BLOB storage)
 		readback string // dialect-path projection over `c` ("" = TO_JSON_STRING(`c`))
+		valueSQL string // per-row VALUES expression for `c` ("" = plain ?)
 		values   []any  // one per row; nil rows included on purpose
 	}{
-		{"numeric", "NUMERIC", false, "", []any{"123.45", "-0.000000001", "123.450", nil}},
-		{"bignumeric", "BIGNUMERIC", false, "", []any{"99999999999999999999999999999.123456789", nil}},
-		{"json", "JSON", false, "", []any{`{"b": 2,  "a": [1, null]}`, `"plain string"`, `[1,2,3]`, nil}},
+		{"numeric", "NUMERIC", false, "", "", []any{"123.45", "-0.000000001", "123.450", nil}},
+		{"bignumeric", "BIGNUMERIC", false, "", "", []any{"99999999999999999999999999999.123456789", nil}},
+		// JSON's per-row reference is PARSE_JSON(?) — the bigquery-emulator
+		// binding shape and the issue-#14 parity bar: a bound string is the
+		// JSON TEXT (parsed into a JSON value), not a JSON scalar string.
+		{"json", "JSON", false, "", "PARSE_JSON(?)", []any{`{"b": 2,  "a": [1, null]}`, `"plain string"`, `[1,2,3]`, nil}},
 		// TO_JSON_STRING over TIME is a pre-existing dialect gap (identical
 		// for both paths); read back through CAST instead.
-		{"time", "TIME", false, "CAST(`c` AS STRING)", []any{"12:34:56.789012", "00:00:00", nil}},
-		{"bytes", "BYTES", true, "", []any{[]byte{0x01, 0x02, 'h', 'i'}, []byte{}, nil}},
-		{"arr_i", "ARRAY<INT64>", false, "", []any{[]int64{1, 2, 3}, []int64{}, nil}},
-		{"arr_s", "ARRAY<STRING>", false, "", []any{[]string{"x", "it's"}, nil}},
-		{"strct", "STRUCT<a INT64, b STRING>", false, "", []any{map[string]any{"a": int64(7), "b": "q"}, map[string]any{"b": "only-b"}, nil}},
-		{"strct_nest", "STRUCT<a INT64, s STRUCT<x FLOAT64, y ARRAY<INT64>>>", false, "",
+		{"time", "TIME", false, "CAST(`c` AS STRING)", "", []any{"12:34:56.789012", "00:00:00", nil}},
+		{"bytes", "BYTES", true, "", "", []any{[]byte{0x01, 0x02, 'h', 'i'}, []byte{}, nil}},
+		{"arr_i", "ARRAY<INT64>", false, "", "", []any{[]int64{1, 2, 3}, []int64{}, nil}},
+		{"arr_s", "ARRAY<STRING>", false, "", "", []any{[]string{"x", "it's"}, nil}},
+		{"strct", "STRUCT<a INT64, b STRING>", false, "", "", []any{map[string]any{"a": int64(7), "b": "q"}, map[string]any{"b": "only-b"}, nil}},
+		{"strct_nest", "STRUCT<a INT64, s STRUCT<x FLOAT64, y ARRAY<INT64>>>", false, "", "",
 			[]any{map[string]any{"a": int64(1), "s": map[string]any{"x": 2.5, "y": []int64{9, 8}}}, nil}},
 	}
 
@@ -85,8 +89,12 @@ func TestBulkInsertStorageParityComplexTypes(t *testing.T) {
 			// Per-row path: one parameterized INSERT per row (the exact
 			// fallback the emulator-style caller runs today).
 			for i, v := range tc.values {
+				expr := tc.valueSQL
+				if expr == "" || v == nil {
+					expr = "?" // NULL binds plainly on both paths
+				}
 				if _, err := conn.ExecContext(ctx,
-					fmt.Sprintf("INSERT `%s` (`id`, `c`) VALUES (?, ?)", perRow), int64(i), v); err != nil {
+					fmt.Sprintf("INSERT `%s` (`id`, `c`) VALUES (?, %s)", perRow, expr), int64(i), v); err != nil {
 					t.Fatalf("per-row insert %d (%v): %v", i, v, err)
 				}
 			}
@@ -386,5 +394,149 @@ func TestBulkInsertArrayStructNormalizedShape(t *testing.T) {
 	want := `[{"a":7,"b":"x"},{"a":8,"b":"y"}]`
 	if got != want {
 		t.Fatalf("round-trip = %s, want %s", got, want)
+	}
+}
+
+// TestBulkInsertJSONObjectParity is the issue-#14 acceptance bar. BulkInsert's
+// cast-in-flush used to feed a Go string bound to a JSON column through
+// StringValue.ToJSON (strconv.Quote), so the flush's CAST(c AS JSON) stored a
+// double-encoded JSON STRING where the per-row reference path — INSERT with
+// PARSE_JSON(?), the bigquery-emulator binding shape — stored the parsed
+// value. The bar, verbatim from the issue-#6 verification thread:
+//
+//   - the 5,000-row parity check at ZERO differing rows, compared via
+//     TO_JSON_STRING over the whole row (JSON_VALUE masked the bug — it
+//     unwraps a JSON scalar string, so field extraction passed either way);
+//   - JSON_TYPE(doc) = 'object' on a bulk-loaded row;
+//   - and (failure parity) invalid JSON text must error on the bulk path the
+//     way per-row PARSE_JSON errors, not get silently stored as a quoted
+//     scalar string.
+func TestBulkInsertJSONObjectParity(t *testing.T) {
+	db, err := sql.Open("googlesqlite", ":memory:?_test=bulk_json_parity14")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	for _, tbl := range []string{"p", "b"} {
+		if _, err := conn.ExecContext(ctx,
+			fmt.Sprintf("CREATE TABLE `%s` (`id` INT64, `doc` JSON)", tbl)); err != nil {
+			t.Fatalf("create %s: %v", tbl, err)
+		}
+	}
+
+	// 5,000 rows over the JSON kinds that diverge under double-encoding:
+	// objects, arrays, scalar strings, numbers, booleans, JSON null.
+	const rowCount = 5000
+	doc := func(i int) string {
+		switch i % 6 {
+		case 0:
+			return fmt.Sprintf(`{"k":%d,"tags":["a","b"],"nested":{"v":%d}}`, i, i*2)
+		case 1:
+			return fmt.Sprintf(`[%d,null,"s-%d"]`, i, i)
+		case 2:
+			return fmt.Sprintf(`"plain string %d"`, i)
+		case 3:
+			return fmt.Sprintf(`%d.5`, i)
+		case 4:
+			return `true`
+		default:
+			return `null`
+		}
+	}
+
+	// Per-row reference path: INSERT with PARSE_JSON(?).
+	for i := 0; i < rowCount; i++ {
+		if _, err := conn.ExecContext(ctx,
+			"INSERT `p` (`id`, `doc`) VALUES (?, PARSE_JSON(?))", int64(i), doc(i)); err != nil {
+			t.Fatalf("per-row insert %d: %v", i, err)
+		}
+	}
+
+	// Bulk path: the same raw JSON texts, one batch.
+	rows := make([][]any, rowCount)
+	for i := 0; i < rowCount; i++ {
+		rows[i] = []any{int64(i), doc(i)}
+	}
+	if n, err := googlesqlite.BulkInsert(ctx, conn, []string{"b"}, []string{"id", "doc"}, rows); err != nil || n != rowCount {
+		t.Fatalf("BulkInsert: n=%d err=%v", n, err)
+	}
+
+	// Whole-row TO_JSON_STRING parity, row by row: ZERO differing rows.
+	fetch := func(tbl string) []string {
+		t.Helper()
+		rs, err := conn.QueryContext(ctx,
+			fmt.Sprintf("SELECT TO_JSON_STRING(t) FROM `%s` AS t ORDER BY t.id", tbl))
+		if err != nil {
+			t.Fatalf("TO_JSON_STRING over %s: %v", tbl, err)
+		}
+		defer rs.Close()
+		out := make([]string, 0, rowCount)
+		for rs.Next() {
+			var s string
+			if err := rs.Scan(&s); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			out = append(out, s)
+		}
+		if err := rs.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	want, got := fetch("p"), fetch("b")
+	if len(want) != rowCount || len(got) != rowCount {
+		t.Fatalf("row counts: per-row=%d bulk=%d, want %d", len(want), len(got), rowCount)
+	}
+	differing := 0
+	for i := range want {
+		if want[i] != got[i] {
+			if differing == 0 {
+				t.Errorf("first differing row %d:\n per-row: %s\n bulk:    %s", i, want[i], got[i])
+			}
+			differing++
+		}
+	}
+	if differing != 0 {
+		t.Errorf("TO_JSON_STRING parity: %d differing rows, want 0", differing)
+	}
+
+	// JSON_TYPE on a loaded object row must be 'object', not 'string' —
+	// on the bulk table AND the per-row reference table.
+	for _, tbl := range []string{"b", "p"} {
+		var jt string
+		if err := conn.QueryRowContext(ctx,
+			fmt.Sprintf("SELECT JSON_TYPE(`doc`) FROM `%s` WHERE `id` = 0", tbl)).Scan(&jt); err != nil {
+			t.Fatalf("JSON_TYPE over %s: %v", tbl, err)
+		}
+		if jt != "object" {
+			t.Errorf("JSON_TYPE(doc) on %s row = %q, want %q", tbl, jt, "object")
+		}
+	}
+
+	// Failure parity: invalid JSON text errors on BOTH paths (the bulk path
+	// used to quote it into a valid JSON scalar string and store it).
+	const badJSON = `{not json`
+	if _, err := conn.ExecContext(ctx,
+		"INSERT `p` (`id`, `doc`) VALUES (?, PARSE_JSON(?))", int64(rowCount), badJSON); err == nil {
+		t.Error("per-row PARSE_JSON of invalid JSON text: want error, got nil")
+	}
+	if _, err := googlesqlite.BulkInsert(ctx, conn, []string{"b"}, []string{"id", "doc"},
+		[][]any{{int64(rowCount), badJSON}}); err == nil {
+		t.Error("BulkInsert of invalid JSON text: want error, got nil")
+	}
+	var afterBad int64
+	if err := conn.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM `b` WHERE `id` = ?", int64(rowCount)).Scan(&afterBad); err != nil {
+		t.Fatal(err)
+	}
+	if afterBad != 0 {
+		t.Errorf("invalid-JSON bulk row was stored (%d rows), want rejected", afterBad)
 	}
 }

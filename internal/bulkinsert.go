@@ -38,7 +38,9 @@
 // implicitly (issue #6 "cast-in-flush"):
 //
 //	TIME -> "15:04:05.999999" text, CAST(c AS TIME)   (TIME column)
-//	JSON -> raw JSON text,         CAST(c AS JSON)    (JSON column)
+//	JSON -> raw JSON text,         CAST(c AS JSON)    (JSON column; a string
+//	        value is the JSON text itself, validated with the same PARSE_JSON
+//	        the per-row reference path runs — issue #14)
 //
 // Because duckdb.NewAppender rejects any table containing a TIME/JSON column,
 // tables with CAST-class columns load through a private TEMP staging table
@@ -70,6 +72,7 @@ import (
 	duckdb "github.com/esilver/duckdb-go-pure"
 	googlesql "github.com/goccy/go-googlesql"
 
+	jsonfn "github.com/goccy/googlesqlite/internal/functions/json"
 	"github.com/goccy/googlesqlite/internal/value"
 )
 
@@ -449,6 +452,9 @@ func bulkEncodeCell(t *Type, v any) (any, error) {
 // directly, so the envelope is converted to its []byte form here (the stored
 // cell is byte-identical — measured in the storage-parity tests).
 func bulkEncodeComplexCell(t *Type, kind googlesql.TypeKind, raw any, val value.Value) (any, error) {
+	if kind == googlesql.TypeKindTypeJson {
+		return bulkEncodeJSONCell(raw, val)
+	}
 	var casted value.Value
 	if s, ok := raw.(string); ok {
 		if decoded, err := DecodeValue(s); err == nil && decoded != nil {
@@ -477,6 +483,47 @@ func bulkEncodeComplexCell(t *Type, kind googlesql.TypeKind, raw any, val value.
 		}
 	}
 	return enc, nil
+}
+
+// bulkEncodeJSONCell produces the raw JSON text the flush's CAST(c AS JSON)
+// parses for a JSON column, mirroring the per-row reference path
+// (INSERT .. PARSE_JSON(?), the bigquery-emulator binding shape) exactly
+// (issue #14):
+//
+//   - a string value IS the JSON text: validate it with the same PARSE_JSON
+//     the per-row path runs (identical failure surface for invalid text) and
+//     feed it RAW. The previous reading went through StringValue.ToJSON,
+//     which strconv.Quotes the text into a JSON scalar string, so the flush
+//     stored a double-encoded STRING where per-row stored the parsed value;
+//   - a string that decodes as a value-layer envelope decodes first (the
+//     same preamble the generic path applies), then its string reading gets
+//     the PARSE_JSON treatment — matching the per-row UDF, whose argument
+//     decoder unwraps the envelope before parsing;
+//   - everything else (a JsonValue handed back from a scan, native scalars,
+//     structured values) keeps the castValueWithKind reading: ToJSON renders
+//     the raw JSON form (JsonValue passes through unchanged).
+//
+// Nested JSON (a struct field / array element of type JSON) is NOT routed
+// here on purpose: those cells live inside value-layer envelopes and must
+// keep bulkCastValue's castValueWithKind-mirroring reading, byte-identical
+// to what the per-row parameter pipeline stores.
+func bulkEncodeJSONCell(raw any, val value.Value) (any, error) {
+	if s, ok := raw.(string); ok {
+		if decoded, err := DecodeValue(s); err == nil && decoded != nil {
+			val = decoded
+		}
+	}
+	if sv, ok := val.(value.StringValue); ok {
+		jv, err := jsonfn.PARSE_JSON(string(sv), "exact")
+		if err != nil {
+			return nil, err
+		}
+		if jv == nil {
+			return nil, nil
+		}
+		val = jv
+	}
+	return val.ToJSON()
 }
 
 // bulkCastValue is the pure-Go mirror of castValueWithKind over the catalog's
