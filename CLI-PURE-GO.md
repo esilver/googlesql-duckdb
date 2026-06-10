@@ -18,14 +18,19 @@ see REPRODUCE-PURE-GO.md).
 ```sh
 cd googlesqlite     # this repo, branch pure-go-duckdb-backend
 CGO_ENABLED=0 \
-  go build -gcflags='github.com/esilver/duckdb-go-pure/internal/duckdbcore=-N -l -c=16' -o gsx ./cmd/googlesqlite
+  go build \
+  -gcflags='github.com/esilver/duckdb-go-pure/internal/duckdbcore/...=-l -c=1' \
+  -gcflags='github.com/esilver/duckdb-go-pure/internal/duckdbcore/core=-c=1' \
+  -o gsx ./cmd/googlesqlite
 ```
 
-The first build compiles the ~150 MB generated engine package (~5–10 min);
-afterwards Go's build cache makes rebuilds take seconds unless the engine
-itself changed. (The `-gcflags` disables optimization ONLY for that generated
-package — full optimization of it OOMs the Go compiler; everything else
-optimizes normally.)
+The first build compiles the generated engine (since duckdb-go-pure v0.2.0 it
+is sharded into ~30 packages and compiles **fully optimized** in ~2 min /
+<3 GB peak); afterwards Go's build cache makes rebuilds take seconds unless
+the engine itself changed. (The `-gcflags` pair is load-bearing: `-l` on the
+shards prevents the inliner re-expanding the generated IR and OOMing at
+~50 GB, `-c=1` keeps per-package compiler memory flat; everything else
+optimizes normally. See the duckdb-go-pure README "Required build flags".)
 
 ## Use it
 

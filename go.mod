@@ -9,7 +9,7 @@ require (
 	github.com/chzyer/readline v1.5.1
 	github.com/dgryski/go-farm v0.0.0-20240924180020-3414d57e47da
 	github.com/dop251/goja v0.0.0-20260311135729-065cd970411c
-	github.com/esilver/duckdb-go-pure v0.2.0
+	github.com/esilver/duckdb-go-pure v0.2.1
 	github.com/fatih/color v1.19.0
 	github.com/fsouza/fake-gcs-server v1.54.0
 	github.com/goccy/go-googlesql v0.2.2
