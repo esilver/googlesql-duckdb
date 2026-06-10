@@ -316,7 +316,11 @@ func bytesValueFromLiteral(lit string) value.BytesValue {
 }
 
 func dateValueFromLiteral(days int64) value.DateValue {
-	t := time.Unix(int64(time.Duration(days)*24*(time.Hour/time.Second)), 0)
+	// time.Unix returns a local-zone time.Time; a DATE is a civil value,
+	// so it must stay at UTC midnight. Formatting a local-zone value in
+	// any zone west of UTC rendered the previous day (DATE "2024-03-22"
+	// stored and displayed as "2024-03-21" in America/New_York).
+	t := time.Unix(int64(time.Duration(days)*24*(time.Hour/time.Second)), 0).UTC()
 	return value.DateValue(t)
 }
 

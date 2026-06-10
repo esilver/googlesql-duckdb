@@ -488,9 +488,20 @@ func (s *ColumnSpec) SQLiteSchema() string {
 	case googlesql.TypeKindTypeString:
 		typ = "TEXT"
 	case googlesql.TypeKindTypeDate:
-		typ = "TEXT"
+		// Native DuckDB temporal storage. The expression lowering emits
+		// native date/time functions (date_part, strftime, date_add, ...)
+		// directly on stored columns, so the column type must be the
+		// native one — a TEXT/VARCHAR column fails to bind at DuckDB
+		// prepare time (e.g. date_part(STRING_LITERAL, VARCHAR)). The
+		// scan path already decodes the engine's time.Time cells (see
+		// rows.go timeValueForKind), and INSERT lowers temporal literals
+		// to typed native literals (DATE '...', TIMESTAMPTZ '...').
+		typ = "DATE"
 	case googlesql.TypeKindTypeTimestamp:
-		typ = "TEXT"
+		// GoogleSQL TIMESTAMP is an absolute instant; DuckDB TIMESTAMPTZ
+		// matches (the engine session TimeZone is UTC, so date_part /
+		// strftime over it follow GoogleSQL's default-UTC semantics).
+		typ = "TIMESTAMPTZ"
 	case googlesql.TypeKindTypeArray:
 		typ = "TEXT"
 	case googlesql.TypeKindTypeStruct:
@@ -498,9 +509,11 @@ func (s *ColumnSpec) SQLiteSchema() string {
 	case googlesql.TypeKindTypeProto:
 		typ = "TEXT"
 	case googlesql.TypeKindTypeTime:
-		typ = "TEXT"
+		typ = "TIME"
 	case googlesql.TypeKindTypeDatetime:
-		typ = "TEXT"
+		// GoogleSQL DATETIME is a civil (zone-less) wall-clock value:
+		// DuckDB's plain TIMESTAMP.
+		typ = "TIMESTAMP"
 	case googlesql.TypeKindTypeGeography:
 		typ = "TEXT"
 	case googlesql.TypeKindTypeNumeric:

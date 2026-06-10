@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"testing"
+
+	"github.com/goccy/googlesqlite"
 )
 
 // ---- from tests/parity/regression_test.go ----
@@ -2242,5 +2244,172 @@ func TestRegression_InUnnestArrayParam(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("got %v want %v", got, want)
 		}
+	}
+}
+
+// TestRegression_PrepareFailureDoesNotPoisonConnection asserts that a
+// DuckDB PREPARE-time failure (Binder error) does not leave a dangling
+// engine transaction on the pooled connection. The pure-Go DuckDB
+// engine begins an implicit transaction at prepare time and a Binder
+// failure returns without aborting it; before the fix every subsequent
+// statement on the connection failed its catalog sync with "cannot
+// start a transaction within a transaction".
+func TestRegression_PrepareFailureDoesNotPoisonConnection(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1) // force statement reuse of the same pooled connection
+	defer db.Close()
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "CREATE TABLE poison_repro (dt DATE, x INT64)"); err != nil {
+		t.Fatal(err)
+	}
+	// A statement that survives analysis but fails at DuckDB prepare
+	// (or used to, before the temporal-column lowering fix). Whether it
+	// fails or succeeds, it must not poison the connection.
+	rows, qerr := conn.QueryContext(ctx, "SELECT CAST(dt AS STRING) FROM poison_repro")
+	if qerr == nil {
+		rows.Close()
+	}
+	// The very next statement must work.
+	var got int64
+	if err := conn.QueryRowContext(ctx, "SELECT 1").Scan(&got); err != nil {
+		t.Fatalf("connection poisoned after prepare failure: %v", err)
+	}
+	if got != 1 {
+		t.Fatalf("got %d, want 1", got)
+	}
+	// Also exercise a guaranteed DuckDB prepare failure that survives
+	// every analyzer/formatter fix: drop the engine table behind the
+	// catalog's back, so analysis succeeds but DuckDB prepare fails
+	// with "table does not exist".
+	if _, err := conn.ExecContext(ctx, "CREATE TABLE poison_repro2 (s STRING)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Raw(func(dc any) error {
+		return dc.(*googlesqlite.Conn).RawEngineExec(ctx, `DROP TABLE "poison_repro2"`)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM poison_repro2").Scan(&got); err == nil {
+		t.Fatal("expected DuckDB prepare failure for dropped engine table")
+	}
+	// The very next statement must work: pre-fix it failed its catalog
+	// sync with "cannot start a transaction within a transaction".
+	if err := conn.QueryRowContext(ctx, "SELECT 2").Scan(&got); err != nil {
+		t.Fatalf("connection poisoned after prepare failure: %v", err)
+	}
+	if got != 2 {
+		t.Fatalf("got %d, want 2", got)
+	}
+}
+
+// TestRegression_StoredTemporalColumns asserts that stored DATE /
+// DATETIME / TIME / TIMESTAMP columns work with native temporal
+// builtins and round-trip their values exactly. Before the fix,
+// CREATE TABLE lowered every temporal column to TEXT/VARCHAR storage
+// while the expression lowering emitted native DuckDB date functions
+// on the raw column (date_part(STRING_LITERAL, VARCHAR) Binder error),
+// and DATE literals were encoded through a local-zone time.Time so
+// they stored/displayed one day early in zones west of UTC.
+func TestRegression_StoredTemporalColumns(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE temporal_repro (dt DATE, ts TIMESTAMP, dtt DATETIME, tm TIME)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO temporal_repro VALUES (DATE "2024-03-22", TIMESTAMP "2024-03-22 12:30:00", DATETIME "2024-03-22 12:30:00", TIME "12:30:00")`); err != nil {
+		t.Fatal(err)
+	}
+	var y, h int64
+	if err := db.QueryRowContext(ctx, "SELECT EXTRACT(YEAR FROM dt) FROM temporal_repro").Scan(&y); err != nil {
+		t.Fatalf("EXTRACT over stored DATE: %v", err)
+	}
+	if y != 2024 {
+		t.Fatalf("EXTRACT(YEAR FROM dt) = %d, want 2024", y)
+	}
+	if err := db.QueryRowContext(ctx, "SELECT EXTRACT(YEAR FROM ts) FROM temporal_repro").Scan(&y); err != nil {
+		t.Fatalf("EXTRACT over stored TIMESTAMP: %v", err)
+	}
+	if y != 2024 {
+		t.Fatalf("EXTRACT(YEAR FROM ts) = %d, want 2024", y)
+	}
+	if err := db.QueryRowContext(ctx, "SELECT EXTRACT(YEAR FROM dtt) FROM temporal_repro").Scan(&y); err != nil {
+		t.Fatalf("EXTRACT over stored DATETIME: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, "SELECT EXTRACT(HOUR FROM tm) FROM temporal_repro").Scan(&h); err != nil {
+		t.Fatalf("EXTRACT over stored TIME: %v", err)
+	}
+	if h != 12 {
+		t.Fatalf("EXTRACT(HOUR FROM tm) = %d, want 12", h)
+	}
+	var s string
+	if err := db.QueryRowContext(ctx, "SELECT CAST(dt AS STRING) FROM temporal_repro").Scan(&s); err != nil {
+		t.Fatalf("CAST stored DATE to STRING: %v", err)
+	}
+	if s != "2024-03-22" {
+		t.Fatalf("CAST(dt AS STRING) = %q, want 2024-03-22 (day-early regression)", s)
+	}
+	// Bare SELECT of the stored DATE must render the same civil date
+	// (this is the one-day-early display regression).
+	if err := db.QueryRowContext(ctx, "SELECT dt FROM temporal_repro").Scan(&s); err != nil {
+		t.Fatal(err)
+	}
+	if s != "2024-03-22" {
+		t.Fatalf("SELECT dt = %q, want 2024-03-22", s)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT FORMAT_DATE("%Y/%m/%d", dt) FROM temporal_repro`).Scan(&s); err != nil {
+		t.Fatalf("FORMAT_DATE over stored DATE: %v", err)
+	}
+	if s != "2024/03/22" {
+		t.Fatalf("FORMAT_DATE = %q, want 2024/03/22", s)
+	}
+}
+
+// TestRegression_SafeDivideAggregateCoercion asserts that the implicit
+// INT64 -> DOUBLE coercion the analyzer inserts around SAFE_DIVIDE's
+// arguments lowers to a native DuckDB CAST. Before the fix it lowered
+// to the googlesqlite_cast UDF, whose VARCHAR result made
+// /(DOUBLE, VARCHAR) fail to bind at DuckDB prepare time.
+func TestRegression_SafeDivideAggregateCoercion(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE safediv_repro (x INT64)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO safediv_repro VALUES (10),(20)"); err != nil {
+		t.Fatal(err)
+	}
+	var got float64
+	if err := db.QueryRowContext(ctx, "SELECT SAFE_DIVIDE(SUM(x), COUNT(*)) FROM safediv_repro").Scan(&got); err != nil {
+		t.Fatalf("SAFE_DIVIDE(SUM, COUNT): %v", err)
+	}
+	if got != 15 {
+		t.Fatalf("SAFE_DIVIDE(SUM(x), COUNT(*)) = %v, want 15", got)
+	}
+	// Division by zero must stay NULL (SAFE semantics intact).
+	var nullable sql.NullFloat64
+	if err := db.QueryRowContext(ctx, "SELECT SAFE_DIVIDE(SUM(x), 0) FROM safediv_repro").Scan(&nullable); err != nil {
+		t.Fatal(err)
+	}
+	if nullable.Valid {
+		t.Fatalf("SAFE_DIVIDE(.., 0) = %v, want NULL", nullable.Float64)
 	}
 }

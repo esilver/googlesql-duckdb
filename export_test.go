@@ -84,3 +84,13 @@ func (c *Conn) RegisterProtoMessage(fullName string) error {
 	_, err := c.catalog.RegisterProtoMessage(fullName)
 	return err
 }
+
+// RawEngineExec runs SQL directly on the inner engine connection,
+// bypassing the analyzer/formatter and the catalog. Test-only: used to
+// drive the engine into states the GoogleSQL surface cannot reach
+// (e.g. dropping an engine table behind the catalog's back to force a
+// deterministic DuckDB prepare failure).
+func (c *Conn) RawEngineExec(ctx context.Context, query string) error {
+	_, err := c.conn.ExecContext(ctx, query)
+	return err
+}

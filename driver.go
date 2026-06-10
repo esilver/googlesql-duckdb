@@ -440,7 +440,32 @@ func recoverPanicAsError(e *error) {
 	}
 }
 
+// rollbackDanglingTx clears a transaction the DuckDB engine may have
+// left open on the pooled connection after a failed statement. The
+// pure-Go engine begins an implicit transaction at PREPARE time and a
+// Binder-stage prepare failure returns without aborting it; every
+// later statement on the same connection then fails with "cannot
+// start a transaction within a transaction" (the first victim is the
+// catalog sync). Issuing a best-effort ROLLBACK clears the dangling
+// transaction; if none is open the ROLLBACK itself fails harmlessly
+// and is discarded. Never called while an explicit user transaction
+// (c.tx) is open — rolling that back is the user's decision.
+func (c *Conn) rollbackDanglingTx() {
+	if c.tx != nil {
+		return
+	}
+	// context.Background() deliberately: the statement's ctx may be the
+	// reason the statement failed (cancellation), and the rollback must
+	// still run to un-poison the pooled connection.
+	_, _ = c.conn.ExecContext(context.Background(), "ROLLBACK")
+}
+
 func (c *Conn) PrepareContext(ctx context.Context, query string) (s driver.Stmt, e error) {
+	defer func() {
+		if e != nil {
+			c.rollbackDanglingTx()
+		}
+	}()
 	defer recoverPanicAsError(&e)
 	conn := internal.NewConnWithOptions(c.conn, c.tx, c.systemVars, c.scriptVars, c.materializeCTE)
 	actionFuncs, err := c.analyzer.Analyze(ctx, conn, query, nil)
@@ -463,6 +488,11 @@ func (c *Conn) PrepareContext(ctx context.Context, query string) (s driver.Stmt,
 }
 
 func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (r driver.Result, e error) {
+	defer func() {
+		if e != nil {
+			c.rollbackDanglingTx()
+		}
+	}()
 	defer recoverPanicAsError(&e)
 	conn := internal.NewConnWithOptions(c.conn, c.tx, c.systemVars, c.scriptVars, c.materializeCTE)
 	actionFuncs, err := c.analyzer.Analyze(ctx, conn, query, args)
@@ -498,6 +528,11 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 }
 
 func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (r driver.Rows, e error) {
+	defer func() {
+		if e != nil {
+			c.rollbackDanglingTx()
+		}
+	}()
 	defer recoverPanicAsError(&e)
 	conn := internal.NewConnWithOptions(c.conn, c.tx, c.systemVars, c.scriptVars, c.materializeCTE)
 	actionFuncs, err := c.analyzer.Analyze(ctx, conn, query, args)

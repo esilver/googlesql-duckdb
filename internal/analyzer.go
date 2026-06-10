@@ -2098,6 +2098,9 @@ func (a *Analyzer) newDMLStmtAction(ctx context.Context, query string, args []dr
 	if formattedQuery == "" {
 		return nil, fmt.Errorf("failed to format query %s", query)
 	}
+	if os.Getenv("GSX_DUMP_SQL") != "" {
+		fmt.Fprintf(os.Stderr, "[gsx-dump] in : %s\n[gsx-dump] out: %s\n", query, formattedQuery)
+	}
 	queryArgs, err := getArgsFromParams(args, params)
 	if err != nil {
 		return nil, err

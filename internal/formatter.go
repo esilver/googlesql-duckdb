@@ -2710,6 +2710,30 @@ func (n *CastNode) tryNativeCast(ctx context.Context) (string, bool, error) {
 		}
 		return false
 	}
+	// Numeric -> floating-point coercions (the implicit widening the
+	// analyzer inserts around e.g. SAFE_DIVIDE(SUM(x), COUNT(*))) lower
+	// to a native DuckDB CAST. The googlesqlite_cast UDF declares a
+	// VARCHAR result, so leaving the coercion on the UDF path types the
+	// operand as VARCHAR and /(DOUBLE, VARCHAR) fails to bind at DuckDB
+	// prepare time. Widening to FLOAT/DOUBLE has no error cases, so the
+	// SAFE_CAST (ReturnNullOnError) flag needs no special handling.
+	// Casts that genuinely need the value layer (NUMERIC/BIGNUMERIC,
+	// STRING parsing, envelopes) keep the UDF path: only raw-scalar
+	// numeric sources are claimed here.
+	if isNativeNumericKind(fromKind) {
+		switch toKind {
+		case googlesql.TypeKindTypeFloat, googlesql.TypeKindTypeDouble:
+			expr, err := newNode(m1(n.node.Expr())).FormatSQL(ctx)
+			if err != nil {
+				return "", false, err
+			}
+			target := "DOUBLE"
+			if toKind == googlesql.TypeKindTypeFloat {
+				target = "FLOAT"
+			}
+			return fmt.Sprintf("CAST(%s AS %s)", expr, target), true, nil
+		}
+	}
 	// Only claim casts that involve a temporal type on at least one side;
 	// everything else (numeric, bytes, struct, ...) stays on the UDF path
 	// that the other burn-down families own.
@@ -2835,6 +2859,21 @@ func rangeEnvelopeArgs(argNodes []googlesql.ResolvedExprNode, args []string) []s
 		}
 	}
 	return out
+}
+
+// isNativeNumericKind reports whether k is a numeric kind whose
+// over-the-wire form is a raw native scalar (EncodeValue hands integers
+// and floats back as bare Go scalars, never the base64 envelope), so a
+// native DuckDB CAST can retype it directly. NUMERIC / BIGNUMERIC are
+// deliberately excluded: they ride the value-layer envelope.
+func isNativeNumericKind(k googlesql.TypeKind) bool {
+	switch k {
+	case googlesql.TypeKindTypeInt32, googlesql.TypeKindTypeInt64,
+		googlesql.TypeKindTypeUint32, googlesql.TypeKindTypeUint64,
+		googlesql.TypeKindTypeFloat, googlesql.TypeKindTypeDouble:
+		return true
+	}
+	return false
 }
 
 // argKinds returns the resolved TypeKind of each function argument, in
