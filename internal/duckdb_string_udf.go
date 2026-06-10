@@ -241,6 +241,16 @@ var duckDBNormalUDFNames = append(append([]string{}, stringFamilyUDFNames...),
 	"obj_fetch_metadata",
 	"obj_get_access_url",
 	"obj_get_read_url",
+	// JSON field access (`doc.field`): the analyzer resolves it to
+	// ResolvedGetJsonField, which GetJsonFieldNode lowers to
+	// googlesqlite_get_json_field(expr, 'fieldName'). The body
+	// (jsonfn.BindJsonField) was always in normalFuncs but the name was
+	// missing from this DuckDB registration list, so the first stored-
+	// JSON-column field access raised "Scalar Function with name
+	// googlesqlite_get_json_field does not exist" (unmasked once JSON
+	// INSERTs started succeeding). Result is a JSON value (envelope
+	// VARCHAR) re-typed by the consumer (INT64()/JSON_VALUE()/decoder).
+	"get_json_field",
 )
 
 // StringFamilyUDFSpecs returns the DuckDB scalar UDF specs for the string

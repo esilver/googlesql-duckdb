@@ -786,6 +786,34 @@ func tryNativeOperator(funcName string, args []string, kinds []googlesql.TypeKin
 		// and json_each.value comparisons already round-trip through the
 		// forgiving spec comparator.
 		if isArithmeticOperator(op) {
+			// temporal +/- INTERVAL: the resolved tree reaches here as
+			// $add/$subtract over (DATE|TIME|DATETIME|TIMESTAMP, INTERVAL),
+			// and the INTERVAL operand was lowered to the VARCHAR-typed
+			// googlesqlite_interval(count, 'part') UDF call — DuckDB's
+			// binder rejects '-(TIMESTAMP WITH TIME ZONE, VARCHAR)'.
+			// Rewrite a literal-part interval to the native
+			// (count * INTERVAL '1 unit') form, and pin the temporal
+			// operand's resolved type (a bound parameter otherwise binds
+			// as UNKNOWN and cannot pick the operator overload). The
+			// DuckDB result types line up with GoogleSQL's: TIMESTAMPTZ
+			// stays TIMESTAMPTZ (GoogleSQL TIMESTAMP), DATE/TIMESTAMP
+			// yield TIMESTAMP (GoogleSQL DATETIME), TIME stays TIME.
+			if (op == "add" || op == "subtract") &&
+				kindAt(kinds, 1) == googlesql.TypeKindTypeInterval &&
+				isTemporalTypeKind(kindAt(kinds, 0)) {
+				if count, part, ok := parseGoogleSQLIntervalCall(args[1]); ok {
+					if unit, mult := intervalUnitForPart(part); unit != "" {
+						if mult != 1 {
+							count = fmt.Sprintf("(%s * %d)", count, mult)
+						}
+						lhs := args[0]
+						if dt, ok := duckDBTypeName(kindAt(kinds, 0)); ok {
+							lhs = fmt.Sprintf("CAST(%s AS %s)", lhs, dt)
+						}
+						return fmt.Sprintf("(%s %s (%s * INTERVAL '1 %s'))", lhs, tok, count, unit), true
+					}
+				}
+			}
 			return fmt.Sprintf("(%s %s %s)", castOperandToKind(args[0], kindAt(kinds, 0)), tok, castOperandToKind(args[1], kindAt(kinds, 1))), true
 		}
 		return fmt.Sprintf("(%s %s %s)", args[0], tok, args[1]), true
@@ -2810,6 +2838,16 @@ func (n *CastNode) tryNativeCast(ctx context.Context) (string, bool, error) {
 	duckType, ok := duckDBTypeName(toKind)
 	if !ok {
 		return "", false, nil
+	}
+	// STRING -> temporal: a STRING-typed operand whose value is only
+	// known at execution time (a bound parameter, a stored STRING
+	// column) carries the value-layer envelope, which DuckDB's
+	// date/time parser rejects ("invalid date field format:
+	// eyJoZWFkZXIi..."). Unwrap it to bare text first; the UDF passes
+	// non-envelope text through unchanged, and literal operands rarely
+	// reach here (the analyzer constant-folds literal casts).
+	if fromKind == googlesql.TypeKindTypeString && toKind != googlesql.TypeKindTypeString {
+		expr = fmt.Sprintf("googlesqlite_plain_string(%s)", expr)
 	}
 	return fmt.Sprintf("CAST(%s AS %s)", expr, duckType), true, nil
 }

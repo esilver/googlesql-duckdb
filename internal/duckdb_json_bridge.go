@@ -140,6 +140,40 @@ func GoogleSQLToNativeJSON(v any) (any, error) {
 	return decoded.ToJSON()
 }
 
+// GoogleSQLPlainString is the DuckDB-facing bridge for the
+// googlesqlite_plain_string scalar UDF. The formatter wraps the operand
+// of a native STRING -> DATE/TIME/TIMESTAMP cast in it (tryNativeCast)
+// so the text reaching DuckDB's cast is the bare string, not the
+// value-layer envelope. STRING-typed expressions whose value is only
+// known at execution time (bound parameters, stored STRING columns)
+// carry the base64 {"header":"string","body":...} envelope, which
+// DuckDB's date parser rejects ("invalid date field format:
+// eyJoZWFkZXIi..."). Literals don't need this (the analyzer
+// constant-folds literal casts), but the wrap is harmless for them:
+// non-envelope text passes through unchanged.
+func GoogleSQLPlainString(v any) (any, error) {
+	if v == nil {
+		return nil, nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return v, nil
+	}
+	decoded, err := DecodeValue(s)
+	if err != nil || decoded == nil {
+		return s, nil
+	}
+	if sv, ok := decoded.(value.StringValue); ok {
+		return string(sv), nil
+	}
+	// An envelope of a non-STRING kind (e.g. a DATE header): render its
+	// canonical textual form, which DuckDB's cast parses.
+	if out, err := decoded.ToString(); err == nil {
+		return out, nil
+	}
+	return s, nil
+}
+
 var jsonFamilyMapOnce sync.Once
 
 // ensureJSONFamilyInFormatterMap inserts every JSON-family name into

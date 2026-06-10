@@ -40,7 +40,37 @@ func registerDuckDBJSONUDFs(db *sql.DB) error {
 	if err := duckdb.RegisterScalarUDF(conn, "googlesqlite_to_native_json", &toNativeJSONUDF{}); err != nil {
 		return fmt.Errorf("googlesqlite: register googlesqlite_to_native_json: %w", err)
 	}
+	if err := duckdb.RegisterScalarUDF(conn, "googlesqlite_plain_string", &plainStringUDF{}); err != nil {
+		return fmt.Errorf("googlesqlite: register googlesqlite_plain_string: %w", err)
+	}
 	return nil
+}
+
+// plainStringUDF adapts internal.GoogleSQLPlainString to DuckDB's
+// scalar-UDF interface: VARCHAR -> VARCHAR, unwrapping a value-layer
+// STRING envelope to its bare text (pass-through for anything else).
+// The formatter wraps the operand of native STRING -> temporal casts
+// in it so bound params / stored STRING cells (which carry the
+// envelope at runtime) survive DuckDB's date/time parser.
+type plainStringUDF struct{}
+
+func (*plainStringUDF) Config() duckdb.ScalarFuncConfig {
+	varchar, _ := duckdb.NewTypeInfo(duckdb.TYPE_VARCHAR)
+	return duckdb.ScalarFuncConfig{
+		InputTypeInfos: []duckdb.TypeInfo{varchar},
+		ResultTypeInfo: varchar,
+	}
+}
+
+func (*plainStringUDF) Executor() duckdb.ScalarFuncExecutor {
+	return duckdb.ScalarFuncExecutor{
+		RowExecutor: func(values []driver.Value) (any, error) {
+			if len(values) != 1 {
+				return nil, fmt.Errorf("googlesqlite_plain_string: want 1 arg, got %d", len(values))
+			}
+			return internal.GoogleSQLPlainString(values[0])
+		},
+	}
 }
 
 // toNativeJSONUDF adapts internal.GoogleSQLToNativeJSON to DuckDB's
