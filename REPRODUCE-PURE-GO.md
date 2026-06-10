@@ -23,8 +23,7 @@ cd googlesqlite
 # Run the emulator with NO cgo:
 CGO_ENABLED=0 \
   go run \
-  -gcflags='github.com/esilver/duckdb-go-pure/internal/duckdbcore/...=-l -c=1' \
-  -gcflags='github.com/esilver/duckdb-go-pure/internal/duckdbcore/core=-c=1' \
+  -gcflags='github.com/esilver/duckdb-go-pure/internal/duckdbcore/...=-c=1' \
   ./cmd/t0boot
 ```
 
@@ -43,14 +42,14 @@ SELECT STARTS_WITH('duckdb','duck') -> true
 SELECT SAFE_CAST('42' AS INT64) -> 42
 ```
 
-(The `-gcflags` pair is required — since duckdb-go-pure v0.2.0 the engine is
-sharded into ~30 packages under `internal/duckdbcore/{core,shardNN,all}` and
-compiles **fully optimized**: `-l` on the shards stops the inliner re-expanding
-the generated IR and OOMing at ~50 GB, `-c=1` keeps per-package compiler memory
-flat; `core` compiles without `-l`. Run tests with `-vet=off` — `go vet` can't
-chew the generated packages. The first build compiles the engine in ~2 min /
-<3 GB peak; cached afterwards. See the duckdb-go-pure README "Required build
-flags".)
+(The `-gcflags` is required — since duckdb-go-pure v0.2.0 the engine is
+sharded into ~30 packages under `internal/duckdbcore/{core,shardNN,all}`, and
+since v0.3.0 its oversized functions are split so the whole engine compiles
+**fully optimized with inlining**: no `-l` anywhere, just `-c=1` to keep
+per-package compiler memory bounded. Run tests with `-vet=off` — `go vet`
+can't chew the generated packages. The first build compiles the engine in
+well under a minute on a multicore box; cached afterwards. See the
+duckdb-go-pure README "Required build flags".)
 
 ## How the swap works
 
@@ -99,8 +98,7 @@ surface the emulator already uses. (See `SWAP-BLUEPRINT.md` in the PoC repo.)
   backend. The 8 skips are proto/graph features with no assertable cases.
   Run it pure-Go with:
   `CGO_ENABLED=0 go test -vet=off
-  -gcflags='github.com/esilver/duckdb-go-pure/internal/duckdbcore/...=-l -c=1'
-  -gcflags='github.com/esilver/duckdb-go-pure/internal/duckdbcore/core=-c=1'
+  -gcflags='github.com/esilver/duckdb-go-pure/internal/duckdbcore/...=-c=1'
   -run 'TestSpec/(googlesql|bigquery)' -test.parallel 4 -timeout 2400s .`
 - Known latent issue (backend-independent): a DuckDB-level failure inside
   `catalog.Sync` can leave a transaction open on the pooled connection
