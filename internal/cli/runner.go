@@ -25,10 +25,10 @@ import (
 const (
 	// driverName is the public googlesqlite database/sql driver.
 	driverName = "googlesqlite"
-	// rawDriverName is the raw SQLite engine behind the driver. The CLI
+	// rawDriverName is the raw DuckDB engine behind the driver. The CLI
 	// uses it only to read the googlesqlite_catalog bookkeeping table
 	// for the .tables / .functions dot-commands.
-	rawDriverName = "googlesqlite_sqlite3"
+	rawDriverName = "googlesqlite_duckdb"
 
 	// DefaultMemoryDSN is the CLI's default data source: an in-memory
 	// database on the ncruces "memdb" VFS. Unlike a bare :memory: DSN,
