@@ -8,6 +8,7 @@ import (
 	"os"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/goccy/googlesqlite"
 )
@@ -2883,5 +2884,76 @@ func TestRegression_CTENameWithHyphen(t *testing.T) {
 	}
 	if total != 6 {
 		t.Errorf("recursive: got %d want 6", total)
+	}
+}
+
+// TestRegression_WedgedSlotRecovery: the shared-engine end-to-end shape of
+// issue #12 (upstream goccy/googlesqlite bf326675 / goccy/bigquery-emulator#478).
+// A request context cancelled mid-statement can close the inner *sql.Conn out
+// from under the pooled driver Conn (database/sql's tx watcher runs
+// Rollback(discardConn=true)). Before the driver.Validator port, that dead
+// Conn stayed in the pool and every later caller got
+// "sql: connection is already closed". On this fork all pooled Conns share
+// one DuckDB engine, so a wedged Conn is a wedged slot against the shared
+// engine mutex — the pool must both drop the poisoned Conn (IsValid /
+// ErrBadConn) and keep serving from the other slot.
+func TestRegression_WedgedSlotRecovery(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(2)
+	ctx := context.Background()
+
+	// Warm both pool slots so the cancelled statement runs on an
+	// already-pooled conn (the poisoning shape, not a fresh-dial shape).
+	var warm int64
+	if err := db.QueryRowContext(ctx, "SELECT 1").Scan(&warm); err != nil {
+		t.Fatalf("warmup: %v", err)
+	}
+
+	// Conn A: a multi-second statement inside a context-cancelled
+	// transaction; the cancel fires while the statement is in flight.
+	cancelCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() {
+		tx, err := db.BeginTx(cancelCtx, nil)
+		if err != nil {
+			done <- err
+			return
+		}
+		defer func() { _ = tx.Rollback() }()
+		var n int64
+		done <- tx.QueryRowContext(cancelCtx,
+			"SELECT COUNT(*) FROM UNNEST(GENERATE_ARRAY(1, 3000)) AS a, UNNEST(GENERATE_ARRAY(1, 3000)) AS b WHERE MOD(a + b, 7) = 0",
+		).Scan(&n)
+	}()
+	time.Sleep(200 * time.Millisecond) // let the statement get in flight
+	cancel()
+	select {
+	case <-done:
+		// The cancelled side may surface context.Canceled, ErrConnDone,
+		// driver-level noise, or (if the engine raced the cancel and
+		// finished) even nil — the assertion below is what matters.
+	case <-time.After(120 * time.Second):
+		t.Fatal("cancelled statement never returned: engine slot wedged")
+	}
+
+	// Conn B (and the recycled slot): the pool must keep serving. Loop a
+	// few times so both pool slots are exercised — before the Validator
+	// port the poisoned slot kept resurfacing as
+	// "sql: connection is already closed".
+	checkCtx, cancel2 := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel2()
+	for i := 0; i < 8; i++ {
+		var one int64
+		if err := db.QueryRowContext(checkCtx, "SELECT 1").Scan(&one); err != nil {
+			t.Fatalf("pool stopped serving after mid-statement cancel (iteration %d): %v", i, err)
+		}
+		if one != 1 {
+			t.Fatalf("SELECT 1 = %d after mid-statement cancel", one)
+		}
 	}
 }
