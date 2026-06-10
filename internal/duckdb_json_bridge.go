@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"fmt"
 	"sync"
 
 	jsonfn "github.com/goccy/googlesqlite/internal/functions/json"
@@ -172,6 +173,27 @@ func GoogleSQLPlainString(v any) (any, error) {
 		return out, nil
 	}
 	return s, nil
+}
+
+// GoogleSQLStringEnvelope is the inverse of GoogleSQLPlainString: it
+// wraps bare text back into the canonical value-layer STRING envelope.
+// The formatter applies it to the result of a native aggregate whose
+// STRING argument was unwrapped with googlesqlite_plain_string (MIN/MAX
+// over a stored STRING column, issue #9), restoring the envelope form
+// the rest of the plan and the row decoder expect. NULL passes through.
+func GoogleSQLStringEnvelope(v any) (any, error) {
+	if v == nil {
+		return nil, nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return nil, fmt.Errorf("googlesqlite_string_envelope: want string, got %T", v)
+	}
+	encoded, _, err := value.EncodeValueAsString(value.StringValue(s))
+	if err != nil {
+		return nil, err
+	}
+	return encoded, nil
 }
 
 var jsonFamilyMapOnce sync.Once

@@ -2957,3 +2957,96 @@ func TestRegression_WedgedSlotRecovery(t *testing.T) {
 		}
 	}
 }
+
+// TestRegression_NumericAggregateEnvelope: issue #9 part 1. SUM/AVG over a
+// stored NUMERIC column lowered to CAST(col AS DOUBLE) over the value-layer
+// envelope — a hard Conversion Error, and the wrong type besides (BigQuery
+// SUM/AVG(NUMERIC) are NUMERIC-exact). Uses the parameter INSERT path from
+// the issue repro; the seam suite covers the literal path.
+func TestRegression_NumericAggregateEnvelope(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE n (amt NUMERIC)"); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []string{"0.000000008", "0.000000004"} {
+		if _, err := db.ExecContext(ctx, "INSERT `n` (`amt`) VALUES (?)", v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var got string
+	if err := db.QueryRowContext(ctx, "SELECT CAST(SUM(amt) AS STRING) FROM `n`").Scan(&got); err != nil {
+		t.Fatalf("SUM over stored NUMERIC failed (issue #9 envelope leak): %v", err)
+	}
+	if got != "0.000000012" {
+		t.Errorf("SUM(amt) = %q, want %q", got, "0.000000012")
+	}
+	if err := db.QueryRowContext(ctx, "SELECT CAST(AVG(amt) AS STRING) FROM `n`").Scan(&got); err != nil {
+		t.Fatalf("AVG over stored NUMERIC failed: %v", err)
+	}
+	if got != "0.000000006" {
+		t.Errorf("AVG(amt) = %q, want %q (AVG(NUMERIC) is NUMERIC in BigQuery)", got, "0.000000006")
+	}
+	// Window form shares the lowering.
+	if err := db.QueryRowContext(ctx,
+		"SELECT CAST(SUM(amt) OVER () AS STRING) FROM `n` LIMIT 1").Scan(&got); err != nil {
+		t.Fatalf("window SUM over stored NUMERIC failed: %v", err)
+	}
+	if got != "0.000000012" {
+		t.Errorf("SUM(amt) OVER () = %q, want %q", got, "0.000000012")
+	}
+}
+
+// TestRegression_CastBytesToString: issue #9 part 2. CAST of a stored BYTES
+// column to STRING returned the storage envelope (base64 of the
+// {"header":"bytes",...} carrier) instead of BigQuery's semantics: the
+// payload decoded as UTF-8 text (an error when the payload is not valid
+// UTF-8, NULL under SAFE_CAST).
+func TestRegression_CastBytesToString(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE b (byt BYTES)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT `b` (`byt`) VALUES (?)", []byte("blob-7")); err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	if err := db.QueryRowContext(ctx, "SELECT CAST(byt AS STRING) FROM `b`").Scan(&got); err != nil {
+		t.Fatalf("CAST(byt AS STRING): %v", err)
+	}
+	if got != "blob-7" {
+		t.Errorf("CAST(byt AS STRING) = %q, want %q (envelope leak)", got, "blob-7")
+	}
+
+	// Invalid UTF-8 payload: CAST errors, SAFE_CAST yields NULL.
+	if _, err := db.ExecContext(ctx, "CREATE TABLE binv (byt BYTES)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT `binv` (`byt`) VALUES (?)", []byte{0xff, 0xfe, 0x01}); err != nil {
+		t.Fatal(err)
+	}
+	var castErr string
+	if err := db.QueryRowContext(ctx, "SELECT CAST(byt AS STRING) FROM `binv`").Scan(&castErr); err == nil {
+		t.Errorf("CAST of invalid-UTF-8 BYTES to STRING succeeded with %q, want error", castErr)
+	}
+	var safe sql.NullString
+	if err := db.QueryRowContext(ctx, "SELECT SAFE_CAST(byt AS STRING) FROM `binv`").Scan(&safe); err != nil {
+		t.Fatalf("SAFE_CAST of invalid-UTF-8 BYTES: %v", err)
+	}
+	if safe.Valid {
+		t.Errorf("SAFE_CAST of invalid-UTF-8 BYTES = %q, want NULL", safe.String)
+	}
+}

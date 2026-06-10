@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	googlesql "github.com/goccy/go-googlesql"
 	"github.com/goccy/go-json"
@@ -560,6 +561,19 @@ func castValueWithKind(kind googlesql.TypeKind, t googlesql.Googlesql_TypeNode, 
 		}
 		return value.FloatValue(f64), nil
 	case googlesql.TypeKindTypeString, googlesql.TypeKindTypeEnum:
+		// BYTES -> STRING follows BigQuery CAST semantics: the payload
+		// must be valid UTF-8 and decodes to that text (issue #9). The
+		// generic ToString() on BytesValue is the base64 rendering (the
+		// BigQuery JSON-API wire form used when a BYTES value itself is
+		// displayed), which is NOT what CAST returns.
+		if kind == googlesql.TypeKindTypeString {
+			if bv, ok := v.(value.BytesValue); ok {
+				if !utf8.Valid([]byte(bv)) {
+					return nil, fmt.Errorf("CAST(BYTES AS STRING): invalid UTF-8 payload")
+				}
+				return value.StringValue(string(bv)), nil
+			}
+		}
 		s, err := v.ToString()
 		if err != nil {
 			return nil, err

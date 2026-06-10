@@ -695,10 +695,11 @@ var nativeBinaryAggregates = map[string]struct {
 // cast away from the JSON value-layer encoding. funcName is the resolved
 // catalog name; args are the already-formatted operand SQL strings;
 // resultKind is the analyzer-resolved result type of the aggregate call.
-// Returns (duckName, castArgs, resultCast, true) when funcName names an
+// Returns (duckName, castArgs, resultWrap, true) when funcName names an
 // aggregate handled here, else ("", nil, "", false) so the caller keeps its
-// generic emit. A non-empty resultCast names a DuckDB type the caller must
-// wrap the FINISHED aggregate call in (CAST(<agg>(...) AS <resultCast>)).
+// generic emit. A non-empty resultWrap is a fmt template (one %s) the caller
+// must wrap the FINISHED aggregate call in (a narrowing CAST or an envelope
+// re-wrap).
 // The DISTINCT / ORDER BY modifier handling downstream still applies to the
 // rewritten name and arguments.
 //
@@ -710,22 +711,90 @@ var nativeBinaryAggregates = map[string]struct {
 // narrow the finished aggregate back with CAST(... AS BIGINT), which DuckDB
 // rejects with a conversion error when the exact sum exceeds the int64
 // range — matching BigQuery's overflow-is-an-error semantics. SUM over
-// FLOAT64 (and the value-layer NUMERIC envelope) keeps the DOUBLE path.
-func tryNativeNumericAggregate(funcName string, args []string, resultKind googlesql.TypeKind) (string, []string, string, bool) {
+// FLOAT64 keeps the DOUBLE path.
+//
+// NUMERIC / BIGNUMERIC arguments are the envelope-exactness case (issue
+// #9): the stored cell is the value-layer base64 envelope, which the
+// default CAST(arg AS DOUBLE) rejects outright ("Could not convert string
+// 'eyJoZWFkZXIi...' to DOUBLE") — and even if it parsed, BigQuery
+// SUM/AVG(NUMERIC) are NUMERIC-exact, not FLOAT64. Those arguments are
+// first unwrapped to their plain decimal text with
+// googlesqlite_plain_string and then cast to DECIMAL(38,9) (GoogleSQL
+// NUMERIC's exact shape): DuckDB's sum(DECIMAL(38,9)) accumulates exactly
+// and returns DECIMAL(38,9) (overflow raises, matching BigQuery), and
+// avg's DOUBLE result is narrowed back to DECIMAL(38,9) so the result
+// type stays NUMERIC. The statistical family (stddev/var/corr/...) is
+// FLOAT64-returning in BigQuery, so its NUMERIC arguments decode and then
+// take the family's usual DOUBLE cast. BIGNUMERIC exceeds DuckDB's
+// 38-digit DECIMAL ceiling, so it decodes to DOUBLE (approximate) rather
+// than failing on the envelope.
+//
+// MIN / MAX are not in nativeNumericAggregates (DuckDB's min/max bind any
+// type), but over a NUMERIC envelope column the bare emit compares the
+// base64 TEXT lexicographically — silently wrong ordering. They are
+// claimed here only for NUMERIC/BIGNUMERIC arguments, with the same
+// decode + DECIMAL(38,9) treatment.
+func tryNativeNumericAggregate(funcName string, args []string, resultKind googlesql.TypeKind, kinds []googlesql.TypeKind) (string, []string, string, bool) {
+	argKind := kindAt(kinds, 0)
 	if m, ok := nativeNumericAggregates[funcName]; ok && len(args) == 1 {
-		castType, resultCast := m.castType, ""
-		if funcName == "sum" && resultKind == googlesql.TypeKindTypeInt64 {
-			castType, resultCast = "BIGINT", "BIGINT"
+		castType, resultWrap := m.castType, ""
+		switch {
+		case funcName == "sum" && resultKind == googlesql.TypeKindTypeInt64:
+			castType, resultWrap = "BIGINT", "CAST(%s AS BIGINT)"
+		case isNumericEnvelopeKind(argKind):
+			decoded := fmt.Sprintf("googlesqlite_plain_string(%s)", args[0])
+			switch {
+			case funcName == "sum" && resultKind == googlesql.TypeKindTypeNumeric:
+				return m.duckName, []string{fmt.Sprintf("CAST(%s AS DECIMAL(38,9))", decoded)}, "", true
+			case funcName == "avg" && resultKind == googlesql.TypeKindTypeNumeric:
+				return m.duckName, []string{fmt.Sprintf("CAST(%s AS DECIMAL(38,9))", decoded)}, "CAST(%s AS DECIMAL(38,9))", true
+			default:
+				return m.duckName, []string{fmt.Sprintf("CAST(%s AS %s)", decoded, m.castType)}, "", true
+			}
 		}
-		return m.duckName, []string{fmt.Sprintf("CAST(%s AS %s)", args[0], castType)}, resultCast, true
+		return m.duckName, []string{fmt.Sprintf("CAST(%s AS %s)", args[0], castType)}, resultWrap, true
+	}
+	if (funcName == "min" || funcName == "max") && len(args) == 1 {
+		decoded := fmt.Sprintf("googlesqlite_plain_string(%s)", args[0])
+		switch {
+		case argKind == googlesql.TypeKindTypeNumeric:
+			return funcName, []string{fmt.Sprintf("CAST(%s AS DECIMAL(38,9))", decoded)}, "", true
+		case argKind == googlesql.TypeKindTypeBignumeric:
+			return funcName, []string{fmt.Sprintf("CAST(%s AS DOUBLE)", decoded)}, "", true
+		case argKind == googlesql.TypeKindTypeString:
+			// MIN/MAX over a stored STRING column: the bare emit compares
+			// the base64 envelope text, whose ordering does not track the
+			// payload's code-point ordering (the coverage class caught
+			// MIN('apple','banana','cherry') = 'cherry'). Unwrap to plain
+			// text for the comparison (UTF-8 byte order == code-point
+			// order, BigQuery's STRING ordering) and re-wrap the finished
+			// aggregate so downstream consumers see the envelope form.
+			return funcName, []string{decoded}, "googlesqlite_string_envelope(%s)", true
+		}
 	}
 	if m, ok := nativeBinaryAggregates[funcName]; ok && len(args) == 2 {
-		return m.duckName, []string{
-			fmt.Sprintf("CAST(%s AS %s)", args[0], m.castType),
-			fmt.Sprintf("CAST(%s AS %s)", args[1], m.castType),
-		}, "", true
+		// The correlation / covariance family is FLOAT64-returning, but a
+		// NUMERIC operand still needs the envelope unwrapped before the
+		// DOUBLE cast can parse it (issue #9).
+		castArgs := make([]string, 2)
+		for i, a := range args {
+			if isNumericEnvelopeKind(kindAt(kinds, i)) {
+				a = fmt.Sprintf("googlesqlite_plain_string(%s)", a)
+			}
+			castArgs[i] = fmt.Sprintf("CAST(%s AS %s)", a, m.castType)
+		}
+		return m.duckName, castArgs, "", true
 	}
 	return "", nil, "", false
+}
+
+// isNumericEnvelopeKind reports whether kind is one of the GoogleSQL
+// arbitrary-precision numeric kinds whose stored column form is the
+// value-layer base64 envelope in a TEXT cell (storageTypeForKind maps
+// both to TEXT), so engine-native expressions over the raw column must
+// decode through googlesqlite_plain_string first.
+func isNumericEnvelopeKind(kind googlesql.TypeKind) bool {
+	return kind == googlesql.TypeKindTypeNumeric || kind == googlesql.TypeKindTypeBignumeric
 }
 
 // tryNativeApproxAggregate rewrites the approximate-aggregate family to
@@ -2160,7 +2229,7 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 	// native reducers cannot consume the JSON value-layer encoding the
 	// UNNEST source feeds. Rewrite to the native name with the argument(s)
 	// cast to the right numeric type; the DISTINCT / ORDER BY handling
-	// below still applies to the rewritten form. resultCast (when set)
+	// below still applies to the rewritten form. resultWrap (when set)
 	// narrows the finished aggregate call back to its analyzer result
 	// type — SUM(INT64) must come back as an exact BIGINT, with DuckDB's
 	// out-of-range conversion error supplying BigQuery's overflow-is-an-
@@ -2171,11 +2240,12 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 			resultKind = k
 		}
 	}
-	var resultCast string
-	if duckName, castArgs, rc, ok := tryNativeNumericAggregate(funcName, args, resultKind); ok {
+	aggArgKinds := argKinds(m1(n.node.ResolvedFunctionCallBase.ArgumentList()))
+	var resultWrap string
+	if duckName, castArgs, rw, ok := tryNativeNumericAggregate(funcName, args, resultKind, aggArgKinds); ok {
 		funcName = duckName
 		args = castArgs
-		resultCast = rc
+		resultWrap = rw
 	}
 	// DuckDB retarget (PATH B): the predecessor encoded the aggregate
 	// modifiers (DISTINCT, ORDER BY, IGNORE NULLS, LIMIT) as trailing
@@ -2250,11 +2320,13 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 		strings.Join(args, ","),
 		orderByClause,
 	)
-	if resultCast != "" {
-		// Narrow the exact (HUGEINT-accumulated) aggregate back to its
-		// analyzer result type; DuckDB raises a conversion error on an
-		// out-of-int64-range sum, which is BigQuery's overflow behavior.
-		sql = fmt.Sprintf("CAST(%s AS %s)", sql, resultCast)
+	if resultWrap != "" {
+		// Re-shape the finished aggregate to its analyzer result form: a
+		// narrowing CAST for the exact-integer / NUMERIC cases (DuckDB
+		// raises a conversion error on an out-of-range sum, which is
+		// BigQuery's overflow behavior) or the string-envelope re-wrap
+		// for MIN/MAX over STRING (issue #9 coverage class).
+		sql = fmt.Sprintf(resultWrap, sql)
 	}
 	return sql, nil
 }
@@ -2576,6 +2648,16 @@ func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName 
 				castType = "DOUBLE"
 			}
 			valueArgs[0] = fmt.Sprintf("CAST(%s AS %s)", valueArgs[0], castType)
+		} else if isNumericEnvelopeKind(kindAt(kinds, 0)) {
+			// NUMERIC / BIGNUMERIC window operands carry the value-layer
+			// envelope (issue #9): unwrap to plain decimal text and run the
+			// window reducer over exact DECIMAL(38,9) (NUMERIC) or DOUBLE
+			// (BIGNUMERIC, which exceeds DuckDB's 38-digit DECIMAL).
+			target := "DECIMAL(38,9)"
+			if kindAt(kinds, 0) == googlesql.TypeKindTypeBignumeric {
+				target = "DOUBLE"
+			}
+			valueArgs[0] = fmt.Sprintf("CAST(googlesqlite_plain_string(%s) AS %s)", valueArgs[0], target)
 		}
 	}
 	// $count_star resolves with no value arguments; DuckDB's native
@@ -2606,10 +2688,19 @@ func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName 
 	// exact INT64 (and a genuinely out-of-range running sum raises DuckDB's
 	// conversion error — BigQuery's overflow semantics) instead of falling
 	// back to a rounded FLOAT64 on the decode path (issue #5).
-	if sqliteName == "sum" {
+	if sqliteName == "sum" || sqliteName == "avg" {
 		if t, _ := n.node.Type(); t != nil {
-			if k, kerr := t.Kind(); kerr == nil && k == googlesql.TypeKindTypeInt64 {
-				expr = fmt.Sprintf("CAST(%s AS BIGINT)", expr)
+			if k, kerr := t.Kind(); kerr == nil {
+				switch {
+				case sqliteName == "sum" && k == googlesql.TypeKindTypeInt64:
+					expr = fmt.Sprintf("CAST(%s AS BIGINT)", expr)
+				case k == googlesql.TypeKindTypeNumeric:
+					// BigQuery SUM/AVG(NUMERIC) return NUMERIC (issue #9):
+					// narrow the window expression to DECIMAL(38,9) so the
+					// result decodes as an exact NumericValue rather than a
+					// rounded FLOAT64 (avg's native result is DOUBLE).
+					expr = fmt.Sprintf("CAST(%s AS DECIMAL(38,9))", expr)
+				}
 			}
 		}
 	}
@@ -4861,8 +4952,6 @@ func (n *RecursiveRefScanNode) FormatSQL(ctx context.Context) (string, error) {
 	if name == "" {
 		return "", fmt.Errorf("recursive ref scan rendered outside a recursive WITH entry")
 	}
-	// Quote to match the WITH definition (WithEntryNode) so names with
-	// hyphens and other non-bare-identifier characters resolve.
 	return fmt.Sprintf("\"%s\"", name), nil
 }
 

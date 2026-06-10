@@ -43,7 +43,40 @@ func registerDuckDBJSONUDFs(db *sql.DB) error {
 	if err := duckdb.RegisterScalarUDF(conn, "googlesqlite_plain_string", &plainStringUDF{}); err != nil {
 		return fmt.Errorf("googlesqlite: register googlesqlite_plain_string: %w", err)
 	}
+	if err := duckdb.RegisterScalarUDF(conn, "googlesqlite_string_envelope", &stringEnvelopeUDF{}); err != nil {
+		return fmt.Errorf("googlesqlite: register googlesqlite_string_envelope: %w", err)
+	}
 	return nil
+}
+
+// stringEnvelopeUDF is googlesqlite_plain_string's inverse: VARCHAR ->
+// VARCHAR, wrapping bare text back into the value-layer STRING envelope.
+// The formatter emits it around native aggregates whose argument had to
+// be unwrapped to plain text first (MIN/MAX over a stored STRING column,
+// issue #9's coverage class: comparing the base64 envelope text orders
+// lexicographically by envelope, not by value), so the finished
+// aggregate flows back into the rest of the plan in the envelope form
+// every downstream consumer (comparisons with literals, the row
+// decoder) expects.
+type stringEnvelopeUDF struct{}
+
+func (*stringEnvelopeUDF) Config() duckdb.ScalarFuncConfig {
+	varchar, _ := duckdb.NewTypeInfo(duckdb.TYPE_VARCHAR)
+	return duckdb.ScalarFuncConfig{
+		InputTypeInfos: []duckdb.TypeInfo{varchar},
+		ResultTypeInfo: varchar,
+	}
+}
+
+func (*stringEnvelopeUDF) Executor() duckdb.ScalarFuncExecutor {
+	return duckdb.ScalarFuncExecutor{
+		RowExecutor: func(values []driver.Value) (any, error) {
+			if len(values) != 1 {
+				return nil, fmt.Errorf("googlesqlite_string_envelope: want 1 arg, got %d", len(values))
+			}
+			return internal.GoogleSQLStringEnvelope(values[0])
+		},
+	}
 }
 
 // plainStringUDF adapts internal.GoogleSQLPlainString to DuckDB's

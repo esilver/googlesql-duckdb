@@ -111,6 +111,20 @@ func DecodeValue(v any) (Value, error) {
 		// wrapper (TO_HEX / BYTE_LENGTH); without this case the wrapper's
 		// ConvertArgs rejects the []byte. Wrap it as the BYTES value the
 		// body expects.
+		//
+		// Stored BYTES columns are the exception (issue #9): the column is
+		// a native BLOB, but the INSERT path persists the value-layer
+		// base64 envelope as the blob's ASCII content, so a stored cell
+		// arrives here as []byte("eyJoZWFkZXIi..."). Without unwrapping,
+		// engine-side consumers (googlesqlite_cast for CAST(b AS STRING),
+		// TO_HEX, BYTE_LENGTH, ...) operate on the envelope text instead
+		// of the payload bytes. Sniff the canonical envelope exactly the
+		// way the string path below does; genuine binary blobs (WKB, proto
+		// wire bytes) fail the base64/JSON/header probe and pass through
+		// untouched.
+		if dv, ok, err := decodeEnvelopeString(string(vv)); ok {
+			return dv, err
+		}
 		return BytesValue(vv), nil
 	case *big.Int:
 		// DuckDB returns HUGEINT (128-bit) results as *big.Int, which the
@@ -185,18 +199,31 @@ func DecodeValue(v any) (Value, error) {
 	// `'int32'`, `'date'`, `'bytes'`) that the formatter inlined
 	// without the envelope. Fall back to a plain StringValue so the
 	// receiver can still call .ToString() on it.
+	if dv, ok, err := decodeEnvelopeString(s); ok {
+		return dv, err
+	}
+	return StringValue(s), nil
+}
+
+// decodeEnvelopeString probes s for the canonical value-layer carrier
+// (base64 of a {"header","body"} ValueLayout JSON). ok reports whether s
+// is such an envelope; when it is, the decoded Value (or the layout's
+// decode error) is returned. Callers fall back to their raw reading
+// (StringValue / BytesValue) when ok is false.
+func decodeEnvelopeString(s string) (Value, bool, error) {
 	decoded, err := base64.StdEncoding.DecodeString(s)
 	if err != nil {
-		return StringValue(s), nil
+		return nil, false, nil
 	}
 	var layout ValueLayout
 	if err := json.Unmarshal(decoded, &layout); err != nil {
-		return StringValue(s), nil
+		return nil, false, nil
 	}
 	if layout.Header == "" {
-		return StringValue(s), nil
+		return nil, false, nil
 	}
-	return decodeFromValueLayout(&layout)
+	v, err := decodeFromValueLayout(&layout)
+	return v, true, err
 }
 
 func decodeFromValueLayout(layout *ValueLayout) (Value, error) {
