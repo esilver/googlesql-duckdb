@@ -307,6 +307,7 @@ func (a *CreateTableFunctionStmtAction) Cleanup(ctx context.Context, conn *Conn)
 type DropStmtAction struct {
 	name           string
 	objectType     string
+	ifExists       bool
 	funcMap        map[string]*FunctionSpec
 	catalog        *Catalog
 	query          string
@@ -320,7 +321,16 @@ func (a *DropStmtAction) exec(ctx context.Context, conn *Conn) error {
 		if _, err := conn.ExecContext(ctx, a.formattedQuery, a.args...); err != nil {
 			return fmt.Errorf("failed to exec %s: %w", a.query, err)
 		}
-		spec := a.catalog.tableMap[a.name]
+		spec, specExists := a.catalog.tableMap[a.name]
+		if !specExists && a.ifExists {
+			// DROP ... IF EXISTS on a table/view that is not in the
+			// catalog: BigQuery semantics are silent success. The
+			// engine-level DROP above already carried IF EXISTS (the
+			// formatter preserves the modifier), so there is nothing
+			// to clean up — swallow the not-found instead of failing
+			// with "failed to delete table spec" (issue #8 part 2).
+			return nil
+		}
 		if err := a.catalog.DeleteTableSpec(ctx, conn, a.name); err != nil {
 			return fmt.Errorf("failed to delete table spec: %w", err)
 		}

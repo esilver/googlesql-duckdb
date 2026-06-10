@@ -2081,10 +2081,12 @@ func (a *Analyzer) newDropStmtAction(ctx context.Context, query string, args []d
 		return nil, err
 	}
 	objectType, _ := node.ObjectType()
+	ifExists, _ := node.IsIfExists()
 	name := a.namePath.format2(node.NamePath())
 	return &DropStmtAction{
 		name:           name,
 		objectType:     objectType,
+		ifExists:       ifExists,
 		funcMap:        funcMapFromContext(ctx),
 		catalog:        a.catalog,
 		query:          query,
