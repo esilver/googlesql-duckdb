@@ -301,7 +301,7 @@ import (
 	"sync"
 	"unsafe"
 
-	duckdb "github.com/duckdb/duckdb-go/v2"
+	duckdb "github.com/goccy/googlesqlite/internal/duckdbgo"
 
 	"github.com/goccy/googlesqlite/internal/functions/aggregate"
 	geofn "github.com/goccy/googlesqlite/internal/functions/geography"

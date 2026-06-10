@@ -11,7 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	duckdb "github.com/duckdb/duckdb-go/v2"
+	duckdb "github.com/goccy/googlesqlite/internal/duckdbgo"
 	googlesql "github.com/goccy/go-googlesql"
 
 	internal "github.com/goccy/googlesqlite/internal"

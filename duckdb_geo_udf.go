@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"sync"
 
-	duckdb "github.com/duckdb/duckdb-go/v2"
+	duckdb "github.com/goccy/googlesqlite/internal/duckdbgo"
 
 	internal "github.com/goccy/googlesqlite/internal"
 )

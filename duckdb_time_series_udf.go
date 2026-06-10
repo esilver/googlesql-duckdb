@@ -4,7 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 
-	duckdb "github.com/duckdb/duckdb-go/v2"
+	duckdb "github.com/goccy/googlesqlite/internal/duckdbgo"
 )
 
 func registerChangeHistoryTableUDFs(conn *sql.Conn) error {

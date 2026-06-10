@@ -7,21 +7,29 @@ The BigQuery dialect (ZetaSQL analysis + the `googlesqlite_*` UDFs) is unchanged
 only the DuckDB *execution backend* changes. `CGO_ENABLED=1` still builds the
 original native path, untouched.
 
-## Setup — two sibling checkouts
+## Setup — ONE clone, zero replaces
+
+The engine is a normal fetchable Go module:
+[`github.com/esilver/duckdb-go-pure`](https://github.com/esilver/duckdb-go-pure)
+(root package `duckdb`, a `database/sql` driver registered as `"duckdb"`, with
+the transpiled engine committed under `internal/duckdbcore`). This repo
+`require`s it like any other dependency — **no `replace` directives, no sibling
+checkouts, no generated files**.
 
 ```sh
-git clone https://github.com/esilver/googlesqlite -b pure-go-duckdb-backend
-git clone https://github.com/esilver/duckdb-wasm2go-poc        # SIBLING directory
+git clone -b pure-go-duckdb-backend https://github.com/esilver/googlesqlite
+cd googlesqlite
 
-# 1. Build the pure-Go DuckDB engine once (generates converge/genpkg; needs
-#    emscripten + wasm2go; see that repo's README / rebuild_all.sh):
-cd duckdb-wasm2go-poc && ./rebuild_all.sh
-
-# 2. Run the emulator with NO cgo:
-cd ../googlesqlite
-CGO_ENABLED=0 GOWORK=off GOTOOLCHAIN=go1.25.6 GOFLAGS=-mod=mod \
-  go run -gcflags='duckdbconverge/genpkg=-N -l -c=16' ./cmd/t0boot
+# Run the emulator with NO cgo:
+CGO_ENABLED=0 \
+  go run -gcflags='github.com/esilver/duckdb-go-pure/internal/duckdbcore=-N -l -c=16' ./cmd/t0boot
 ```
+
+(Engine developers hacking on the transpiler output can still point the engine
+at a local checkout the old way — add
+`replace github.com/esilver/duckdb-go-pure => ../duckdb-go-pure` (or the PoC
+repo's `converge` tree via its previous `duckdbconverge` wiring) — but nothing
+in this repo requires it anymore.)
 
 Expected: GoogleSQL queries run pure-Go, e.g.
 
@@ -32,17 +40,20 @@ SELECT STARTS_WITH('duckdb','duck') -> true
 SELECT SAFE_CAST('42' AS INT64) -> 42
 ```
 
-(`-gcflags='duckdbconverge/genpkg=-N -l ...'` is required: full Go optimization of
-the ~141 MB transpiled engine package OOMs; `-N -l` keeps it compilable. Run tests
-with `-vet=off` — `go vet` can't scope the giant generated file.)
+(`-gcflags='github.com/esilver/duckdb-go-pure/internal/duckdbcore=-N -l -c=16'`
+is required: full Go optimization of the ~150 MB transpiled engine package OOMs;
+`-N -l` keeps it compilable, and only that one package loses optimization. Run
+tests with `-vet=off` — `go vet` can't scope the giant generated files. The
+first build compiles the engine in ~10 min; cached afterwards.)
 
 ## How the swap works
 
-- **`go.mod` replaces** point `github.com/duckdb/duckdb-go/v2` at
-  `../duckdb-wasm2go-poc/converge/duckdbcompat` — a drop-in stand-in for the
-  `duckdb-go/v2` API (`Driver`, `Decimal`, `Type`/`TypeInfo`, `RegisterScalarUDF`,
-  `RegisterTableUDF`, …) backed by the pure-Go engine — and `duckdbconverge` at
-  `../duckdb-wasm2go-poc/converge`. **No call-site changes** in this repo.
+- **`go.mod` requires `github.com/esilver/duckdb-go-pure`** (the pure-Go engine
+  + `database/sql` driver). The former `github.com/duckdb/duckdb-go/v2` import
+  sites now import `internal/duckdbgo` — a drop-in stand-in for the
+  `duckdb-go/v2` API subset the emulator consumes (`Driver`, `Decimal`,
+  `Type`/`TypeInfo`, `RegisterScalarUDF`, `RegisterTableUDF`, …) backed by the
+  pure-Go engine. Call sites are unchanged apart from the import path.
 - The single cgo translation unit `duckdb_aggregate_udf.go` is build-tagged
   `//go:build cgo`; `duckdb_aggregate_udf_purego.go` (`//go:build !cgo`) is the
   pure-Go port of the same bridge: all 32 aggregate specs (KLL, HLL, ANY_VALUE
@@ -81,9 +92,9 @@ surface the emulator already uses. (See `SWAP-BLUEPRINT.md` in the PoC repo.)
   (SEARCH declared BOOL) fixed all 14; the same patch would fix the cgo
   backend. The 8 skips are proto/graph features with no assertable cases.
   Run it pure-Go with:
-  `CGO_ENABLED=0 GOWORK=off GOFLAGS=-mod=mod go test -vet=off
-  -gcflags='duckdbconverge/genpkg=-N -l -c=16' -c -o gsx.test . &&
-  ./gsx.test -test.run 'TestSpec/(googlesql|bigquery)' -test.parallel 4`.
+  `CGO_ENABLED=0 go test -vet=off
+  -gcflags='github.com/esilver/duckdb-go-pure/internal/duckdbcore=-N -l -c=16'
+  -run 'TestSpec/(googlesql|bigquery)' -test.parallel 4 -timeout 2400s .`
 - Known latent issue (backend-independent): a DuckDB-level failure inside
   `catalog.Sync` can leave a transaction open on the pooled connection
   ("cannot start a transaction within a transaction" on later queries) — the

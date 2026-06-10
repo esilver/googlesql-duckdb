@@ -5,7 +5,7 @@ package googlesqlite
 // This file is the pure-Go (CGO_ENABLED=0) counterpart of duckdb_aggregate_udf.go
 // (which is tagged //go:build cgo): it registers the same GoogleSQL aggregate /
 // window UDF surface against the wasm2go pure-Go DuckDB engine through
-// duckdbconverge/duckdb's RegisterAggregateBandConn instead of the C aggregate
+// github.com/esilver/duckdb-go-pure's RegisterAggregateBandConn instead of the C aggregate
 // API. The two files are mutually exclusive by build tag and intentionally share
 // helper names (aggSpec, duckdbAggSpecs, normalizeJSONScalar, toFloat64Result,
 // toInt64Result, ...) so they stay textually comparable.
@@ -47,7 +47,7 @@ import (
 	"fmt"
 	"strconv"
 
-	convergeduckdb "duckdbconverge/duckdb"
+	convergeduckdb "github.com/esilver/duckdb-go-pure"
 
 	"github.com/goccy/googlesqlite/internal/functions/aggregate"
 	geofn "github.com/goccy/googlesqlite/internal/functions/geography"

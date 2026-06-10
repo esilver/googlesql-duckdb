@@ -1,7 +1,7 @@
 // Command t2boot is the T2 boot smoke-test for the pure-Go (CGO_ENABLED=0)
 // DuckDB aggregate-UDF bridge (duckdb_aggregate_udf_purego.go). It opens the
 // googlesqlite BigQuery emulator on an in-memory database — which registers
-// the 32 aggregate specs through duckdbconverge/duckdb.RegisterAggregateBandConn
+// the 32 aggregate specs through github.com/esilver/duckdb-go-pure.RegisterAggregateBandConn
 // — and runs known-good BigQuery-dialect aggregate queries copied from this
 // repo's spec corpus (testdata/specs/**), printing each query and its result
 // next to the corpus' expected value.

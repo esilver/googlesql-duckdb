@@ -3,7 +3,7 @@ package internal
 import (
 	"math/big"
 
-	duckdb "github.com/duckdb/duckdb-go/v2"
+	duckdb "github.com/goccy/googlesqlite/internal/duckdbgo"
 
 	"github.com/goccy/googlesqlite/internal/value"
 )

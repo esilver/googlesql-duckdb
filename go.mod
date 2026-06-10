@@ -9,6 +9,7 @@ require (
 	github.com/chzyer/readline v1.5.1
 	github.com/dgryski/go-farm v0.0.0-20240924180020-3414d57e47da
 	github.com/dop251/goja v0.0.0-20260311135729-065cd970411c
+	github.com/esilver/duckdb-go-pure v0.1.0
 	github.com/fatih/color v1.19.0
 	github.com/fsouza/fake-gcs-server v1.54.0
 	github.com/goccy/go-googlesql v0.2.2
@@ -31,12 +32,6 @@ require (
 )
 
 require (
-	github.com/duckdb/duckdb-go-bindings v0.10503.0 // indirect
-	github.com/duckdb/duckdb-go-bindings/lib/darwin-arm64 v0.10503.0 // indirect
-	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
-)
-
-require (
 	cel.dev/expr v0.25.1 // indirect
 	cloud.google.com/go v0.123.0 // indirect
 	cloud.google.com/go/auth v0.20.0 // indirect
@@ -53,7 +48,6 @@ require (
 	github.com/clipperhouse/uax29/v2 v2.2.0 // indirect
 	github.com/cncf/xds/go v0.0.0-20251210132809-ee656c7534f5 // indirect
 	github.com/dlclark/regexp2 v1.11.4 // indirect
-	github.com/duckdb/duckdb-go/v2 v2.10503.1
 	github.com/envoyproxy/go-control-plane/envoy v1.36.0 // indirect
 	github.com/envoyproxy/protoc-gen-validate v1.3.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
@@ -104,9 +98,3 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260401024825-9d38bb4040a9 // indirect
 	google.golang.org/grpc v1.80.0 // indirect
 )
-
-require duckdbconverge v0.0.0
-
-replace github.com/duckdb/duckdb-go/v2 => ../duckdb-wasm2go-poc/converge/duckdbcompat
-
-replace duckdbconverge => ../duckdb-wasm2go-poc/converge

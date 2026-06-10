@@ -11,22 +11,21 @@ self-contained static binary (~375 MB — it embeds the whole transpiled DuckDB)
 copy it anywhere and run it. Rebuild only when you change the Go code or pull a
 new engine.
 
-Prerequisites: this repo and `duckdb-wasm2go-poc` as **sibling checkouts**, with
-the engine already generated (`converge/genpkg/gen.go` exists — produced by the
-PoC repo's `rebuild_fs_all.sh`; see REPRODUCE-PURE-GO.md).
+Prerequisites: **none beyond Go** — the engine is the fetchable module
+`github.com/esilver/duckdb-go-pure` (no sibling checkouts, no generated files;
+see REPRODUCE-PURE-GO.md).
 
 ```sh
 cd googlesqlite     # this repo, branch pure-go-duckdb-backend
-CGO_ENABLED=0 GOWORK=off GOTOOLCHAIN=go1.25.6 GOFLAGS=-mod=mod \
-  go build -gcflags='duckdbconverge/genpkg=-N -l -c=16' -o gsx ./cmd/googlesqlite
+CGO_ENABLED=0 \
+  go build -gcflags='github.com/esilver/duckdb-go-pure/internal/duckdbcore=-N -l -c=16' -o gsx ./cmd/googlesqlite
 ```
 
-The first build compiles the 158 MB generated engine package (~5–10 min);
+The first build compiles the ~150 MB generated engine package (~5–10 min);
 afterwards Go's build cache makes rebuilds take seconds unless the engine
 itself changed. (The `-gcflags` disables optimization ONLY for that generated
 package — full optimization of it OOMs the Go compiler; everything else
-optimizes normally. `GOWORK=off`/`GOFLAGS=-mod=mod` keep the build pinned to
-this repo's `replace` directives.)
+optimizes normally.)
 
 ## Use it
 

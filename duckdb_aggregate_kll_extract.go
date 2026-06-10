@@ -6,7 +6,7 @@ import (
 	"database/sql/driver"
 	"fmt"
 
-	duckdb "github.com/duckdb/duckdb-go/v2"
+	duckdb "github.com/goccy/googlesqlite/internal/duckdbgo"
 
 	"github.com/goccy/googlesqlite/internal/functions/kll"
 	"github.com/goccy/googlesqlite/internal/value"
