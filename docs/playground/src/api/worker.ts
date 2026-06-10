@@ -1,6 +1,14 @@
-// worker.ts runs the googlesqlite WebAssembly engine off the UI
-// thread. The engine performs blocking work, so running it in a worker
-// keeps the page responsive.
+// worker.ts runs the googlesqlite engine off the UI thread. Two
+// engine modes exist, selected by the VITE_ENGINE build variable:
+//
+//   - "wasm" (default): the googlesqlite WebAssembly engine runs
+//     inside this worker. The engine performs blocking work, so
+//     running it in a worker keeps the page responsive.
+//   - "server": a thin HTTP client to a local native engine
+//     (`go run ./cmd/playground`, default http://localhost:8765,
+//     override with VITE_SERVER_URL). The server exposes the same
+//     API surface and JSON shapes as the wasm engine, so everything
+//     below the engine seam is shared.
 //
 // Persistence is the Origin Private File System (OPFS): the worker
 // acquires synchronous access handles for the database file and the
@@ -34,6 +42,15 @@ declare global {
   var googlesqlite: GoogleSQLiteAPI | undefined
   var onGoogleSQLiteReady: (() => void) | undefined
 }
+
+// ENGINE_MODE selects the engine backing this worker; SERVER_URL is
+// the native server's base URL in "server" mode.
+const ENGINE_MODE: string =
+  (import.meta.env.VITE_ENGINE as string | undefined) ?? 'wasm'
+const SERVER_URL: string = (
+  (import.meta.env.VITE_SERVER_URL as string | undefined) ??
+  'http://localhost:8765'
+).replace(/\/$/, '')
 
 function post(msg: WorkerResponse): void {
   self.postMessage(msg)
@@ -186,6 +203,82 @@ async function persist(): Promise<void> {
   }
 }
 
+// --- server engine mode ----------------------------------------------
+
+// serverFetch performs one request against the native engine server
+// and throws a useful Error on any failure (connection refused, or a
+// non-2xx with the server's {error} JSON body).
+async function serverFetch(path: string, init?: RequestInit): Promise<Response> {
+  let resp: Response
+  try {
+    resp = await fetch(`${SERVER_URL}${path}`, init)
+  } catch {
+    throw new Error(
+      `cannot reach the engine server at ${SERVER_URL} — ` +
+        'start it with: go run ./cmd/playground',
+    )
+  }
+  if (!resp.ok) {
+    let message = `engine server error: HTTP ${resp.status}`
+    try {
+      const body = (await resp.json()) as { error?: string }
+      if (body.error) {
+        message = body.error
+      }
+    } catch {
+      // keep the HTTP status message
+    }
+    throw new Error(message)
+  }
+  return resp
+}
+
+async function serverJSON<T>(path: string, init?: RequestInit): Promise<T> {
+  return (await serverFetch(path, init)).json() as Promise<T>
+}
+
+function postJSON(body: unknown): RequestInit {
+  return {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }
+}
+
+// serverAPI implements the wasm engine's API surface over HTTP. The
+// server returns the same JSON shapes (see cmd/playground/main.go),
+// so callers cannot tell the engines apart.
+function serverAPI(): GoogleSQLiteAPI {
+  return {
+    exec: (sql) => serverJSON<ExecResponse>('/exec', postJSON({ sql })),
+    getHistory: () => serverJSON<QueryResult[]>('/history'),
+    loadHistory: async (json) => {
+      await serverFetch('/history/load', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: json,
+      })
+      return { ok: true }
+    },
+    clearHistory: async () => {
+      await serverFetch('/history/clear', { method: 'POST' })
+      return { ok: true }
+    },
+    exportHistory: async (format) =>
+      (await serverFetch(`/history/export?format=${format}`)).text(),
+    listTables: () => serverJSON<string[]>('/tables'),
+  }
+}
+
+// initServer wires the worker to the native engine server: it checks
+// the server is up, then installs the HTTP-backed API. Persistence is
+// the server's database file, so OPFS is not touched in this mode.
+async function initServer(): Promise<void> {
+  progress('start')
+  await serverFetch('/healthz')
+  globalThis.googlesqlite = serverAPI()
+}
+
 // --- engine loading -------------------------------------------------
 
 function progress(phase: LoadPhase, loaded = 0, total = 0): void {
@@ -327,7 +420,14 @@ async function initWASM(): Promise<void> {
 
 // startup is awaited by every request handler so messages that arrive
 // before the engine is ready queue behind initialisation.
+//
+// In server mode the engine (and its history) lives in the native
+// server process, so the OPFS restore step does not apply.
 const startup: Promise<void> = (async () => {
+  if (ENGINE_MODE === 'server') {
+    await initServer()
+    return
+  }
   await initWASM()
   await restore()
 })()

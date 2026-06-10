@@ -266,7 +266,11 @@ func (r *Runner) catalogNames(ctx context.Context, kinds ...string) ([]string, e
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		// No catalog table yet: the session has not created anything.
-		if strings.Contains(err.Error(), "no such table") {
+		// SQLite reports "no such table"; the DuckDB backend reports
+		// a Catalog Error saying the table does not exist.
+		msg := err.Error()
+		if strings.Contains(msg, "no such table") ||
+			(strings.Contains(msg, "googlesqlite_catalog") && strings.Contains(msg, "does not exist")) {
 			return nil, nil
 		}
 		return nil, err

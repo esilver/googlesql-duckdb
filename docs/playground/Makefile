@@ -50,8 +50,18 @@ deps:
 
 # dev builds the engine and starts the Vite dev server. The page is
 # served at http://localhost:5173/googlesqlite/.
+#
+# With VITE_ENGINE=server the in-browser wasm engine is not built or
+# loaded: the UI talks to the native engine server instead (run
+# `go run ./cmd/playground` from the repository root first; see
+# cmd/playground/README.md).
+ifeq ($(VITE_ENGINE),server)
+dev:
+	npm run dev
+else
 dev: build/wasm build/assets
 	npm run dev
+endif
 
 # preview serves the production build from dist/.
 preview:
