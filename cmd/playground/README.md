@@ -15,9 +15,7 @@ UI start time with `VITE_ENGINE=server`.
 Terminal 1 — the engine server (repository root):
 
 ```sh
-CGO_ENABLED=0 go run \
-  -gcflags='github.com/esilver/duckdb-go-pure/internal/duckdbcore/...=-c=1' \
-  ./cmd/playground
+CGO_ENABLED=0 go run ./cmd/playground
 ```
 
 Flags:
@@ -27,9 +25,9 @@ Flags:
 | `-db`   | `playground.db`  | database file path; `:memory:` for non-persistent  |
 | `-addr` | `localhost:8765` | listen address                                     |
 
-(The `-gcflags` is the standard pure-Go-backend build flag — see
-`REPRODUCE-PURE-GO.md`. The first build compiles the engine once; it is
-cached afterwards.)
+(No build flags required — the pure-Go engine builds with a plain `go
+build`; see `REPRODUCE-PURE-GO.md`. The first build compiles the engine
+once; it is cached afterwards.)
 
 Terminal 2 — the UI:
 
@@ -100,7 +98,5 @@ curl -s localhost:8765/exec -d '{"sql":"CREATE TABLE t (n INT64); INSERT INTO t 
 ## Tests
 
 ```sh
-CGO_ENABLED=0 go test -vet=off \
-  -gcflags='github.com/esilver/duckdb-go-pure/internal/duckdbcore/...=-c=1' \
-  ./cmd/playground
+CGO_ENABLED=0 go test -vet=off ./cmd/playground
 ```

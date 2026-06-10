@@ -8,8 +8,8 @@ client-side, powered by `googlesqlite` compiled to WebAssembly.
 - The `googlesqlite` engine runs in a **Web Worker** so the UI stays
   responsive
 - The database is a single file in the **Origin Private File System**
-  (OPFS); SQLite reads and writes it directly, so it survives reloads
-  with no explicit save step
+  (OPFS); the pure-Go DuckDB engine reads and writes it directly, so it
+  survives reloads with no explicit save step
 
 ## Prerequisites
 
@@ -51,8 +51,9 @@ workflow builds the engine, bundles the site, uploads `dist/` as the
 Pages artifact, and publishes it through `actions/deploy-pages`.
 
 The engine binary is large — it bundles the whole googlesqlite stack
-into one js/wasm module: SQLite (transpiled to Go) plus the GoogleSQL
-analyzer, which is itself an embedded wasm module run through wazero.
+into one js/wasm module: the pure-Go DuckDB engine (transpiled to Go)
+plus the GoogleSQL analyzer, which is itself an embedded wasm module
+run through wazero.
 The uncompressed binary exceeds GitHub's 100 MB per-file limit, but it
 is never deployed: the worker fetches the gzip-compressed
 `googlesqlite.wasm.gz` (tens of MB) and decompresses it in the browser,

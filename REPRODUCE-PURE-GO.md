@@ -20,11 +20,8 @@ checkouts, no generated files**.
 git clone -b pure-go-duckdb-backend https://github.com/esilver/googlesqlite
 cd googlesqlite
 
-# Run the emulator with NO cgo:
-CGO_ENABLED=0 \
-  go run \
-  -gcflags='github.com/esilver/duckdb-go-pure/internal/duckdbcore/...=-c=1' \
-  ./cmd/t0boot
+# Run the emulator with NO cgo (no build flags required):
+CGO_ENABLED=0 go run ./cmd/t0boot
 ```
 
 (Engine developers hacking on the transpiler output can still point the engine
@@ -42,14 +39,13 @@ SELECT STARTS_WITH('duckdb','duck') -> true
 SELECT SAFE_CAST('42' AS INT64) -> 42
 ```
 
-(The `-gcflags` is required — since duckdb-go-pure v0.2.0 the engine is
-sharded into ~30 packages under `internal/duckdbcore/{core,shardNN,all}`, and
-since v0.3.0 its oversized functions are split so the whole engine compiles
-**fully optimized with inlining**: no `-l` anywhere, just `-c=1` to keep
-per-package compiler memory bounded. Run tests with `-vet=off` — `go vet`
-can't chew the generated packages. The first build compiles the engine in
-well under a minute on a multicore box; cached afterwards. See the
-duckdb-go-pure README "Required build flags".)
+(No build flags required — since duckdb-go-pure v0.3.1 a plain `go build`
+works: the engine is sharded into ~30 packages under
+`internal/duckdbcore/{core,shardNN,all}` with its oversized functions split,
+so the whole engine compiles **fully optimized with inlining**. Run tests
+with `-vet=off` — `go vet` can't chew the generated packages. The first
+build compiles the engine in well under a minute on a multicore box; cached
+afterwards.)
 
 ## How the swap works
 
@@ -98,7 +94,6 @@ surface the emulator already uses. (See `SWAP-BLUEPRINT.md` in the PoC repo.)
   backend. The 8 skips are proto/graph features with no assertable cases.
   Run it pure-Go with:
   `CGO_ENABLED=0 go test -vet=off
-  -gcflags='github.com/esilver/duckdb-go-pure/internal/duckdbcore/...=-c=1'
   -run 'TestSpec/(googlesql|bigquery)' -test.parallel 4 -timeout 2400s .`
 - Known latent issue (backend-independent): a DuckDB-level failure inside
   `catalog.Sync` can leave a transaction open on the pooled connection

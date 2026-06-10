@@ -1,5 +1,10 @@
 # GoogleSQLite
 
+> **This branch (`pure-go-duckdb-backend`)** runs GoogleSQL on the pure-Go
+> DuckDB engine (`github.com/esilver/duckdb-go-pure`), not SQLite — 986/994
+> conformance with zero failures, `CGO_ENABLED=0`, no build flags. See
+> [REPRODUCE-PURE-GO.md](REPRODUCE-PURE-GO.md) and [CLI-PURE-GO.md](CLI-PURE-GO.md).
+
 GoogleSQLite is a Go project that runs GoogleSQL — the SQL dialect
 used by BigQuery and Cloud Spanner — on top of a SQLite backend. It is
 exposed as a `database/sql` driver, so any `database/sql` consumer gets

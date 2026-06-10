@@ -1,19 +1,18 @@
 # googlesqlite CLI
 
 `googlesqlite` is an interactive console for running GoogleSQL queries
-against the SQLite-backed googlesqlite engine, in the spirit of the
-`sqlite3` and `spanner-cli` REPLs.
+against the googlesqlite engine — on this branch
+(`pure-go-duckdb-backend`) that is the pure-Go DuckDB backend — in the
+spirit of the `sqlite3` and `spanner-cli` REPLs. See `CLI-PURE-GO.md`
+at the repository root for the branch-specific build and usage guide.
 
 The same program also builds for `js/wasm` and powers the browser
 Playground.
 
 ## Install
 
-```console
-$ go install github.com/goccy/googlesqlite/cmd/googlesqlite@latest
-```
-
-Or build from a checkout:
+Build from a checkout of this branch (`go install ...@latest` would
+fetch the upstream SQLite-backed binary, not this backend):
 
 ```console
 $ make build        # native binary -> bin/googlesqlite
@@ -28,7 +27,7 @@ googlesqlite [flags] [database]
 Flags:
   --dsn string            data source name (overrides the positional database argument)
   --file value            run statements from a SQL file before the REPL starts (repeatable)
-  --debug                 show the translated SQLite query for each statement
+  --debug                 show the translated DuckDB SQL for each statement
   --no-color              disable coloured output
   --history string        REPL history file (default ~/.googlesqlite_history)
   --continue-on-error     keep running a script after a statement fails
@@ -54,7 +53,7 @@ terminal is available the REPL opens afterwards in the resulting state.
 
 - `.help` — show help
 - `.quit`, `.exit` — leave the CLI
-- `.debug [on|off]` — show the translated SQLite query for each statement
+- `.debug [on|off]` — show the translated DuckDB SQL for each statement
 - `.tables` — list tables and views
 - `.functions` — list functions
 - `.read <path>` — run the statements in a SQL file
@@ -78,7 +77,7 @@ The `js/wasm` build installs `globalThis.googlesqlite` with:
 | `loadHistory(json)` | restore a history exported as JSON |
 | `clearHistory()` | drop all history |
 | `exportHistory(format)` | export history as `json`, `sql`, `markdown` or `csv` |
-| `setDebug(bool)` | toggle the translated-SQLite display |
+| `setDebug(bool)` | toggle the translated-SQL display |
 
 The host page is responsible for persisting `exportDB()` bytes and the
 history (e.g. in IndexedDB) and restoring them on load via `importDB`
