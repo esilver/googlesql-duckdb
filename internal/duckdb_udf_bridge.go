@@ -1,6 +1,9 @@
 package internal
 
 import (
+	"fmt"
+	"time"
+
 	"github.com/goccy/go-json"
 
 	arrfn "github.com/goccy/googlesqlite/internal/functions/array"
@@ -101,6 +104,88 @@ func GoogleSQLDecodeScalar(envelope any) (any, error) {
 		return nil, err
 	}
 	return string(b), nil
+}
+
+// GoogleSQLUnnestTemporal is the DuckDB-facing bridge for the
+// googlesqlite_unnest_temporal scalar UDF, which the formatter emits when
+// projecting a DATE / TIME / DATETIME / TIMESTAMP element out of the
+// json_each(googlesqlite_decode_array(...)) UNNEST lowering. The element
+// arrives in one of two wire forms: the value-layer base64 envelope (a
+// literal array, GENERATE_DATE_ARRAY / GENERATE_TIMESTAMP_ARRAY, any
+// value-layer producer) or a plain temporal text rendering (a DuckDB-native
+// LIST handed to googlesqlite_decode_array — e.g. array_agg over a natively
+// stored temporal column — json-marshals its time.Time elements to RFC3339).
+// kind is the analyzer-resolved element kind ('date', 'time', 'datetime',
+// 'timestamp'); the result is the canonical text form that DuckDB CASTs
+// cleanly to the matching native temporal type, mirroring the literal
+// rendering in literalFromValue.
+func GoogleSQLUnnestTemporal(elem, kind any) (any, error) {
+	if elem == nil {
+		return nil, nil
+	}
+	kindName, ok := kind.(string)
+	if !ok {
+		return nil, fmt.Errorf("googlesqlite_unnest_temporal: kind must be a string, got %T", kind)
+	}
+	decoded, err := DecodeValue(elem)
+	if err != nil {
+		return nil, err
+	}
+	if decoded == nil {
+		return nil, nil
+	}
+	var t time.Time
+	switch vv := decoded.(type) {
+	case value.DateValue:
+		t = time.Time(vv)
+	case value.TimeValue:
+		t = time.Time(vv)
+	case value.DatetimeValue:
+		t = time.Time(vv)
+	case value.TimestampValue:
+		t = time.Time(vv)
+	case value.StringValue:
+		parsed, err := parseTemporalElementText(string(vv))
+		if err != nil {
+			return nil, fmt.Errorf("googlesqlite_unnest_temporal: %w", err)
+		}
+		t = parsed
+	default:
+		return nil, fmt.Errorf("googlesqlite_unnest_temporal: unexpected element value %T", decoded)
+	}
+	switch kindName {
+	case "date":
+		return t.Format("2006-01-02"), nil
+	case "time":
+		return t.Format("15:04:05.999999"), nil
+	case "datetime":
+		return t.Format("2006-01-02 15:04:05.999999"), nil
+	case "timestamp":
+		// GoogleSQL TIMESTAMP is an absolute instant -> DuckDB TIMESTAMPTZ.
+		// Normalize to UTC and pin the +00 offset so the instant
+		// round-trips regardless of DuckDB's session TimeZone.
+		return t.UTC().Format("2006-01-02 15:04:05.999999+00"), nil
+	}
+	return nil, fmt.Errorf("googlesqlite_unnest_temporal: unknown kind %q", kindName)
+}
+
+// parseTemporalElementText parses the plain-text temporal forms a
+// DuckDB-native LIST element can arrive in: RFC3339 (json.Marshal of a Go
+// time.Time), the DuckDB render of a TIMESTAMP/DATETIME, a bare DATE, or a
+// bare TIME.
+func parseTemporalElementText(s string) (time.Time, error) {
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		"2006-01-02 15:04:05.999999999Z07:00",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02",
+		"15:04:05.999999999",
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("cannot parse temporal element %q", s)
 }
 
 // GoogleSQLCast is the DuckDB-facing bridge for the googlesqlite_cast scalar

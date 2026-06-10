@@ -3718,6 +3718,64 @@ func wrapZipOperand(operand string) string {
 	return fmt.Sprintf("(%s)", trimmed)
 }
 
+// unnestElementSQL returns the SQL projecting one decoded array element out
+// of the json_each(googlesqlite_decode_array(...)) scan, retyped to match the
+// element column's analyzer-resolved GoogleSQL type.
+//
+// Left as raw json_each.value, every element reaches DuckDB JSON-typed:
+// native functions fail to bind (mod(JSON, INTEGER_LITERAL)), CTAS persists
+// a JSON column, and — worst — native comparisons / MIN / MAX over the JSON
+// values are lexicographic, so MAX over UNNEST(GENERATE_ARRAY(1,1000))
+// silently returned 999. The analyzer knows the element type here, so:
+//
+//   - INT64 / FLOAT64 / BOOL elements are bare JSON scalars in the decoded
+//     array (EncodeValue passes them through raw); a native CAST retypes
+//     them to BIGINT / DOUBLE / BOOLEAN.
+//   - STRING elements are the value-layer envelope wrapped in JSON quotes;
+//     json_extract_string strips the quotes so the element carries the same
+//     VARCHAR envelope a stored TEXT column holds (equality with literals
+//     and stored columns is byte-identical either way; a plain CAST would
+//     keep the JSON quotes and break it).
+//   - DATE / TIME / DATETIME / TIMESTAMP elements ride the envelope inside
+//     the JSON; googlesqlite_unnest_temporal unwraps the envelope to a
+//     canonical native-castable text form and the CAST retypes it to the
+//     native temporal column type (matching ColumnSpec.SQLiteSchema, which
+//     stores temporals natively).
+//
+// Every other element kind (ARRAY, STRUCT, BYTES, NUMERIC, GEOGRAPHY, JSON,
+// INTERVAL, RANGE, ENUM, PROTO, ...) keeps the raw JSON projection: the
+// value-layer flow depends on receiving the envelope untouched.
+func unnestElementSQL(col *googlesql.ResolvedColumn) string {
+	const raw = "json_each.value"
+	if col == nil {
+		return raw
+	}
+	t, _ := col.Type()
+	if t == nil {
+		return raw
+	}
+	k, err := t.Kind()
+	if err != nil {
+		return raw
+	}
+	if castType, ok := valueLayerScalarCastType(k); ok {
+		return fmt.Sprintf("CAST(%s AS %s)", raw, castType)
+	}
+	switch k {
+	case googlesql.TypeKindTypeString:
+		return fmt.Sprintf("json_extract_string(%s, '$')", raw)
+	case googlesql.TypeKindTypeDate:
+		return fmt.Sprintf("CAST(googlesqlite_unnest_temporal(json_extract_string(%s, '$'), 'date') AS DATE)", raw)
+	case googlesql.TypeKindTypeTime:
+		return fmt.Sprintf("CAST(googlesqlite_unnest_temporal(json_extract_string(%s, '$'), 'time') AS TIME)", raw)
+	case googlesql.TypeKindTypeDatetime:
+		return fmt.Sprintf("CAST(googlesqlite_unnest_temporal(json_extract_string(%s, '$'), 'datetime') AS TIMESTAMP)", raw)
+	case googlesql.TypeKindTypeTimestamp:
+		return fmt.Sprintf("CAST(googlesqlite_unnest_temporal(json_extract_string(%s, '$'), 'timestamp') AS TIMESTAMPTZ)", raw)
+	}
+	return raw
+}
+
 func (n *ArrayScanNode) FormatSQL(ctx context.Context) (string, error) {
 	if n.node == nil {
 		return "", nil
@@ -3726,12 +3784,16 @@ func (n *ArrayScanNode) FormatSQL(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	colName := uniqueColumnName(ctx, m1(n.node.ElementColumn()))
-	columns := []string{fmt.Sprintf("json_each.value AS \"%s\"", colName)}
+	elementColumn := m1(n.node.ElementColumn())
+	colName := uniqueColumnName(ctx, elementColumn)
+	columns := []string{fmt.Sprintf("%s AS \"%s\"", unnestElementSQL(elementColumn), colName)}
 
 	if offsetColumn, _ := n.node.ArrayOffsetColumn(); offsetColumn != nil {
 		offsetColName := uniqueColumnName(ctx, m1(offsetColumn.Column()))
-		columns = append(columns, fmt.Sprintf("json_each.key AS \"%s\"", offsetColName))
+		// The WITH OFFSET column resolves as INT64; retype json_each.key
+		// the same way the element is retyped so native functions bind and
+		// ORDER BY off sorts numerically rather than lexicographically.
+		columns = append(columns, fmt.Sprintf("CAST(json_each.key AS BIGINT) AS \"%s\"", offsetColName))
 	}
 	if m1(n.node.InputScan()) != nil {
 		input, err := newNode(m1(n.node.InputScan())).FormatSQL(ctx)

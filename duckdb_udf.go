@@ -46,6 +46,9 @@ func registerDuckDBUDFs(db *sql.DB) error {
 	if err := duckdb.RegisterScalarUDF(conn, "googlesqlite_decode_scalar", &decodeScalarUDF{}); err != nil {
 		return fmt.Errorf("googlesqlite: register googlesqlite_decode_scalar: %w", err)
 	}
+	if err := duckdb.RegisterScalarUDF(conn, "googlesqlite_unnest_temporal", &unnestTemporalUDF{}); err != nil {
+		return fmt.Errorf("googlesqlite: register googlesqlite_unnest_temporal: %w", err)
+	}
 	if err := duckdb.RegisterScalarUDF(conn, "googlesqlite_cast", &castUDF{}); err != nil {
 		return fmt.Errorf("googlesqlite: register googlesqlite_cast: %w", err)
 	}
@@ -172,15 +175,21 @@ func (*decodeArrayUDF) Executor() duckdb.ScalarFuncExecutor {
 // scalar-UDF interface. The formatter wraps a scalar struct-field access
 // (googlesqlite_get_struct_field, which returns the value-layer envelope)
 // in googlesqlite_decode_scalar so the bare textual value falls out of the
-// envelope, then casts it to the field's resolved scalar type. The single
-// argument is the envelope VARCHAR; the result is the bare value rendered
-// through the VARCHAR result type.
+// envelope, then casts it to the field's resolved scalar type. The argument
+// is usually the envelope VARCHAR, but the safe-eval wrap (IFERROR /
+// NULLIFERROR try arms) can hand it a value that is already native — e.g. a
+// scalar subquery over an UNNEST element, which the typed UNNEST projection
+// now emits as BIGINT / DOUBLE / BOOLEAN — so the input is declared TYPE_ANY
+// and the bridge's DecodeValue round-trips native scalars to their textual
+// form unchanged. The result is the bare value rendered through the VARCHAR
+// result type.
 type decodeScalarUDF struct{}
 
 func (*decodeScalarUDF) Config() duckdb.ScalarFuncConfig {
 	varchar, _ := duckdb.NewTypeInfo(duckdb.TYPE_VARCHAR)
+	anyType, _ := duckdb.NewTypeInfo(duckdb.TYPE_ANY)
 	return duckdb.ScalarFuncConfig{
-		InputTypeInfos: []duckdb.TypeInfo{varchar},
+		InputTypeInfos: []duckdb.TypeInfo{anyType},
 		ResultTypeInfo: varchar,
 		// A NULL field value (struct field access on a NULL struct) must stay
 		// NULL rather than decode, so route NULLs through the body.
@@ -199,21 +208,55 @@ func (*decodeScalarUDF) Executor() duckdb.ScalarFuncExecutor {
 	}
 }
 
+// unnestTemporalUDF adapts internal.GoogleSQLUnnestTemporal to DuckDB's
+// scalar-UDF interface. The formatter emits
+// CAST(googlesqlite_unnest_temporal(json_extract_string(json_each.value,
+// '$'), '<kind>') AS <native temporal type>) when projecting a temporal
+// element out of the UNNEST lowering. Both arguments are VARCHAR (the
+// element's envelope-or-text wire form, and the resolved kind name); the
+// result is the canonical native-castable text rendering.
+type unnestTemporalUDF struct{}
+
+func (*unnestTemporalUDF) Config() duckdb.ScalarFuncConfig {
+	varchar, _ := duckdb.NewTypeInfo(duckdb.TYPE_VARCHAR)
+	return duckdb.ScalarFuncConfig{
+		InputTypeInfos: []duckdb.TypeInfo{varchar, varchar},
+		ResultTypeInfo: varchar,
+		// A NULL array element must stay NULL; the body folds it before
+		// touching the kind argument.
+		SpecialNullHandling: true,
+	}
+}
+
+func (*unnestTemporalUDF) Executor() duckdb.ScalarFuncExecutor {
+	return duckdb.ScalarFuncExecutor{
+		RowExecutor: func(values []driver.Value) (any, error) {
+			if len(values) != 2 {
+				return nil, fmt.Errorf("googlesqlite_unnest_temporal: want 2 args, got %d", len(values))
+			}
+			return internal.GoogleSQLUnnestTemporal(values[0], values[1])
+		},
+	}
+}
+
 // inArrayUDF adapts the engine's pure-Go internal.GoogleSQLInArray body
-// to DuckDB's scalar-UDF interface. Both arguments arrive as the engine's
-// value-layer wire form (a VARCHAR holding base64-encoded JSON for the
-// non-primitive ARRAY argument, and the element in the same encoding),
-// because the formatter routes both the column value and the bound param
-// through the identical encode path. We decode each argument back into a
-// value.Value, delegate to the shared membership body, and hand DuckDB a
+// to DuckDB's scalar-UDF interface. The array argument arrives as the
+// engine's value-layer wire form (a VARCHAR holding base64-encoded JSON).
+// The element argument is polymorphic: a VARCHAR envelope from the
+// value-layer encode path, or a native BIGINT / DOUBLE / BOOLEAN when the
+// probe is a typed UNNEST element (the ARRAY_INCLUDES_* rewrites lower to
+// `e IN UNNEST(...)` over the decoded element), so it is declared TYPE_ANY
+// and DecodeValue normalises both forms. We decode each argument back into
+// a value.Value, delegate to the shared membership body, and hand DuckDB a
 // native Go bool.
 type inArrayUDF struct{}
 
 func (*inArrayUDF) Config() duckdb.ScalarFuncConfig {
 	varchar, _ := duckdb.NewTypeInfo(duckdb.TYPE_VARCHAR)
 	boolean, _ := duckdb.NewTypeInfo(duckdb.TYPE_BOOLEAN)
+	anyType, _ := duckdb.NewTypeInfo(duckdb.TYPE_ANY)
 	return duckdb.ScalarFuncConfig{
-		InputTypeInfos: []duckdb.TypeInfo{varchar, varchar},
+		InputTypeInfos: []duckdb.TypeInfo{anyType, varchar},
 		ResultTypeInfo: boolean,
 		// The element argument can legitimately be NULL while the array is
 		// not; defer NULL semantics to the membership body rather than

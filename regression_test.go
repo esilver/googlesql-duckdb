@@ -2413,3 +2413,187 @@ func TestRegression_SafeDivideAggregateCoercion(t *testing.T) {
 		t.Fatalf("SAFE_DIVIDE(.., 0) = %v, want NULL", nullable.Float64)
 	}
 }
+
+// TestRegression_UnnestElementNativeBinding asserts that array elements
+// produced by UNNEST reach DuckDB with their analyzer-resolved native type
+// instead of JSON, so DuckDB-native functions bind against them.
+//
+// Origin: https://github.com/esilver/googlesqlite/issues/1 — the UNNEST
+// lowering projected raw json_each.value, so MOD(y, 7) over an unnested
+// element failed at prepare time with
+// 'No function matches ... mod(JSON, INTEGER_LITERAL)'.
+func TestRegression_UnnestElementNativeBinding(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	rows, err := db.QueryContext(ctx, "SELECT MOD(y,7) AS m FROM UNNEST([10,20,30]) AS y ORDER BY m")
+	if err != nil {
+		t.Fatalf("MOD over UNNEST element: %v", err)
+	}
+	defer rows.Close()
+	var got []int64
+	for rows.Next() {
+		var v int64
+		if err := rows.Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, v)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 || got[0] != 2 || got[1] != 3 || got[2] != 6 {
+		t.Fatalf("MOD(y,7) over UNNEST([10,20,30]) = %v, want [2 3 6]", got)
+	}
+}
+
+// TestRegression_UnnestMaxNotLexicographic asserts that MIN / MAX over an
+// unnested integer array compare numerically.
+//
+// Origin: https://github.com/esilver/googlesqlite/issues/1 — with the raw
+// JSON projection, native MAX compared the JSON values lexicographically,
+// so MAX over UNNEST(GENERATE_ARRAY(1,1000)) silently returned 999.
+func TestRegression_UnnestMaxNotLexicographic(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	var n, max int64
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) AS n, MAX(x) AS m FROM UNNEST(GENERATE_ARRAY(1,1000)) AS x").Scan(&n, &max); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1000 || max != 1000 {
+		t.Fatalf("COUNT, MAX over UNNEST(GENERATE_ARRAY(1,1000)) = %d, %d; want 1000, 1000", n, max)
+	}
+}
+
+// TestRegression_UnnestCTASColumnType asserts that CREATE TABLE AS SELECT
+// over an unnested array persists a natively typed column, so native
+// functions bind against the stored column afterwards.
+//
+// Origin: https://github.com/esilver/googlesqlite/issues/1 — the JSON typing
+// persisted through CTAS, so MOD(id, 1000) on the stored column failed with
+// the same binder error.
+func TestRegression_UnnestCTASColumnType(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx,
+		"CREATE TABLE unnest_ctas AS SELECT x AS id, MOD(x,1000) AS grp FROM UNNEST(GENERATE_ARRAY(1,5000)) AS x"); err != nil {
+		t.Fatalf("CTAS over UNNEST: %v", err)
+	}
+	var groups, total int64
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(DISTINCT MOD(id,1000)), COUNT(*) FROM unnest_ctas").Scan(&groups, &total); err != nil {
+		t.Fatalf("MOD over stored CTAS column: %v", err)
+	}
+	if groups != 1000 || total != 5000 {
+		t.Fatalf("MOD over stored column: groups=%d total=%d, want 1000, 5000", groups, total)
+	}
+	// Numeric (not lexicographic) semantics on the stored column too.
+	var max int64
+	if err := db.QueryRowContext(ctx, "SELECT MAX(id) FROM unnest_ctas").Scan(&max); err != nil {
+		t.Fatal(err)
+	}
+	if max != 5000 {
+		t.Fatalf("MAX(id) over stored column = %d, want 5000", max)
+	}
+}
+
+// TestRegression_UnnestElementTypedProjections drives the per-kind UNNEST
+// element projections (BOOL / FLOAT64 / STRING / DATE / TIMESTAMP / offset)
+// introduced for issue #1, asserting both that native functions bind and
+// that values round-trip.
+func TestRegression_UnnestElementTypedProjections(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	// FLOAT64: native rounding over the element.
+	var f float64
+	if err := db.QueryRowContext(ctx,
+		"SELECT SUM(ROUND(v)) FROM UNNEST([1.4, 2.6]) AS v").Scan(&f); err != nil {
+		t.Fatalf("ROUND over FLOAT64 element: %v", err)
+	}
+	if f != 4 {
+		t.Fatalf("SUM(ROUND(v)) = %v, want 4", f)
+	}
+
+	// BOOL: usable directly as a predicate.
+	var c int64
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM UNNEST([true, false, true]) AS b WHERE b").Scan(&c); err != nil {
+		t.Fatalf("BOOL element as predicate: %v", err)
+	}
+	if c != 2 {
+		t.Fatalf("COUNT WHERE b = %d, want 2", c)
+	}
+
+	// STRING: function application and equality.
+	var s string
+	if err := db.QueryRowContext(ctx,
+		"SELECT UPPER(v) FROM UNNEST(['a','b']) AS v WHERE v = 'b'").Scan(&s); err != nil {
+		t.Fatalf("UPPER / equality over STRING element: %v", err)
+	}
+	if s != "B" {
+		t.Fatalf("UPPER(v) = %q, want B", s)
+	}
+
+	// DATE: native EXTRACT over the element.
+	var y int64
+	if err := db.QueryRowContext(ctx,
+		"SELECT EXTRACT(YEAR FROM d) FROM UNNEST([DATE '2024-03-22']) AS d").Scan(&y); err != nil {
+		t.Fatalf("EXTRACT over DATE element: %v", err)
+	}
+	if y != 2024 {
+		t.Fatalf("EXTRACT(YEAR) = %d, want 2024", y)
+	}
+
+	// TIMESTAMP: native EXTRACT over the element.
+	if err := db.QueryRowContext(ctx,
+		"SELECT EXTRACT(HOUR FROM ts) FROM UNNEST([TIMESTAMP '2024-01-01 12:00:00']) AS ts").Scan(&y); err != nil {
+		t.Fatalf("EXTRACT over TIMESTAMP element: %v", err)
+	}
+	if y != 12 {
+		t.Fatalf("EXTRACT(HOUR) = %d, want 12", y)
+	}
+
+	// WITH OFFSET: the offset column is INT64-native (MOD binds, numeric
+	// ordering past one digit).
+	rows, err := db.QueryContext(ctx,
+		"SELECT MOD(off, 2) FROM UNNEST(GENERATE_ARRAY(0,11)) AS v WITH OFFSET off ORDER BY off")
+	if err != nil {
+		t.Fatalf("MOD over OFFSET column: %v", err)
+	}
+	defer rows.Close()
+	var offs []int64
+	for rows.Next() {
+		var v int64
+		if err := rows.Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		offs = append(offs, v)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(offs) != 12 || offs[10] != 0 || offs[11] != 1 {
+		t.Fatalf("MOD(off,2) ordered by off = %v, want alternating 0/1 over 12 rows", offs)
+	}
+}
