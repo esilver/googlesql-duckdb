@@ -575,10 +575,25 @@ func bulkCastValue(t *Type, v value.Value) (value.Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Mirror castValueWithKind: elements pass through untyped (the
-		// envelope encoder serializes each element by its runtime kind).
+		// Recurse with the declared element type: ARRAY<STRUCT> elements
+		// arrive in the caller's normalized shape (e.g. a []map of
+		// single-key maps per struct, the bigquery-emulator RECORD form)
+		// and must be reshaped exactly like a top-level column of that
+		// type, or the stored envelope decodes as the wrong kind at scan
+		// time ("failed to convert struct from array" -> HTTP 500 ->
+		// client retry loop; the bqe TestTable hang).
 		ret := &value.ArrayValue{}
-		ret.Values = append(ret.Values, array.Values...)
+		for _, ev := range array.Values {
+			if ev == nil || t.ElementType == nil {
+				ret.Values = append(ret.Values, ev)
+				continue
+			}
+			ce, err := bulkCastValue(t.ElementType, ev)
+			if err != nil {
+				return nil, err
+			}
+			ret.Values = append(ret.Values, ce)
+		}
 		return ret, nil
 	case googlesql.TypeKindTypeStruct:
 		return bulkCastStruct(t, v)

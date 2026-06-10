@@ -341,3 +341,50 @@ func BenchmarkPerRowInsertJSON1k(b *testing.B) {
 	b.StopTimer()
 	b.ReportMetric(float64(b.Elapsed().Milliseconds())/float64(b.N)/float64(rowsN), "ms/row")
 }
+
+// TestBulkInsertArrayStructNormalizedShape pins the bqe TestTable hang's
+// root cause: an ARRAY<STRUCT> cell arriving in the bigquery-emulator's
+// normalized RECORD form — each struct element a []map of single-key maps
+// (one per field). bulkCastStruct merged that shape for TOP-LEVEL struct
+// columns, but bulkCastValue's ARRAY branch passed elements through
+// untyped, so each element persisted as a nested ARRAY envelope of
+// mini-structs; the scan side then died with "failed to convert struct
+// from array" (surfacing as an HTTP 500 retry loop in the emulator).
+// The ARRAY branch now recurses with the declared element type.
+func TestBulkInsertArrayStructNormalizedShape(t *testing.T) {
+	db, err := sql.Open("googlesqlite", ":memory:?_test=bulk_arrstruct")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(ctx,
+		"CREATE TABLE `t` (`id` INT64, `recs` ARRAY<STRUCT<a INT64, b STRING>>)"); err != nil {
+		t.Fatal(err)
+	}
+	rows := [][]any{{
+		int64(1),
+		[]any{
+			[]map[string]any{{"a": int64(7)}, {"b": "x"}},
+			[]map[string]any{{"a": int64(8)}, {"b": "y"}},
+		},
+	}}
+	if n, err := googlesqlite.BulkInsert(ctx, conn, []string{"t"}, []string{"id", "recs"}, rows); err != nil || n != 1 {
+		t.Fatalf("BulkInsert: n=%d err=%v", n, err)
+	}
+	var got string
+	if err := conn.QueryRowContext(ctx,
+		"SELECT TO_JSON_STRING(recs) FROM `t` WHERE id = 1").Scan(&got); err != nil {
+		t.Fatalf("scan ARRAY<STRUCT> back: %v", err)
+	}
+	want := `[{"a":7,"b":"x"},{"a":8,"b":"y"}]`
+	if got != want {
+		t.Fatalf("round-trip = %s, want %s", got, want)
+	}
+}
