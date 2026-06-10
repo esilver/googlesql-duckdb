@@ -139,12 +139,14 @@ func TestBulkInsertUnsupportedShapes(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Targeted column outside the fast path's kind set.
-	if _, err := conn.ExecContext(ctx, "CREATE TABLE `tj` (`j` JSON)"); err != nil {
+	// Targeted column outside the fast path's kind set, with a non-NULL
+	// value (the value-aware gate admits all-NULL batches; see
+	// TestBulkInsertValueAwareNullGate).
+	if _, err := conn.ExecContext(ctx, "CREATE TABLE `tj` (`j` GEOGRAPHY)"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := googlesqlite.BulkInsert(ctx, conn, []string{"tj"}, []string{"j"}, [][]any{{`{"a":1}`}}); !errors.Is(err, googlesqlite.ErrBulkInsertUnsupported) {
-		t.Errorf("JSON column: err = %v, want errors.Is(_, ErrBulkInsertUnsupported)", err)
+	if _, err := googlesqlite.BulkInsert(ctx, conn, []string{"tj"}, []string{"j"}, [][]any{{"POINT(1 2)"}}); !errors.Is(err, googlesqlite.ErrBulkInsertUnsupported) {
+		t.Errorf("GEOGRAPHY column: err = %v, want errors.Is(_, ErrBulkInsertUnsupported)", err)
 	}
 
 	// Omitted column with a DEFAULT (the slow path splices defaults).

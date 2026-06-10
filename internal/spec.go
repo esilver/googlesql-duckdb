@@ -469,8 +469,21 @@ func typeKindToSQLName(kind googlesql.TypeKind) string {
 }
 
 func (s *ColumnSpec) SQLiteSchema() string {
+	typ := storageTypeForKind(googlesql.TypeKind(s.Type.Kind))
+	schema := fmt.Sprintf("\"%s\" %s", s.Name, typ)
+	if s.IsNotNull {
+		schema += " NOT NULL"
+	}
+	return schema
+}
+
+// storageTypeForKind maps a GoogleSQL column kind to the DuckDB column type
+// its cells are stored in — the single source of truth shared by the CREATE
+// TABLE schema rendering (SQLiteSchema) and the bulk-insert seam (which must
+// produce/cast into exactly these storage types; see internal/bulkinsert.go).
+func storageTypeForKind(kind googlesql.TypeKind) string {
 	var typ string
-	switch googlesql.TypeKind(s.Type.Kind) {
+	switch kind {
 	case googlesql.TypeKindTypeInt32, googlesql.TypeKindTypeInt64, googlesql.TypeKindTypeUint32, googlesql.TypeKindTypeUint64:
 		// BIGINT, not INT: GoogleSQL INT64 is 64-bit, and DuckDB's INT is
 		// the 32-bit INTEGER. Storing INT64 columns as INTEGER both
@@ -538,11 +551,7 @@ func (s *ColumnSpec) SQLiteSchema() string {
 	default:
 		typ = "UNKNOWN"
 	}
-	schema := fmt.Sprintf("\"%s\" %s", s.Name, typ)
-	if s.IsNotNull {
-		schema += " NOT NULL"
-	}
-	return schema
+	return typ
 }
 
 func newTypeFromFunctionArgumentType(t *googlesql.FunctionArgumentType) *Type {

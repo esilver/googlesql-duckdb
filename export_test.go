@@ -94,3 +94,46 @@ func (c *Conn) RawEngineExec(ctx context.Context, query string) error {
 	_, err := c.conn.ExecContext(ctx, query)
 	return err
 }
+
+// RawEngineQuery runs SQL directly on the inner engine connection and
+// returns every row formatted as strings ("<NULL>" for SQL NULL).
+// Test-only: the BulkInsert storage-parity tests read RAW stored cell
+// representations (typeof(c), CAST(c AS VARCHAR), hex(c)) to assert the
+// bulk path stores byte-identical values to the per-row INSERT path.
+func (c *Conn) RawEngineQuery(ctx context.Context, query string) ([][]string, error) {
+	rows, err := c.conn.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	var out [][]string
+	for rows.Next() {
+		cells := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range cells {
+			ptrs[i] = &cells[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		row := make([]string, len(cols))
+		for i, cv := range cells {
+			switch v := cv.(type) {
+			case nil:
+				row[i] = "<NULL>"
+			case []byte:
+				row[i] = string(v)
+			case time.Time:
+				row[i] = v.Format(time.RFC3339Nano)
+			default:
+				row[i] = fmt.Sprintf("%v", v)
+			}
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}

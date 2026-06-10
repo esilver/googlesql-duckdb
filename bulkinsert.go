@@ -15,7 +15,7 @@
 //	    if !ok { return fmt.Errorf("not a googlesqlite conn: %T", dc) }
 //	    _, err := gsqlConn.BulkInsert(ctx,
 //	        []string{projectID, datasetID, table.ID}, // full name path
-//	        colNames,  // table.Columns names, minus JSON columns
+//	        colNames,  // table.Columns names (complex types included, #6)
 //	        rowValues, // same per-column values it binds today
 //	    )
 //	    return err
@@ -39,6 +39,25 @@ import (
 // column set is outside the bulk fast path. Treat it as "fall back to the
 // ordinary INSERT path"; test with errors.Is.
 var ErrBulkInsertUnsupported = internal.ErrBulkInsertUnsupported
+
+// BulkInsertUnsupportedEvent describes one ErrBulkInsertUnsupported return:
+// the table, the gating column (empty for whole-table-shape rejections), the
+// column's GoogleSQL type name, and a human-readable reason.
+type BulkInsertUnsupportedEvent = internal.BulkInsertUnsupportedEvent
+
+// BulkInsertUnsupportedCount returns how many times BulkInsert has returned
+// ErrBulkInsertUnsupported since process start (monotonic, process-wide).
+// Emulator-style callers that fall back to the per-row INSERT path can sample
+// it to report whether real workloads miss the fast path at scale.
+func BulkInsertUnsupportedCount() uint64 { return internal.BulkInsertUnsupportedCount() }
+
+// SetBulkInsertUnsupportedHook installs fn as the process-wide observer
+// called synchronously with one event per ErrBulkInsertUnsupported return
+// (e.g. to emit a debug log line with the gating column and type). nil
+// uninstalls. The hook must be cheap and must not call BulkInsert.
+func SetBulkInsertUnsupportedHook(fn func(BulkInsertUnsupportedEvent)) {
+	internal.SetBulkInsertUnsupportedHook(fn)
+}
 
 // BulkInsert loads rows into the table named by the full tablePath (e.g.
 // {project, dataset, table}) through the engine's bulk Appender, bypassing
