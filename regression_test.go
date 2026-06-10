@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"sort"
 	"testing"
 
 	"github.com/goccy/googlesqlite"
@@ -2595,5 +2596,98 @@ func TestRegression_UnnestElementTypedProjections(t *testing.T) {
 	}
 	if len(offs) != 12 || offs[10] != 0 || offs[11] != 1 {
 		t.Fatalf("MOD(off,2) ordered by off = %v, want alternating 0/1 over 12 rows", offs)
+	}
+}
+
+// TestRegression_Int64BigintStorage pins the INT64 storage width fix:
+// ColumnSpec.SQLiteSchema used to emit the engine's 32-bit INTEGER for
+// INT64 columns, so any value outside [-2^31, 2^31) failed the implicit
+// int64->int32 cast on INSERT. INT64 columns now map to BIGINT and the
+// full 64-bit domain must round-trip — via literals and via bound
+// parameters (the prepared-statement encode fast path).
+func TestRegression_Int64BigintStorage(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", "file:int64_bigint?mode=memory&cache=private")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE t_i64 (x INT64)"); err != nil {
+		t.Fatal(err)
+	}
+	// Literal above 2^31 (the original bug report shape).
+	if _, err := db.ExecContext(ctx, "INSERT INTO t_i64 (x) VALUES (4000000000)"); err != nil {
+		t.Fatalf("literal insert of 4000000000 failed: %v", err)
+	}
+	// Bound parameters across the full 64-bit domain.
+	for _, v := range []int64{-4000000000, -9223372036854775808, 9223372036854775807} {
+		if _, err := db.ExecContext(ctx, "INSERT INTO t_i64 (x) VALUES (?)", v); err != nil {
+			t.Fatalf("param insert of %d failed: %v", v, err)
+		}
+	}
+	// NOTE: no ORDER BY on this table. The engine's prepare-time sort
+	// optimization computes the column-stats span (max - min), which
+	// overflows INT64 when both extremes are present ("Overflow in
+	// subtraction of INT64 (9223372036854775807 - -9223372036854775808)").
+	// That is a separate, pre-existing engine limitation; this test pins
+	// the storage round-trip, so sort client-side here and exercise
+	// ORDER BY on a narrower-span table below.
+	want := []int64{-9223372036854775808, -4000000000, 4000000000, 9223372036854775807}
+	rows, err := db.QueryContext(ctx, "SELECT x FROM t_i64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []int64
+	for rows.Next() {
+		var x int64
+		if err := rows.Scan(&x); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, x)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	sort.Slice(got, func(i, j int) bool { return got[i] < got[j] })
+	if len(got) != len(want) {
+		t.Fatalf("got %d rows %v, want %d", len(got), got, len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("row %d = %d, want %d (full got %v)", i, got[i], want[i], got)
+		}
+	}
+	// ORDER BY over >2^31 magnitudes (span small enough for the engine's
+	// stats subtraction): the original bug-report shape, ordered.
+	if _, err := db.ExecContext(ctx, "CREATE TABLE t_i64b (x INT64)"); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []int64{4000000000, -4000000000, 7} {
+		if _, err := db.ExecContext(ctx, "INSERT INTO t_i64b (x) VALUES (?)", v); err != nil {
+			t.Fatalf("param insert of %d failed: %v", v, err)
+		}
+	}
+	wantB := []int64{-4000000000, 7, 4000000000}
+	rowsB, err := db.QueryContext(ctx, "SELECT x FROM t_i64b ORDER BY x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rowsB.Close()
+	var gotB []int64
+	for rowsB.Next() {
+		var x int64
+		if err := rowsB.Scan(&x); err != nil {
+			t.Fatal(err)
+		}
+		gotB = append(gotB, x)
+	}
+	if err := rowsB.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(gotB) != fmt.Sprint(wantB) {
+		t.Fatalf("ORDER BY round-trip = %v, want %v", gotB, wantB)
 	}
 }

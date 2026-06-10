@@ -525,7 +525,22 @@ func CastValue(t googlesql.Googlesql_TypeNode, v value.Value) (value.Value, erro
 		return v, nil
 	}
 	// Googlesql_TypeNode carries Kind directly, no upcast needed.
-	switch m1(t.Kind()) {
+	return castValueWithKind(m1(t.Kind()), t, v)
+}
+
+// castValueWithKind is CastValue with the type's Kind already resolved.
+// Type.Kind() is a wasm round-trip into the ZetaSQL analyzer module, so
+// per-exec hot paths (prepared-statement arg encoding) resolve the kind
+// once at prepare time and call this variant; CastValue keeps the
+// resolve-on-every-call behavior for the remaining callers.
+func castValueWithKind(kind googlesql.TypeKind, t googlesql.Googlesql_TypeNode, v value.Value) (value.Value, error) {
+	if v == nil {
+		return nil, nil
+	}
+	if t == nil {
+		return v, nil
+	}
+	switch kind {
 	case googlesql.TypeKindTypeInt32, googlesql.TypeKindTypeInt64, googlesql.TypeKindTypeUint32, googlesql.TypeKindTypeUint64:
 		i64, err := v.ToInt64()
 		if err != nil {
@@ -860,4 +875,52 @@ func encodeParamValue(v value.Value) (any, error) {
 		return string(vv), nil
 	}
 	return EncodeValue(v)
+}
+
+// encodeValueAgainstParamTypeWithKind is encodeValueAgainstParamType with
+// the param type's Kind pre-resolved (see castValueWithKind). It also
+// short-circuits the scalar identity cases — an int64/float64/bool Go
+// value bound to a matching scalar param kind round-trips unchanged
+// through ValueFromGoValue → CastValue → EncodeValue, so the conversion
+// is skipped entirely. hasKind is false when the param's Type() was
+// unavailable at prepare time; the un-typed path then matches the
+// original behavior (CastValue passthrough on nil type).
+func encodeValueAgainstParamTypeWithKind(v any, t googlesql.Googlesql_TypeNode, kind googlesql.TypeKind, hasKind bool) (any, error) {
+	if v == nil {
+		return nil, nil
+	}
+	if !hasKind || t == nil {
+		return encodeValueAgainstParamType(v, nil)
+	}
+	switch kind {
+	case googlesql.TypeKindTypeInt32, googlesql.TypeKindTypeInt64, googlesql.TypeKindTypeUint32, googlesql.TypeKindTypeUint64:
+		if iv, ok := v.(int64); ok {
+			return iv, nil
+		}
+	case googlesql.TypeKindTypeFloat, googlesql.TypeKindTypeDouble:
+		if fv, ok := v.(float64); ok {
+			return fv, nil
+		}
+	case googlesql.TypeKindTypeBool:
+		if bv, ok := v.(bool); ok {
+			return bv, nil
+		}
+	}
+	if s, ok := v.(string); ok {
+		if decoded, err := DecodeValue(s); err == nil && decoded != nil {
+			cast, err := castValueWithKind(kind, t, decoded)
+			if err == nil && cast != nil {
+				return encodeParamValue(cast)
+			}
+		}
+	}
+	val, err := ValueFromGoValue(v)
+	if err != nil {
+		return nil, err
+	}
+	casted, err := castValueWithKind(kind, t, val)
+	if err != nil {
+		return nil, err
+	}
+	return encodeParamValue(casted)
 }
