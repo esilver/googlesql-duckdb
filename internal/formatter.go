@@ -5075,13 +5075,38 @@ func (n *InsertStmtNode) FormatSQL(ctx context.Context) (string, error) {
 			stmt,
 		), nil
 	}
+	// DuckDB retarget: JSON columns are native-typed (spec.go maps
+	// TypeKindTypeJson to a JSON column), but JSON-producing
+	// expressions (googlesqlite_parse_json / to_json UDF calls and the
+	// JSON literal lowering) emit the value-layer base64 envelope,
+	// which fails DuckDB's VARCHAR->JSON cast at execution time
+	// ("Malformed JSON at byte 0 ... eyJoZWFkZXIi..."). Wrap each
+	// value headed for a JSON column in googlesqlite_to_native_json,
+	// which unwraps the envelope to raw JSON text and passes already-
+	// native values (bound params) through untouched.
+	jsonCol := make([]bool, len(insertCols))
+	for i, col := range insertCols {
+		if t, err := col.Type(); err == nil && t != nil {
+			if k, err := t.Kind(); err == nil && k == googlesql.TypeKindTypeJson {
+				jsonCol[i] = true
+			}
+		}
+	}
 	rows := []string{}
 	for _, row := range m1(n.node.RowList()) {
-		sql, err := newNode(row).FormatSQL(ctx)
-		if err != nil {
-			return "", err
+		valueNodes := m1(row.ValueList())
+		values := make([]string, 0, len(valueNodes))
+		for i, valueNode := range valueNodes {
+			sql, err := newNode(valueNode).FormatSQL(ctx)
+			if err != nil {
+				return "", err
+			}
+			if i < len(jsonCol) && jsonCol[i] && sql != "" {
+				sql = fmt.Sprintf("googlesqlite_to_native_json(%s)", sql)
+			}
+			values = append(values, sql)
 		}
-		full := sql
+		full := strings.Join(values, ",")
 		for _, d := range defaults {
 			full += "," + d.expr
 		}
@@ -5158,6 +5183,16 @@ func (n *UpdateItemNode) FormatSQL(ctx context.Context) (string, error) {
 		return "", err
 	} else if ok {
 		return rewritten, nil
+	}
+	// Same JSON seam as InsertStmtNode: a native JSON target column
+	// rejects the value-layer envelope that JSON-producing expressions
+	// emit, so unwrap to raw JSON text at assignment time. Applied only
+	// on the whole-column path — struct-field assignments (above) live
+	// inside envelope storage and must keep the envelope form.
+	if t, terr := targetNode.Type(); terr == nil && t != nil && setValue != "" {
+		if k, kerr := t.Kind(); kerr == nil && k == googlesql.TypeKindTypeJson {
+			setValue = fmt.Sprintf("googlesqlite_to_native_json(%s)", setValue)
+		}
 	}
 	target, err := newNode(targetNode).FormatSQL(targetCtx)
 	if err != nil {

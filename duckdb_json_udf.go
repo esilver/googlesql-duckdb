@@ -37,7 +37,40 @@ func registerDuckDBJSONUDFs(db *sql.DB) error {
 			return fmt.Errorf("googlesqlite: register %s: %w", u.Name, err)
 		}
 	}
+	if err := duckdb.RegisterScalarUDF(conn, "googlesqlite_to_native_json", &toNativeJSONUDF{}); err != nil {
+		return fmt.Errorf("googlesqlite: register googlesqlite_to_native_json: %w", err)
+	}
 	return nil
+}
+
+// toNativeJSONUDF adapts internal.GoogleSQLToNativeJSON to DuckDB's
+// scalar-UDF interface. The formatter wraps JSON-typed INSERT VALUES /
+// UPDATE SET expressions in it so a native JSON column receives raw
+// JSON text rather than the value-layer base64 envelope. The argument
+// is variadic-ANY (the wrapped expression may be an envelope VARCHAR,
+// a natively-encoded param, or a bare scalar); the result is VARCHAR
+// that DuckDB casts into the JSON column. NULL short-circuits to NULL
+// via DuckDB's default NULL handling.
+type toNativeJSONUDF struct{}
+
+func (*toNativeJSONUDF) Config() duckdb.ScalarFuncConfig {
+	any_, _ := duckdb.NewTypeInfo(duckdb.TYPE_ANY)
+	varchar, _ := duckdb.NewTypeInfo(duckdb.TYPE_VARCHAR)
+	return duckdb.ScalarFuncConfig{
+		VariadicTypeInfo: any_,
+		ResultTypeInfo:   varchar,
+	}
+}
+
+func (*toNativeJSONUDF) Executor() duckdb.ScalarFuncExecutor {
+	return duckdb.ScalarFuncExecutor{
+		RowExecutor: func(values []driver.Value) (any, error) {
+			if len(values) != 1 {
+				return nil, fmt.Errorf("googlesqlite_to_native_json: want 1 arg, got %d", len(values))
+			}
+			return internal.GoogleSQLToNativeJSON(values[0])
+		},
+	}
 }
 
 // jsonScalarUDF adapts a value-layer JSON-family body to DuckDB's

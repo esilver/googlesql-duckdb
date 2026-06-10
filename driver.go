@@ -173,8 +173,26 @@ func duckdbDSN(name string) string {
 // UDF layer to DuckDB scalar/aggregate UDFs is the Milestone-1 work item.
 type internalDuckDBDriver struct{}
 
+// internalDuckDBDriver must implement driver.DriverContext: without
+// OpenConnector, database/sql wraps the driver in its dsnConnector
+// fallback and calls Open once per POOLED CONNECTION — and the engine
+// driver's raw Open creates a brand-new wasm engine (~200MB, no
+// googlesqlite_* UDFs) per call. Any second pooled connection (forced
+// by a held transaction or concurrent load) then ran on a fresh,
+// UDF-less engine ("Scalar Function with name googlesqlite_in_array
+// does not exist"). Delegating to the engine driver's connector shares
+// ONE engine + database across the whole pool.
+var _ driver.DriverContext = internalDuckDBDriver{}
+
 func (internalDuckDBDriver) Open(name string) (driver.Conn, error) {
 	return duckdb.Driver{}.Open(duckdbDSN(name))
+}
+
+// OpenConnector implements driver.DriverContext by handing back the
+// engine driver's connector (one shared engine + database; a fresh
+// duckdb_connection per Connect).
+func (internalDuckDBDriver) OpenConnector(name string) (driver.Connector, error) {
+	return duckdb.Driver{}.OpenConnector(duckdbDSN(name))
 }
 
 func newDBAndCatalog(name string) (*sql.DB, *internal.Catalog, error) {

@@ -92,6 +92,54 @@ var jsonFamilyFuncs = []*funcInfo{
 	{Name: "json_array_insert", BindFunc: longtail.BindJsonArrayInsert},
 }
 
+// GoogleSQLToNativeJSON is the DuckDB-facing bridge for the
+// googlesqlite_to_native_json scalar UDF. The formatter wraps every
+// JSON-typed INSERT VALUES / UPDATE SET expression in it so the value
+// arriving at DuckDB's native JSON column is raw JSON text instead of
+// the value-layer base64 envelope (which fails DuckDB's VARCHAR->JSON
+// cast with "Malformed JSON at byte 0"). Three input shapes:
+//
+//   - a value-layer envelope VARCHAR (the result of
+//     googlesqlite_parse_json / to_json / a JSON literal lowering):
+//     decode it and hand back the raw JSON body;
+//   - raw text (a JSON-typed bound parameter, already natively
+//     encoded by encodeParamValue): pass through unchanged and let
+//     DuckDB's cast validate it;
+//   - a native scalar (int64 / float64 / bool): render it as its JSON
+//     scalar text.
+//
+// NULL passes through as NULL (the registration relies on DuckDB's
+// default NULL-in/NULL-out short-circuit).
+func GoogleSQLToNativeJSON(v any) (any, error) {
+	if v == nil {
+		return nil, nil
+	}
+	if s, ok := v.(string); ok {
+		decoded, err := DecodeValue(s)
+		if err != nil {
+			return nil, err
+		}
+		if decoded == nil {
+			return nil, nil
+		}
+		if sv, ok := decoded.(value.StringValue); ok && string(sv) == s {
+			// Not an envelope: raw JSON text from a natively-encoded
+			// JSON param (or an analyzer-guaranteed JSON-castable
+			// string). Forward as-is.
+			return s, nil
+		}
+		return decoded.ToJSON()
+	}
+	decoded, err := DecodeValue(v)
+	if err != nil {
+		return nil, err
+	}
+	if decoded == nil {
+		return nil, nil
+	}
+	return decoded.ToJSON()
+}
+
 var jsonFamilyMapOnce sync.Once
 
 // ensureJSONFamilyInFormatterMap inserts every JSON-family name into

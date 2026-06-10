@@ -794,13 +794,23 @@ func encodeNamedValue(v driver.NamedValue, param *googlesql.ResolvedParameter) (
 	}, nil
 }
 
-// encodeValueAgainstParamType produces the canonical googlesqlite
-// layout for v under the analyzer-declared param type. The value
-// arriving here may already be a base64-encoded layout (because
-// Conn.CheckNamedValue encodes by Go type before we know the
-// declared param type), so first try to decode and re-encode against
-// the declared type. If decoding fails, treat v as a raw Go value
-// and run the standard EncodeGoValue path.
+// encodeValueAgainstParamType produces the over-the-wire form for v
+// under the analyzer-declared param type. The value arriving here may
+// already be a base64-encoded layout (because Conn.CheckNamedValue
+// encodes by Go type before we know the declared param type), so first
+// try to decode and re-encode against the declared type. If decoding
+// fails, treat v as a raw Go value and run the standard cast path.
+//
+// DuckDB retarget: the bcf0852 storage seam made DATE / TIME / DATETIME
+// / TIMESTAMP / JSON columns native-typed, and the expression lowering
+// emits native temporal literals (DATE '...', TIMESTAMPTZ '...') for
+// inline values. A bound parameter must arrive in the same native form
+// — the legacy base64 envelope fails DuckDB's VARCHAR->DATE/JSON cast
+// at bind time ("invalid date field format: eyJoZWFkZXIi...").
+// encodeParamValue mirrors literalFromValue's native shortcuts for
+// exactly those kinds; everything else (STRING, NUMERIC, ARRAY, STRUCT,
+// ...) keeps the envelope the TEXT-backed columns and googlesqlite_*
+// UDFs store and decode.
 func encodeValueAgainstParamType(v any, t googlesql.Googlesql_TypeNode) (any, error) {
 	if v == nil {
 		return nil, nil
@@ -809,9 +819,45 @@ func encodeValueAgainstParamType(v any, t googlesql.Googlesql_TypeNode) (any, er
 		if decoded, err := DecodeValue(s); err == nil && decoded != nil {
 			cast, err := CastValue(t, decoded)
 			if err == nil && cast != nil {
-				return EncodeValue(cast)
+				return encodeParamValue(cast)
 			}
 		}
 	}
-	return encodeGoValue(t, v)
+	val, err := ValueFromGoValue(v)
+	if err != nil {
+		return nil, err
+	}
+	casted, err := CastValue(t, val)
+	if err != nil {
+		return nil, err
+	}
+	return encodeParamValue(casted)
+}
+
+// encodeParamValue renders a declared-type-cast parameter value in the
+// form the DuckDB storage layer expects: temporal kinds as the plain
+// text DuckDB casts into its native DATE / TIME / TIMESTAMP /
+// TIMESTAMPTZ columns (the same calendar/instant readings
+// literalFromValue pins for inline literals), JSON as the raw JSON
+// text a native JSON column accepts, and every other kind through
+// EncodeValue (bare Go scalars for INT64 / FLOAT64 / BOOL, the base64
+// value-layer envelope for STRING / NUMERIC / ARRAY / STRUCT / ...).
+func encodeParamValue(v value.Value) (any, error) {
+	switch vv := v.(type) {
+	case *value.SafeValue:
+		return encodeParamValue(vv.Value)
+	case value.DateValue:
+		return time.Time(vv).Format("2006-01-02"), nil
+	case value.TimeValue:
+		return time.Time(vv).Format("15:04:05.999999"), nil
+	case value.DatetimeValue:
+		return time.Time(vv).Format("2006-01-02 15:04:05.999999"), nil
+	case value.TimestampValue:
+		// Normalize to UTC and pin the +00 offset so the instant
+		// round-trips regardless of DuckDB's session TimeZone.
+		return time.Time(vv).UTC().Format("2006-01-02 15:04:05.999999+00"), nil
+	case value.JsonValue:
+		return string(vv), nil
+	}
+	return EncodeValue(v)
 }
