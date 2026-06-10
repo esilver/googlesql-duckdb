@@ -7,9 +7,9 @@ client-side, powered by `googlesqlite` compiled to WebAssembly.
 - **CodeMirror 6** as the SQL editor
 - The `googlesqlite` engine runs in a **Web Worker** so the UI stays
   responsive
-- The database is a single file in the **Origin Private File System**
-  (OPFS); the pure-Go DuckDB engine reads and writes it directly, so it
-  survives reloads with no explicit save step
+- The pure-Go DuckDB engine runs an in-memory database (fresh on each
+  reload); query history persists in the **Origin Private File System**
+  (OPFS)
 
 ## Prerequisites
 
