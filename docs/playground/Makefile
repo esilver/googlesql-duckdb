@@ -21,9 +21,13 @@ build: build/wasm build/assets build/page
 # under public/ is a generated artifact and is gitignored.
 build/wasm:
 	mkdir -p $(PUBLIC)
-	cd $(ROOT) && GOOS=js GOARCH=wasm go build \
+	cd $(ROOT) && GOOS=js GOARCH=wasm go build -ldflags='-s -w' \
 	  -o docs/playground/$(WASM) ./cmd/googlesqlite
-	cp "$$(go env GOROOT)/lib/wasm/wasm_exec.js" $(PUBLIC)/wasm_exec.js
+	# wasm_exec.js in GOROOT is read-only (0444) and lives in the read-only
+	# module cache; a plain cp inherits that mode, so the NEXT build can't
+	# overwrite it (EACCES). install creates a writable copy, replacing any
+	# stale read-only one.
+	install -m 644 "$$(go env GOROOT)/lib/wasm/wasm_exec.js" $(PUBLIC)/wasm_exec.js
 
 # build/assets derives the artifacts that depend on the engine binary:
 # the packed timezone database, the content-hash build id, and the
