@@ -1125,10 +1125,58 @@ func sqlStringLiteral(s string) string {
 
 // translateBQDateFormat rewrites the GoogleSQL/BigQuery strftime
 // conversion specifiers that DuckDB's strftime/strptime grammar spells
-// differently. Currently the RFC3339 numeric-offset specifier %Ez maps
-// to DuckDB's %z; other shared specifiers pass through untouched.
+// differently or lacks entirely:
+//
+//   - %Ez (RFC3339 numeric offset) -> %z
+//   - the composite shorthands DuckDB does not implement expand to their
+//     definitions: %F -> %Y-%m-%d, %T -> %H:%M:%S, %D -> %m/%d/%y,
+//     %R -> %H:%M, %r -> %I:%M:%S %p, %h -> %b
+//
+// The scan is %%-aware so a literal percent never has its successor
+// rewritten. Unknown specifiers pass through untouched (DuckDB raises a
+// clear error for them, which beats silently emitting wrong output).
 func translateBQDateFormat(format string) string {
-	return strings.ReplaceAll(format, "%Ez", "%z")
+	var b strings.Builder
+	for i := 0; i < len(format); i++ {
+		c := format[i]
+		if c != '%' || i+1 >= len(format) {
+			b.WriteByte(c)
+			continue
+		}
+		switch format[i+1] {
+		case '%':
+			b.WriteString("%%")
+			i++
+		case 'E':
+			if i+2 < len(format) && format[i+2] == 'z' {
+				b.WriteString("%z")
+				i += 2
+			} else {
+				b.WriteByte(c)
+			}
+		case 'F':
+			b.WriteString("%Y-%m-%d")
+			i++
+		case 'T':
+			b.WriteString("%H:%M:%S")
+			i++
+		case 'D':
+			b.WriteString("%m/%d/%y")
+			i++
+		case 'R':
+			b.WriteString("%H:%M")
+			i++
+		case 'r':
+			b.WriteString("%I:%M:%S %p")
+			i++
+		case 'h':
+			b.WriteString("%b")
+			i++
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // timeLiftedToTimestamp wraps a TIME-valued SQL expression as a
