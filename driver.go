@@ -634,3 +634,12 @@ func (tx *Tx) Rollback() error {
 	}()
 	return tx.tx.Rollback()
 }
+
+// AnalysisCacheCounters reports the process-wide GoogleSQL
+// analysis-cache hit / miss counts (see internal/analysis_cache.go).
+// Repeated identical query texts (same parameter shape, no
+// intervening DDL) are served from the cache, skipping the wasm
+// analyzer entirely. Intended for observability and tests.
+func AnalysisCacheCounters() (hits, misses uint64) {
+	return internal.AnalysisCacheCounters()
+}

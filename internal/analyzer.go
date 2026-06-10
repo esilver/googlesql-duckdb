@@ -1522,6 +1522,26 @@ func (a *Analyzer) Analyze(ctx context.Context, conn *Conn, query string, args [
 	query = applySQLRewritePipeline(query, sqlRewritePipelinePreScriptVars)
 	query = applyScriptVariables(ctx, query, conn)
 	query = applySQLRewritePipeline(query, sqlRewritePipelinePostScriptVars)
+	// Analysis cache (see analysis_cache.go). System variables feed the
+	// formatter through context, so connections carrying them bypass
+	// the cache; everything else keys on the post-rewrite text plus
+	// the parameter shape and catalog generation.
+	cacheEnabled := len(conn.systemVars) == 0
+	var (
+		cacheKey  string
+		lookupGen uint64
+	)
+	if cacheEnabled {
+		cacheKey = analysisCacheKey(a.namePath, query, args, conn.MaterializeCTE())
+		lookupGen = a.catalog.analysisGeneration()
+		if entry := a.catalog.lookupAnalysis(cacheKey, lookupGen); entry != nil {
+			entryArgs := args
+			cachedQuery := query
+			return []stmtActionFunc{func() (StmtAction, error) {
+				return entry.buildAction(a, cachedQuery, entryArgs)
+			}}, nil
+		}
+	}
 	parsed, err := a.parseScript(query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse statements: %w", err)
@@ -1575,6 +1595,9 @@ func (a *Analyzer) Analyze(ctx context.Context, conn *Conn, query string, args [
 			action, err := a.newStmtAction(ctx, query, stmtArgs, stmtNode)
 			if err != nil {
 				return nil, err
+			}
+			if cacheEnabled && len(parsed.stmts) == 1 {
+				a.maybeStoreAnalysis(cacheKey, lookupGen, stmt, mode, action)
 			}
 			return action, nil
 		})

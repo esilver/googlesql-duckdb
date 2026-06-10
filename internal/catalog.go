@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	googlesql "github.com/goccy/go-googlesql"
@@ -102,6 +103,13 @@ type Catalog struct {
 	// through CREATE PROPERTY GRAPH. Currently a metadata-only
 	// store; full GRAPH_EXPAND / AGG integration is not yet wired.
 	propertyGraphs map[string]*propertyGraphSpec
+	// analysisGen counts semantic catalog mutations; analysisCache
+	// holds Analyzer.Analyze output keyed by query text + parameter
+	// shape, valid only at the generation it was built under. See
+	// analysis_cache.go.
+	analysisGen     atomic.Uint64
+	analysisCacheMu sync.Mutex
+	analysisCache   map[string]*analysisCacheEntry
 }
 
 // PropertyGraphSpec captures the essentials of a CREATE PROPERTY
@@ -1489,6 +1497,7 @@ func (c *Catalog) DescriptorPool() *googlesql.DescriptorPool {
 // MakeEnumType and pin them on the catalog under their fully-qualified
 // names so subsequent SQL can reference them.
 func (c *Catalog) RegisterProto(fileDescriptorProtoBytes []byte) error {
+	c.bumpAnalysisGeneration()
 	if c.descriptorPool == nil {
 		return fmt.Errorf("catalog has no DescriptorPool — proto registration unavailable")
 	}
@@ -1546,6 +1555,7 @@ func (c *Catalog) RegisterProto(fileDescriptorProtoBytes []byte) error {
 // ("foo.bar.MyMessage"). The same `fullName` is used as the catalog
 // key and is what SQL must reference.
 func (c *Catalog) RegisterProtoMessage(fullName string) (*googlesql.ProtoType, error) {
+	c.bumpAnalysisGeneration()
 	if c.descriptorPool == nil {
 		return nil, fmt.Errorf("catalog has no DescriptorPool — proto registration unavailable")
 	}
@@ -1575,6 +1585,7 @@ func (c *Catalog) RegisterProtoMessage(fullName string) (*googlesql.ProtoType, e
 // the dotted name of the enum type. The returned *EnumType is pinned
 // on the catalog at that name.
 func (c *Catalog) RegisterEnum(fullName string) (*googlesql.EnumType, error) {
+	c.bumpAnalysisGeneration()
 	if c.descriptorPool == nil {
 		return nil, fmt.Errorf("catalog has no DescriptorPool — enum registration unavailable")
 	}
@@ -1611,6 +1622,7 @@ func (c *Catalog) LookupProtoType(fullName string) *googlesql.ProtoType {
 // Idempotent on the canonical name path; CREATE_OR_REPLACE simply
 // overwrites the previous entry.
 func (c *Catalog) AddPropertyGraph(spec *propertyGraphSpec) {
+	c.bumpAnalysisGeneration()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.propertyGraphs[spec.Name] = spec
@@ -1999,6 +2011,7 @@ func (c *Catalog) DeleteFunctionSpec(ctx context.Context, conn *Conn, name strin
 }
 
 func (c *Catalog) deleteTableSpecByName(name string) error {
+	c.bumpAnalysisGeneration()
 	spec, exists := c.tableMap[name]
 	if !exists {
 		return fmt.Errorf("failed to find table spec from map by %s", name)
@@ -2018,6 +2031,7 @@ func (c *Catalog) deleteTableSpecByName(name string) error {
 }
 
 func (c *Catalog) deleteFunctionSpecByName(name string) error {
+	c.bumpAnalysisGeneration()
 	spec, exists := c.funcMap[name]
 	if !exists {
 		return fmt.Errorf("failed to find function spec from map by %s", name)
@@ -2037,6 +2051,7 @@ func (c *Catalog) deleteFunctionSpecByName(name string) error {
 }
 
 func (c *Catalog) deleteTVFSpecByName(name string) error {
+	c.bumpAnalysisGeneration()
 	spec, exists := c.tvfMap[name]
 	if !exists {
 		return fmt.Errorf("failed to find TVF spec from map by %s", name)
@@ -2056,6 +2071,7 @@ func (c *Catalog) deleteTVFSpecByName(name string) error {
 }
 
 func (c *Catalog) resetCatalog(tables []*TableSpec, functions []*FunctionSpec, tvfs []*TVFSpec) error {
+	c.bumpAnalysisGeneration()
 	c.catalog = newSimpleCatalog(catalogName)
 	if c.catalog == nil {
 		return fmt.Errorf("failed to create catalog")
@@ -2236,6 +2252,7 @@ func (c *Catalog) trimmedLastPath(path []string) []string {
 }
 
 func (c *Catalog) addTVFSpec(spec *TVFSpec) error {
+	c.bumpAnalysisGeneration()
 	tvfName := spec.TVFName()
 	if _, exists := c.tvfMap[tvfName]; exists {
 		c.tvfMap[tvfName] = spec
@@ -2250,6 +2267,7 @@ func (c *Catalog) addTVFSpec(spec *TVFSpec) error {
 }
 
 func (c *Catalog) addFunctionSpec(spec *FunctionSpec) error {
+	c.bumpAnalysisGeneration()
 	funcName := spec.FuncName()
 	if _, exists := c.funcMap[funcName]; exists {
 		c.funcMap[funcName] = spec // update current spec
@@ -2264,6 +2282,7 @@ func (c *Catalog) addFunctionSpec(spec *FunctionSpec) error {
 }
 
 func (c *Catalog) addTableSpec(spec *TableSpec) error {
+	c.bumpAnalysisGeneration()
 	tableName := spec.TableName()
 	if _, exists := c.tableMap[tableName]; exists {
 		// Refresh the entry in-place: CREATE OR REPLACE TABLE has to
