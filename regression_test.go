@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"testing"
@@ -2689,5 +2690,163 @@ func TestRegression_Int64BigintStorage(t *testing.T) {
 	}
 	if fmt.Sprint(gotB) != fmt.Sprint(wantB) {
 		t.Fatalf("ORDER BY round-trip = %v, want %v", gotB, wantB)
+	}
+}
+
+// TestRegression_SumInt64Exactness asserts that SUM over an INT64 column is
+// computed as an EXACT integer — no float64 routing anywhere on the path —
+// including above 2^53 where double rounding becomes observable.
+//
+// Origin: https://github.com/esilver/googlesqlite/issues/5 — the aggregate
+// lowering cast SUM's argument to DOUBLE, so the whole sum accumulated in
+// float64 and 2^62 + 1 came back as 2^62 (the float64-nearest value), with
+// the result type itself surfacing as FLOAT64.
+func TestRegression_SumInt64Exactness(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE sum_exact (n INT64)"); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []int64{1, 4611686018427387904} { // 1, 2^62
+		if _, err := db.ExecContext(ctx, "INSERT `sum_exact` (`n`) VALUES (?)", v); err != nil {
+			t.Fatalf("insert %d: %v", v, err)
+		}
+	}
+	// The issue's exact repro: CAST(SUM(n) AS STRING) is computed server
+	// side, so this pins the in-engine result, not client scan conversion.
+	var s string
+	if err := db.QueryRowContext(ctx, "SELECT CAST(SUM(n) AS STRING) FROM sum_exact").Scan(&s); err != nil {
+		t.Fatal(err)
+	}
+	if want := "4611686018427387905"; s != want { // 2^62 + 1
+		t.Fatalf("CAST(SUM(n) AS STRING) = %q, want %q", s, want)
+	}
+	// The result must scan as an exact int64 too.
+	var got int64
+	if err := db.QueryRowContext(ctx, "SELECT SUM(n) FROM sum_exact").Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(4611686018427387905); got != want {
+		t.Fatalf("SUM(n) = %d, want %d", got, want)
+	}
+	// FORMAT('%T', SUM(n)) renders an INT64 literal, not a FLOAT64 one
+	// (the issue's type-level probe: 4.611686018427388e+18 was the bug).
+	var lit string
+	if err := db.QueryRowContext(ctx, "SELECT FORMAT('%T', SUM(n)) FROM sum_exact").Scan(&lit); err != nil {
+		t.Fatal(err)
+	}
+	if want := "4611686018427387905"; lit != want {
+		t.Fatalf("FORMAT('%%T', SUM(n)) = %q, want %q", lit, want)
+	}
+}
+
+// TestRegression_SumInt64NearMaxExact asserts SUM stays exact when the
+// result lands within a few units of math.MaxInt64 — every float64 ulp at
+// that magnitude is 1024, so any float routing shows up immediately.
+//
+// Origin: https://github.com/esilver/googlesqlite/issues/5.
+func TestRegression_SumInt64NearMaxExact(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE sum_nearmax (n INT64)"); err != nil {
+		t.Fatal(err)
+	}
+	// math.MaxInt64 - 10 plus 7 = math.MaxInt64 - 3: inside the int64
+	// range, far outside float64 exactness.
+	for _, v := range []int64{math.MaxInt64 - 10, 7} {
+		if _, err := db.ExecContext(ctx, "INSERT `sum_nearmax` (`n`) VALUES (?)", v); err != nil {
+			t.Fatalf("insert %d: %v", v, err)
+		}
+	}
+	var got int64
+	if err := db.QueryRowContext(ctx, "SELECT SUM(n) FROM sum_nearmax").Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(math.MaxInt64 - 3); got != want {
+		t.Fatalf("SUM(n) = %d, want %d", got, want)
+	}
+	var s string
+	if err := db.QueryRowContext(ctx, "SELECT CAST(SUM(n) AS STRING) FROM sum_nearmax").Scan(&s); err != nil {
+		t.Fatal(err)
+	}
+	if want := "9223372036854775804"; s != want {
+		t.Fatalf("CAST(SUM(n) AS STRING) = %q, want %q", s, want)
+	}
+}
+
+// TestRegression_SumInt64OverflowErrors asserts BigQuery's overflow
+// semantics: a SUM whose exact value exceeds the int64 range raises an
+// error instead of silently returning a float64-rounded (wrong) value.
+//
+// Origin: https://github.com/esilver/googlesqlite/issues/5.
+func TestRegression_SumInt64OverflowErrors(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE sum_overflow (n INT64)"); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []int64{math.MaxInt64, 1} {
+		if _, err := db.ExecContext(ctx, "INSERT `sum_overflow` (`n`) VALUES (?)", v); err != nil {
+			t.Fatalf("insert %d: %v", v, err)
+		}
+	}
+	var got int64
+	err = db.QueryRowContext(ctx, "SELECT SUM(n) FROM sum_overflow").Scan(&got)
+	if err == nil {
+		t.Fatalf("SUM overflowing int64 returned %d, want an error", got)
+	}
+}
+
+// TestRegression_SumFloat64Unchanged pins the control: SUM over FLOAT64
+// keeps its double semantics (the issue #5 fix must only retarget the
+// INT64-result path).
+func TestRegression_SumFloat64Unchanged(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE sum_float (x FLOAT64)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO sum_float (x) VALUES (1.5), (2.25)"); err != nil {
+		t.Fatal(err)
+	}
+	var got float64
+	if err := db.QueryRowContext(ctx, "SELECT SUM(x) FROM sum_float").Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != 3.75 {
+		t.Fatalf("SUM(x) = %v, want 3.75", got)
+	}
+	// AVG over INT64 stays FLOAT64 as before (only SUM's result type
+	// retargets the argument cast).
+	var avg float64
+	if err := db.QueryRowContext(ctx, "SELECT AVG(y) FROM UNNEST([1,2]) AS y").Scan(&avg); err != nil {
+		t.Fatal(err)
+	}
+	if avg != 1.5 {
+		t.Fatalf("AVG(y) = %v, want 1.5", avg)
 	}
 }

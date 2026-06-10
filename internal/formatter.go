@@ -693,22 +693,39 @@ var nativeBinaryAggregates = map[string]struct {
 // tryNativeNumericAggregate rewrites a GoogleSQL numeric / statistical /
 // bitwise / logical aggregate to its DuckDB-native form with the argument(s)
 // cast away from the JSON value-layer encoding. funcName is the resolved
-// catalog name; args are the already-formatted operand SQL strings. Returns
-// (duckName, castArgs, true) when funcName names an aggregate handled here,
-// else ("", nil, false) so the caller keeps its generic emit. The DISTINCT /
-// ORDER BY modifier handling downstream still applies to the rewritten name
-// and arguments.
-func tryNativeNumericAggregate(funcName string, args []string) (string, []string, bool) {
+// catalog name; args are the already-formatted operand SQL strings;
+// resultKind is the analyzer-resolved result type of the aggregate call.
+// Returns (duckName, castArgs, resultCast, true) when funcName names an
+// aggregate handled here, else ("", nil, "", false) so the caller keeps its
+// generic emit. A non-empty resultCast names a DuckDB type the caller must
+// wrap the FINISHED aggregate call in (CAST(<agg>(...) AS <resultCast>)).
+// The DISTINCT / ORDER BY modifier handling downstream still applies to the
+// rewritten name and arguments.
+//
+// SUM with an INT64 analyzer result type is the exactness-critical case
+// (issue #5): BigQuery SUM(INT64) is an EXACT INT64 that errors on int64
+// overflow, but the default DOUBLE argument cast computed the whole sum in
+// float64, rounding results above 2^53. Instead cast the argument to BIGINT
+// (DuckDB's native sum(BIGINT) accumulates exactly in HUGEINT/int128) and
+// narrow the finished aggregate back with CAST(... AS BIGINT), which DuckDB
+// rejects with a conversion error when the exact sum exceeds the int64
+// range — matching BigQuery's overflow-is-an-error semantics. SUM over
+// FLOAT64 (and the value-layer NUMERIC envelope) keeps the DOUBLE path.
+func tryNativeNumericAggregate(funcName string, args []string, resultKind googlesql.TypeKind) (string, []string, string, bool) {
 	if m, ok := nativeNumericAggregates[funcName]; ok && len(args) == 1 {
-		return m.duckName, []string{fmt.Sprintf("CAST(%s AS %s)", args[0], m.castType)}, true
+		castType, resultCast := m.castType, ""
+		if funcName == "sum" && resultKind == googlesql.TypeKindTypeInt64 {
+			castType, resultCast = "BIGINT", "BIGINT"
+		}
+		return m.duckName, []string{fmt.Sprintf("CAST(%s AS %s)", args[0], castType)}, resultCast, true
 	}
 	if m, ok := nativeBinaryAggregates[funcName]; ok && len(args) == 2 {
 		return m.duckName, []string{
 			fmt.Sprintf("CAST(%s AS %s)", args[0], m.castType),
 			fmt.Sprintf("CAST(%s AS %s)", args[1], m.castType),
-		}, true
+		}, "", true
 	}
-	return "", nil, false
+	return "", nil, "", false
 }
 
 // tryNativeApproxAggregate rewrites the approximate-aggregate family to
@@ -2143,10 +2160,22 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 	// native reducers cannot consume the JSON value-layer encoding the
 	// UNNEST source feeds. Rewrite to the native name with the argument(s)
 	// cast to the right numeric type; the DISTINCT / ORDER BY handling
-	// below still applies to the rewritten form.
-	if duckName, castArgs, ok := tryNativeNumericAggregate(funcName, args); ok {
+	// below still applies to the rewritten form. resultCast (when set)
+	// narrows the finished aggregate call back to its analyzer result
+	// type — SUM(INT64) must come back as an exact BIGINT, with DuckDB's
+	// out-of-range conversion error supplying BigQuery's overflow-is-an-
+	// error semantics (issue #5).
+	resultKind := googlesql.TypeKindTypeUnknown
+	if t, _ := n.node.Type(); t != nil {
+		if k, err := t.Kind(); err == nil {
+			resultKind = k
+		}
+	}
+	var resultCast string
+	if duckName, castArgs, rc, ok := tryNativeNumericAggregate(funcName, args, resultKind); ok {
 		funcName = duckName
 		args = castArgs
+		resultCast = rc
 	}
 	// DuckDB retarget (PATH B): the predecessor encoded the aggregate
 	// modifiers (DISTINCT, ORDER BY, IGNORE NULLS, LIMIT) as trailing
@@ -2214,13 +2243,20 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 			orderByClause,
 		), nil
 	}
-	return fmt.Sprintf(
+	sql := fmt.Sprintf(
 		"%s(%s%s%s)",
 		funcName,
 		argPrefix,
 		strings.Join(args, ","),
 		orderByClause,
-	), nil
+	)
+	if resultCast != "" {
+		// Narrow the exact (HUGEINT-accumulated) aggregate back to its
+		// analyzer result type; DuckDB raises a conversion error on an
+		// out-of-int64-range sum, which is BigQuery's overflow behavior.
+		sql = fmt.Sprintf("CAST(%s AS %s)", sql, resultCast)
+	}
+	return sql, nil
 }
 
 // nativeAggregateFuncMap maps a bare GoogleSQL aggregate builtin name to
@@ -2525,14 +2561,21 @@ func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName 
 	}
 	// SUM / AVG in OVER context reject the JSON value-layer encoding the
 	// UNNEST source produces (`sum(JSON)` does not bind), the same way the
-	// non-window aggregate path casts these to DOUBLE. Cast the value arg
-	// to DOUBLE only when its analyzer-resolved kind is a value-layer
-	// numeric (INT/FLOAT) so a real native-numeric column is unaffected.
-	// MIN / MAX / COUNT bind against JSON directly, so they are left alone.
+	// non-window aggregate path casts its argument. Cast the value arg
+	// only when its analyzer-resolved kind is a value-layer numeric
+	// (INT/FLOAT) so a real native-numeric column is unaffected. AVG is
+	// always a FLOAT64 result, so it casts to DOUBLE; SUM over an INT64
+	// argument must stay EXACT (issue #5), so it takes the BIGINT cast
+	// valueLayerScalarCastType resolves for the integer kinds — DuckDB's
+	// sum(BIGINT) accumulates in HUGEINT without float rounding. MIN /
+	// MAX / COUNT bind against JSON directly, so they are left alone.
 	if (sqliteName == "sum" || sqliteName == "avg") && len(valueArgs) >= 1 {
 		kinds := argKinds(m1(n.node.ResolvedFunctionCallBase.ArgumentList()))
-		if _, ok := valueLayerScalarCastType(kindAt(kinds, 0)); ok {
-			valueArgs[0] = fmt.Sprintf("CAST(%s AS DOUBLE)", valueArgs[0])
+		if castType, ok := valueLayerScalarCastType(kindAt(kinds, 0)); ok {
+			if sqliteName == "avg" {
+				castType = "DOUBLE"
+			}
+			valueArgs[0] = fmt.Sprintf("CAST(%s AS %s)", valueArgs[0], castType)
 		}
 	}
 	// $count_star resolves with no value arguments; DuckDB's native
@@ -2557,7 +2600,20 @@ func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName 
 	if err != nil {
 		return "", err
 	}
-	return call + " " + over, nil
+	expr := call + " " + over
+	// SUM with an INT64 analyzer result type: DuckDB's sum yields HUGEINT;
+	// narrow the window expression back to BIGINT so the result stays an
+	// exact INT64 (and a genuinely out-of-range running sum raises DuckDB's
+	// conversion error — BigQuery's overflow semantics) instead of falling
+	// back to a rounded FLOAT64 on the decode path (issue #5).
+	if sqliteName == "sum" {
+		if t, _ := n.node.Type(); t != nil {
+			if k, kerr := t.Kind(); kerr == nil && k == googlesql.TypeKindTypeInt64 {
+				expr = fmt.Sprintf("CAST(%s AS BIGINT)", expr)
+			}
+		}
+	}
+	return expr, nil
 }
 
 // windowOverClause assembles the `OVER (...)` clause shared by the
