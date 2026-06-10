@@ -81,8 +81,8 @@ github.com/envoyproxy/go-control-plane/ratelimit v0.1.0/go.mod h1:Wk+tMFAFbCXaJP
 github.com/envoyproxy/protoc-gen-validate v0.1.0/go.mod h1:iSmxcyjqTsJpI2R4NaDN7+kN2VEUnK/pcBlmesArF7c=
 github.com/envoyproxy/protoc-gen-validate v1.3.0 h1:TvGH1wof4H33rezVKWSpqKz5NXWg5VPuZ0uONDT6eb4=
 github.com/envoyproxy/protoc-gen-validate v1.3.0/go.mod h1:HvYl7zwPa5mffgyeTUHA9zHIH36nmrm7oCbo4YKoSWA=
-github.com/esilver/duckdb-go-pure v0.1.0 h1:CYyGUrJhtoj7v76VloHzEzzmDYcTosKMnJozHUvSDdo=
-github.com/esilver/duckdb-go-pure v0.1.0/go.mod h1:K0lu75wP4hv1zaaEEqaq42/cE96wNg/azf4kGnIwg2g=
+github.com/esilver/duckdb-go-pure v0.1.1 h1:6N1SRaCggXk68rJOj07XHBhpnsZVnGXlzkw+BmKG1pM=
+github.com/esilver/duckdb-go-pure v0.1.1/go.mod h1:K0lu75wP4hv1zaaEEqaq42/cE96wNg/azf4kGnIwg2g=
 github.com/fatih/color v1.19.0 h1:Zp3PiM21/9Ld6FzSKyL5c/BULoe/ONr9KlbYVOfG8+w=
 github.com/fatih/color v1.19.0/go.mod h1:zNk67I0ZUT1bEGsSGyCZYZNrHuTkJJB+r6Q9VuMi0LE=
 github.com/felixge/httpsnoop v1.0.4 h1:NFTV2Zj1bL4mc9sqWACXbQFVBBg2W3GPvqp8/ESS2Wg=
