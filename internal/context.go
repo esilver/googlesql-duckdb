@@ -170,6 +170,30 @@ type analyticOrderBy struct {
 	column    string
 	isAsc     bool
 	nullOrder nullOrderMode
+	// sortExpr is the SQL expression to use when this entry appears as a
+	// native ORDER BY sort key (window OVER clause or the analytic scan's
+	// trailing output ORDER BY). For value-layer STRING / UUID columns the
+	// base64 envelope text does NOT order like the payload, so sortExpr
+	// carries the googlesqlite_plain_string unwrap; for every other kind
+	// it equals column. The emulation argument path keeps using column
+	// (it needs the envelope form for value-layer decoding).
+	sortExpr string
+	// fromPartition marks entries that were derived from the window's
+	// PARTITION BY keys rather than its ORDER BY items. The native OVER
+	// clause must not repeat partition keys inside ORDER BY: they are
+	// constant per partition (semantically a no-op) and a RANGE frame
+	// with an offset requires exactly one ORDER BY key, which a leading
+	// partition key would break.
+	fromPartition bool
+}
+
+// sortSQL returns the expression to order by for this entry, preferring
+// the native sortExpr when set.
+func (a *analyticOrderBy) sortSQL() string {
+	if a.sortExpr != "" {
+		return a.sortExpr
+	}
+	return a.column
 }
 
 type analyticOrderColumnNames struct {

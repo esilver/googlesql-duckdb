@@ -1073,6 +1073,43 @@ func tryNativeOperator(funcName string, args []string, kinds []googlesql.TypeKin
 						return fmt.Sprintf("(%s %s (%s * INTERVAL '1 %s'))", lhs, tok, count, unit), true
 					}
 				}
+				// Runtime INTERVAL operand (a column ref / UNNEST element
+				// carrying the value-layer interval envelope, which DuckDB
+				// types as JSON/VARCHAR): rebuild a native INTERVAL from the
+				// envelope's fields via googlesqlite_extract (its pure-Go
+				// body decodes interval envelopes directly, signed per
+				// section, with MICROSECOND as the sub-second fraction).
+				lhs := args[0]
+				if dt, ok := duckDBTypeName(kindAt(kinds, 0)); ok {
+					lhs = fmt.Sprintf("CAST(%s AS %s)", lhs, dt)
+				}
+				return fmt.Sprintf("(%s %s %s)", lhs, tok, intervalEnvelopeToNativeSQL(args[1])), true
+			}
+			// temporal - temporal yields a GoogleSQL INTERVAL: DATE - DATE
+			// is a days-only interval; DATETIME/TIMESTAMP differences are
+			// time-only (the whole difference lives in the H:M:S.F part,
+			// e.g. "0-0 0 36:34:56.789" — never normalized into days).
+			// DuckDB's native operator instead returns BIGINT days for
+			// DATE-DATE and a days+time interval for timestamps, so build
+			// the GoogleSQL shape explicitly.
+			if op == "subtract" && kindAt(kinds, 0) == kindAt(kinds, 1) {
+				switch kindAt(kinds, 0) {
+				case googlesql.TypeKindTypeDate:
+					return fmt.Sprintf(
+						"to_days(CAST((CAST(%s AS DATE) - CAST(%s AS DATE)) AS INTEGER))",
+						args[0], args[1],
+					), true
+				case googlesql.TypeKindTypeDatetime:
+					return fmt.Sprintf(
+						"to_microseconds(epoch_us(CAST(%s AS TIMESTAMP)) - epoch_us(CAST(%s AS TIMESTAMP)))",
+						args[0], args[1],
+					), true
+				case googlesql.TypeKindTypeTimestamp:
+					return fmt.Sprintf(
+						"to_microseconds(epoch_us(CAST(%s AS TIMESTAMP WITH TIME ZONE)) - epoch_us(CAST(%s AS TIMESTAMP WITH TIME ZONE)))",
+						args[0], args[1],
+					), true
+				}
 			}
 			return fmt.Sprintf("(%s %s %s)", castOperandToKind(args[0], kindAt(kinds, 0)), tok, castOperandToKind(args[1], kindAt(kinds, 1))), true
 		}
@@ -1684,6 +1721,111 @@ func duckDBTruncToPartSQL(expr, part, castType string) (string, bool) {
 	return "", false
 }
 
+// duckDBLastDaySQL lowers LAST_DAY(d, part) to a pure calendar rewrite
+// over the civil date. All parts return DATE (GoogleSQL contract):
+//
+//   - MONTH:    DuckDB last_day.
+//   - YEAR:     Dec 31 of d's calendar year.
+//   - QUARTER:  start of next quarter minus one day.
+//   - WEEK(*):  containing week's start (per weekday anchor) plus 6 days;
+//     ISOWEEK is the Monday-anchored week.
+//   - ISOYEAR:  day before the next ISO year's start (the Monday of the
+//     week containing Jan 4, per ISO 8601).
+func duckDBLastDaySQL(expr, part string) (string, bool) {
+	dateExpr := fmt.Sprintf("CAST(%s AS DATE)", expr)
+	switch strings.ToUpper(strings.TrimSpace(part)) {
+	case "MONTH":
+		return fmt.Sprintf("last_day(%s)", dateExpr), true
+	case "YEAR":
+		return fmt.Sprintf(
+			"make_date(CAST(date_part('year', %s) AS INTEGER), 12, 31)",
+			dateExpr,
+		), true
+	case "QUARTER":
+		return fmt.Sprintf(
+			"CAST((date_trunc('quarter', %s) + INTERVAL '3 months' - INTERVAL '1 day') AS DATE)",
+			dateExpr,
+		), true
+	case "ISOYEAR":
+		// Start of ISO year N+1 is the Monday of the week containing
+		// Jan 4 of year N+1; the ISO year's last day is the day before.
+		nextJan4 := fmt.Sprintf(
+			"make_date(CAST(date_part('isoyear', %s) AS INTEGER) + 1, 1, 4)",
+			dateExpr,
+		)
+		return fmt.Sprintf(
+			"CAST((%s - INTERVAL '1 day') AS DATE)",
+			duckDBWeekStartSQL(nextJan4, 1),
+		), true
+	}
+	if offset, ok := weekPartOffset(part); ok {
+		return fmt.Sprintf(
+			"CAST((%s + INTERVAL '6 days') AS DATE)",
+			duckDBWeekStartSQL(expr, offset),
+		), true
+	}
+	return "", false
+}
+
+// duckDBSundayWeekNumberSQL lowers EXTRACT(WEEK[(<weekday>)] FROM d):
+// the week number in [0, 53] where weeks begin on the anchor weekday
+// (offset days after Sunday) and days before the year's first anchor
+// day fall in week 0. Derivation: with doy0 = dayofyear-1 (0-based) and
+// s = days from Jan 1 to the first anchor weekday, the week number is
+// floor((doy0 - s)/7) + 1 clamped to 0 below s — equivalently
+// floor((doy0 - s + 7)/7) since doy0 - s >= -6 always holds.
+func duckDBSundayWeekNumberSQL(expr string, offset int) string {
+	dateExpr := fmt.Sprintf("CAST(%s AS DATE)", expr)
+	jan1 := fmt.Sprintf("make_date(CAST(date_part('year', %s) AS INTEGER), 1, 1)", dateExpr)
+	firstAnchorDelta := fmt.Sprintf("((%d - dayofweek(%s) + 7) %% 7)", offset, jan1)
+	return fmt.Sprintf(
+		"CAST(floor((dayofyear(%s) - 1 - %s + 7) / 7.0) AS BIGINT)",
+		dateExpr, firstAnchorDelta,
+	)
+}
+
+// intervalEnvelopeToNativeSQL converts a runtime value-layer INTERVAL
+// operand (envelope VARCHAR or json_each element) into a native DuckDB
+// INTERVAL. There is no UDF that can return a native INTERVAL through
+// the pure-Go bridge (the codec has no interval result type), so the
+// envelope's signed fields are read back one by one with
+// googlesqlite_extract — whose pure-Go body decodes interval envelopes
+// directly — and recombined with to_months / to_days / to_microseconds.
+// MICROSECOND extracts the signed sub-second fraction in microseconds.
+func intervalEnvelopeToNativeSQL(arg string) string {
+	field := func(part string) string {
+		return fmt.Sprintf("CAST(googlesqlite_extract(%s, '%s') AS BIGINT)", arg, part)
+	}
+	months := fmt.Sprintf("(%s * 12 + %s)", field("YEAR"), field("MONTH"))
+	timeMicros := fmt.Sprintf(
+		"(((%s * 60 + %s) * 60 + %s) * 1000000 + %s)",
+		field("HOUR"), field("MINUTE"), field("SECOND"), field("MICROSECOND"),
+	)
+	return fmt.Sprintf(
+		"(to_months(CAST(%s AS INTEGER)) + to_days(CAST(%s AS INTEGER)) + to_microseconds(%s))",
+		months, field("DAY"), timeMicros,
+	)
+}
+
+// timestampDiffWidthMicros returns the fixed microsecond width of the
+// sub-day TIMESTAMP_DIFF parts (the ones GoogleSQL counts as whole
+// elapsed widths rather than boundary crossings).
+func timestampDiffWidthMicros(part string) (int64, bool) {
+	switch strings.ToUpper(strings.TrimSpace(part)) {
+	case "MICROSECOND":
+		return 1, true
+	case "MILLISECOND":
+		return 1000, true
+	case "SECOND":
+		return 1000000, true
+	case "MINUTE":
+		return 60000000, true
+	case "HOUR":
+		return 3600000000, true
+	}
+	return 0, false
+}
+
 var googleSQLTimeZoneOffsetRE = regexp.MustCompile(`^([+-])(\d{2})(?::?(\d{2}))?$`)
 
 func pinnedUnixNanoArg(args []string) (string, []string, bool) {
@@ -1848,6 +1990,20 @@ func tryNativeDatetimeFunc(funcName string, args []string, kinds []googlesql.Typ
 	case "date_diff", "datetime_diff", "time_diff", "timestamp_diff":
 		if len(args) < 3 {
 			return "", false
+		}
+		if funcName == "timestamp_diff" {
+			// GoogleSQL TIMESTAMP_DIFF counts WHOLE part-widths in the
+			// microsecond difference (truncating toward zero) for the
+			// fixed-width parts, not boundary crossings like DuckDB's
+			// date_diff (pure-Go reference: timestamp.TIMESTAMP_DIFF's
+			// Duration division). DAY and coarser keep the boundary
+			// count, matching the body's DATE_DIFF fallback.
+			if width, ok := timestampDiffWidthMicros(partBody(2)); ok {
+				return fmt.Sprintf(
+					"((epoch_us(CAST(%s AS TIMESTAMP WITH TIME ZONE)) - epoch_us(CAST(%s AS TIMESTAMP WITH TIME ZONE))) // %d)",
+					args[0], args[1], width,
+				), true
+			}
 		}
 		if offset, ok := weekPartOffset(partBody(2)); ok {
 			// GoogleSQL WEEK variants count week-start boundaries between
@@ -2122,9 +2278,17 @@ func tryNativeDatetimeFunc(funcName string, args []string, kinds []googlesql.Typ
 		return "", false
 	case "last_day":
 		// LAST_DAY(date_or_datetime[, part]); the single-arg month form
-		// maps straight to DuckDB last_day, which returns DATE.
+		// maps straight to DuckDB last_day, which returns DATE. The
+		// two-arg parts are pure calendar rewrites over the civil date
+		// (see duckDBLastDaySQL); cross-checked against the pure-Go
+		// date.LAST_DAY body in formatter_last_day_test.go.
 		if len(args) == 1 {
 			return fmt.Sprintf("last_day(%s)", args[0]), true
+		}
+		if len(args) >= 2 {
+			if sql, ok := duckDBLastDaySQL(args[0], partBody(1)); ok {
+				return sql, true
+			}
 		}
 		return "", false
 
@@ -2666,6 +2830,19 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 	if err != nil {
 		return "", err
 	}
+	// DuckDB retarget: HLL_COUNT.MERGE_PARTIAL and
+	// KLL_QUANTILES.MERGE_PARTIAL both resolve to the bare leaf
+	// `merge_partial` (Function.Name strips the dotted namespace), and the
+	// KLL body is what the bridge registers under that bare name. Routing
+	// the HLL surface there feeds a HyperLogLog sketch to the KLL gob
+	// decoder ("gob: encoded unsigned integer out of range"). Disambiguate
+	// on the catalog name path and emit the dedicated
+	// hll_count_merge_partial aggregate for the HLL_COUNT namespace.
+	if funcName == "merge_partial" {
+		if np, nperr := m1(n.node.ResolvedFunctionCallBase.Function()).FunctionNamePath(); nperr == nil && len(np) > 0 && np[0] == "hll_count" {
+			funcName = "hll_count_merge_partial"
+		}
+	}
 	// HAVING { MAX | MIN } modifier rewrite. The resolved tree
 	// carries the modifier on ResolvedAggregateFunctionCall, but
 	// SQLite has no equivalent. For ANY_VALUE we rewrite to a
@@ -2880,6 +3057,14 @@ var nativeWindowFuncMap = map[string]string{
 	"first_value": "first_value",
 	"last_value":  "last_value",
 	"nth_value":   "nth_value",
+	// ANY_VALUE — DuckDB's any_value returns the first non-NULL value of
+	// the frame, which matches the reference engine's window ANY_VALUE
+	// (first value after the default IGNORE NULLS filtering).
+	"any_value": "any_value",
+	// COUNTIF — lowered by formatNative to count(CASE WHEN cond THEN 1
+	// END) OVER (...), the same rewrite the non-window aggregate path
+	// uses (COUNT never returns NULL, matching COUNTIF's 0-on-empty).
+	"countif": "countif",
 	// Cumulative aggregates against native SQLite types. Encoded
 	// values would not survive these (SUM of base64 strings would
 	// fail), but parity tests exercise them on INT64/FLOAT64 where
@@ -2923,18 +3108,6 @@ var customNativeWindowFuncMap = map[string]string{
 	"variance":    "googlesqlite_window_var_samp",
 	"var_pop":     "googlesqlite_window_var_pop",
 	"var_samp":    "googlesqlite_window_var_samp",
-	// Boolean / bitwise aggregators in OVER context. Their custom
-	// natives implement Step / Inverse / Done over the active frame
-	// with per-row tristate tracking (NULL / FALSE / TRUE) for the
-	// LOGICAL_* family and direct &/|/^ folding for the BIT_* family.
-	"logical_or":  "googlesqlite_window_logical_or",
-	"logical_and": "googlesqlite_window_logical_and",
-	"bit_and":     "googlesqlite_window_bit_and",
-	"bit_or":      "googlesqlite_window_bit_or",
-	"bit_xor":     "googlesqlite_window_bit_xor",
-	// ARRAY_CONCAT_AGG flattens per-row ARRAY<T> arguments into a
-	// single ARRAY<T> over the active frame.
-	"array_concat_agg": "googlesqlite_window_array_concat_agg",
 }
 
 // nativeWindowFuncForName returns the SQLite native name for a
@@ -2974,12 +3147,23 @@ func (n *AnalyticFunctionCallNode) FormatSQL(ctx context.Context) (string, error
 		return n.formatStClusterDBSCAN(ctx, orderColumns)
 	}
 
-	// SUM(DISTINCT x) / COUNT(DISTINCT x) / AVG(DISTINCT x) — SQLite
-	// rejects DISTINCT in OVER, but our custom natives know how to
-	// dedupe. Take precedence over the SQLite-native fast path.
+	// SUM(DISTINCT x) / COUNT(DISTINCT x) / AVG(DISTINCT x) — DuckDB
+	// supports DISTINCT aggregate arguments inside OVER natively (the
+	// value-layer encodings are injective, so envelope equality equals
+	// payload equality). formatNative emits the DISTINCT keyword inside
+	// the native call when n.node.Distinct() is set.
 	if m1(n.node.Distinct()) {
-		if custom, ok := distinctAwareNativeWindowFuncs[rawName]; ok {
-			return n.formatNative(ctx, custom, orderColumns, true)
+		if _, ok := distinctAwareNativeWindowFuncs[rawName]; ok {
+			return n.formatNative(ctx, nativeWindowFuncMap[rawName], orderColumns, false)
+		}
+	}
+	// PERCENTILE_CONT / PERCENTILE_DISC with RESPECT NULLS: DuckDB's
+	// quantile_cont / quantile_disc always ignore NULLs, so the modifier
+	// routes to the googlesqlite_window_percentile_* replay aggregates
+	// (the pure-Go bodies sort NULLs to the front of the partition).
+	if rawName == "percentile_cont" || rawName == "percentile_disc" {
+		if m1(n.node.NullHandlingModifier()) == googlesql.ResolvedNonScalarFunctionCallBaseEnums_NullHandlingModifierRespectNulls {
+			return n.formatNative(ctx, "googlesqlite_window_"+rawName, orderColumns, true)
 		}
 	}
 	if native := nativeWindowFuncForName(rawName); native != "" && !n.requiresPredecessorEmulation() {
@@ -3202,7 +3386,27 @@ func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName 
 			valueArgs = append(valueArgs, "googlesqlite_ignore_nulls()")
 		}
 	}
-	call := fmt.Sprintf("%s(%s)", sqliteName, strings.Join(valueArgs, ","))
+	// DISTINCT over a native aggregate in OVER context: DuckDB supports
+	// the DISTINCT keyword inside window aggregate calls directly, and
+	// dedupe over the (injective) value-layer / cast operand equals
+	// dedupe over the GoogleSQL value. Only the plain native reducers
+	// take the keyword; custom googlesqlite_* bodies receive the
+	// googlesqlite_distinct() marker via includeOpts instead.
+	distinctKeyword := ""
+	if m1(n.node.Distinct()) && !includeOpts {
+		switch sqliteName {
+		case "sum", "avg", "count", "min", "max":
+			distinctKeyword = "DISTINCT "
+		}
+	}
+	call := fmt.Sprintf("%s(%s%s)", sqliteName, distinctKeyword, strings.Join(valueArgs, ","))
+	// COUNTIF(cond) — same rewrite as the non-window aggregate path:
+	// DuckDB's count_if returns NULL over an empty frame where GoogleSQL
+	// returns 0, while COUNT(CASE WHEN cond THEN 1 END) matches both the
+	// truthy-count and the zero-on-empty semantics.
+	if sqliteName == "countif" && len(valueArgs) >= 1 {
+		call = fmt.Sprintf("count(CASE WHEN %s THEN 1 END)", valueArgs[0])
+	}
 
 	over, err := n.windowOverClause(ctx, orderColumns)
 	if err != nil {
@@ -3242,26 +3446,30 @@ func (n *AnalyticFunctionCallNode) windowOverClause(ctx context.Context, orderCo
 	if cols := analyticPartitionColumnNamesFromContext(ctx); len(cols) > 0 {
 		clauses = append(clauses, "PARTITION BY "+strings.Join(cols, ","))
 	}
-	if len(orderColumns) > 0 {
-		var ob []string
-		for _, col := range orderColumns {
-			switch col.nullOrder {
-			case nullOrderFirst:
-				ob = append(ob, fmt.Sprintf("(%s IS NOT NULL)", col.column))
-			case nullOrderLast:
-				ob = append(ob, fmt.Sprintf("(%s IS NULL)", col.column))
-			}
-			// DuckDB retarget: drop the googlesqlite_collate SQLite
-			// collation (DuckDB has no callback-collation API). Rows that
-			// are equal under GoogleSQL semantics share a byte-identical
-			// value-layer encoding, so native DuckDB ordering is correct
-			// for the window-frame ORDER BY.
-			suffix := ""
-			if !col.isAsc {
-				suffix = " DESC"
-			}
-			ob = append(ob, col.column+suffix)
+	var ob []string
+	for _, col := range orderColumns {
+		// Partition keys are constant within a partition: repeating them
+		// inside ORDER BY is a semantic no-op, and a RANGE frame with an
+		// offset requires exactly one ORDER BY key, so drop them here.
+		if col.fromPartition {
+			continue
 		}
+		// sortSQL unwraps value-layer STRING/UUID envelopes (base64 text
+		// order is not monotonic with payload order); other kinds order
+		// correctly on their stored form. Null placement is emitted
+		// explicitly: BigQuery defaults to NULLS FIRST on ASC / NULLS
+		// LAST on DESC while DuckDB defaults to NULLS LAST always.
+		ob = append(ob, col.sortSQL()+analyticOrderDirectionSQL(col))
+	}
+	if n.wantsRowIDTiebreak() {
+		// DuckDB's window sort is not stable with respect to the input,
+		// so rows tied on the ORDER BY keys would land in the frame /
+		// sequence in arbitrary order. Appending the input ordinal the
+		// AnalyticScanNode wrap materializes pins ties to input order —
+		// the order the legacy engine (and the test corpus) saw.
+		ob = append(ob, `"row_id"`)
+	}
+	if len(ob) > 0 {
 		clauses = append(clauses, "ORDER BY "+strings.Join(ob, ","))
 	}
 	if frameSQL, err := n.formatNativeFrame(ctx); err != nil {
@@ -3274,6 +3482,41 @@ func (n *AnalyticFunctionCallNode) windowOverClause(ctx context.Context, orderCo
 		return "OVER ()", nil
 	}
 	return "OVER (" + strings.Join(clauses, " ") + ")", nil
+}
+
+// wantsRowIDTiebreak reports whether the native OVER clause for this
+// analytic call should append the input-ordinal "row_id" as a final
+// ORDER BY key.
+//
+//   - Rank-of-peers functions (RANK / DENSE_RANK / PERCENT_RANK /
+//     CUME_DIST) must NOT get it: their results depend on tie groups,
+//     and a unique tiebreak would dissolve every tie.
+//   - RANGE-framed calls must NOT get it: the frame is defined by value
+//     distance over a single ORDER BY key (peers are included by value,
+//     so tie order never affects the result anyway).
+//   - ROWS-framed calls get it: the frame is positional, so tied rows
+//     need a deterministic (input) order to reproduce the reference
+//     results.
+//   - Pure position functions (LEAD / LAG / NTILE / ROW_NUMBER) get it
+//     even without any other ORDER BY key: they read physical row order
+//     directly.
+//   - Aggregates with only the analyzer's default frame (RANGE UNBOUNDED
+//     PRECEDING .. CURRENT ROW) or no ORDER BY at all are left alone:
+//     the default frame includes peers by value, and an unordered
+//     aggregate is commutative over the whole partition.
+func (n *AnalyticFunctionCallNode) wantsRowIDTiebreak() bool {
+	rawName := strings.TrimPrefix(strings.ReplaceAll(m1(m1(n.node.Function()).FullName(false)), ".", "_"), "$")
+	switch rawName {
+	case "rank", "dense_rank", "percent_rank", "cume_dist":
+		return false
+	case "lead", "lag", "ntile", "row_number":
+		return true
+	}
+	windowFrame, _ := n.node.WindowFrame()
+	if windowFrame == nil {
+		return false
+	}
+	return m1(windowFrame.FrameUnit()) == googlesql.ResolvedWindowFrameEnums_FrameUnitRows
 }
 
 // formatStClusterDBSCAN lowers the analytic ST_CLUSTERDBSCAN to a
@@ -5305,14 +5548,17 @@ func (n *AnalyticScanNode) FormatSQL(ctx context.Context) (string, error) {
 		if m1(group.PartitionBy()) != nil {
 			var partitionColumns []string
 			for _, columnRef := range m1(m1(group.PartitionBy()).PartitionByList()) {
-				colName := fmt.Sprintf("\"%s\"", uniqueColumnName(ctx, m1(columnRef.Column())))
+				col := m1(columnRef.Column())
+				colName := fmt.Sprintf("\"%s\"", uniqueColumnName(ctx, col))
 				partitionColumns = append(
 					partitionColumns,
 					colName,
 				)
 				order := &analyticOrderBy{
-					column: colName,
-					isAsc:  true,
+					column:        colName,
+					sortExpr:      analyticSortExprForColumn(col, colName),
+					isAsc:         true,
+					fromPartition: true,
 				}
 				orderColumnNames.values = append(orderColumnNames.values, order)
 				scanOrderBy = append(scanOrderBy, order)
@@ -5321,7 +5567,8 @@ func (n *AnalyticScanNode) FormatSQL(ctx context.Context) (string, error) {
 		}
 		if m1(group.OrderBy()) != nil {
 			for _, item := range m1(m1(group.OrderBy()).OrderByItemList()) {
-				colName := uniqueColumnName(ctx, m1(m1(item.ColumnRef()).Column()))
+				col := m1(m1(item.ColumnRef()).Column())
+				colName := uniqueColumnName(ctx, col)
 				formattedColName := fmt.Sprintf("\"%s\"", colName)
 				nullOrder := nullOrderUnspecified
 				switch m1(item.NullOrder()) {
@@ -5332,6 +5579,7 @@ func (n *AnalyticScanNode) FormatSQL(ctx context.Context) (string, error) {
 				}
 				order := &analyticOrderBy{
 					column:    formattedColName,
+					sortExpr:  analyticSortExprForColumn(col, formattedColName),
 					isAsc:     !m1(item.IsDescending()),
 					nullOrder: nullOrder,
 				}
@@ -5361,62 +5609,81 @@ func (n *AnalyticScanNode) FormatSQL(ctx context.Context) (string, error) {
 			)
 		}
 	}
+	// Trailing output ORDER BY: the legacy SQLite engine evaluated window
+	// functions by sorting rows on (partition keys, order keys) and emitted
+	// them in that order, and the test corpus (zetasqlite heritage) asserts
+	// that order. DuckDB's window operator gives no output-order guarantee,
+	// so reproduce it explicitly: sort by the last function group's
+	// partition + order keys (value-layer aware via sortSQL, BigQuery null
+	// placement: NULLS FIRST when ASC, NULLS LAST when DESC unless the
+	// query said otherwise) and break ties by "row_id" — the input ordinal
+	// materialized by the wrap below — for a stable, input-order result.
 	var orderColumnFormattedNames []string
 	for _, col := range scanOrderBy {
-		// NULLS FIRST/LAST is implemented as a sort key prefix:
-		// emit (col IS NOT NULL) for NULLS FIRST so nulls (0) sort
-		// before non-nulls (1); emit (col IS NULL) for NULLS LAST so
-		// non-nulls (0) come before nulls (1). Skipped when the
-		// query did not request explicit null ordering.
-		switch col.nullOrder {
-		case nullOrderFirst:
-			orderColumnFormattedNames = append(
-				orderColumnFormattedNames,
-				fmt.Sprintf("(%s IS NOT NULL)", col.column),
-			)
-		case nullOrderLast:
-			orderColumnFormattedNames = append(
-				orderColumnFormattedNames,
-				fmt.Sprintf("(%s IS NULL)", col.column),
-			)
-		}
-		// DuckDB retarget: native ordering on the bare value-layer
-		// column (no googlesqlite_collate callback collation on DuckDB).
-		if col.isAsc {
-			orderColumnFormattedNames = append(
-				orderColumnFormattedNames,
-				col.column,
-			)
-		} else {
-			orderColumnFormattedNames = append(
-				orderColumnFormattedNames,
-				fmt.Sprintf("%s DESC", col.column),
-			)
-		}
+		orderColumnFormattedNames = append(
+			orderColumnFormattedNames,
+			col.sortSQL()+analyticOrderDirectionSQL(col),
+		)
 	}
-	var orderBy string
-	if len(orderColumnFormattedNames) != 0 {
-		orderBy = fmt.Sprintf("ORDER BY %s", strings.Join(orderColumnFormattedNames, ","))
-	}
+	orderColumnFormattedNames = append(orderColumnFormattedNames, `"row_id"`)
+	orderBy := fmt.Sprintf("ORDER BY %s", strings.Join(orderColumnFormattedNames, ","))
 	orderColumnNames.values = []*analyticOrderBy{}
-	if !*emulationUsed {
-		// Every analytic call in this scan went through the native
-		// OVER path; the row_id column the predecessor's emulation
-		// needs is dead weight here, so skip the wrap and let
-		// SQLite read the input directly.
-		return fmt.Sprintf(
-			"SELECT %s %s %s",
-			strings.Join(columns, ","),
-			formattedInput,
-			orderBy,
-		), nil
-	}
+	_ = emulationUsed
+	// Always materialize the input ordinal: both the emulation path and
+	// the native path reference "row_id" (the native OVER clauses use it
+	// as a deterministic intra-tie ordering key, and the trailing output
+	// ORDER BY uses it as the final tiebreak).
 	return fmt.Sprintf(
 		"SELECT %s FROM (SELECT *, ROW_NUMBER() OVER() AS \"row_id\" %s) %s",
 		strings.Join(columns, ","),
 		formattedInput,
 		orderBy,
 	), nil
+}
+
+// analyticOrderDirectionSQL renders the direction + null-placement suffix
+// for one analytic sort key. BigQuery (like the legacy SQLite engine)
+// places NULLs first on ASC and last on DESC by default; DuckDB defaults
+// to NULLS LAST regardless of direction, so the placement is always
+// emitted explicitly.
+func analyticOrderDirectionSQL(col *analyticOrderBy) string {
+	dir := ""
+	nulls := " NULLS FIRST"
+	if !col.isAsc {
+		dir = " DESC"
+		nulls = " NULLS LAST"
+	}
+	switch col.nullOrder {
+	case nullOrderFirst:
+		nulls = " NULLS FIRST"
+	case nullOrderLast:
+		nulls = " NULLS LAST"
+	}
+	return dir + nulls
+}
+
+// analyticSortExprForColumn builds the native sort expression for an
+// analytic partition / order column. STRING and UUID columns ride the
+// value-layer base64 envelope, whose text does not order like the payload,
+// so they unwrap through googlesqlite_plain_string (UTF-8 byte order over
+// the payload matches GoogleSQL code-point ordering). Every other kind
+// orders correctly on its stored form.
+func analyticSortExprForColumn(col *googlesql.ResolvedColumn, formattedName string) string {
+	if col == nil {
+		return formattedName
+	}
+	t, err := col.Type()
+	if err != nil || t == nil {
+		return formattedName
+	}
+	k, err := t.Kind()
+	if err != nil {
+		return formattedName
+	}
+	if isPlainTextOrderableKind(k) {
+		return fmt.Sprintf("googlesqlite_plain_string(%s)", formattedName)
+	}
+	return formattedName
 }
 
 // FormatSQL passes the SampleScan through to its InputScan. We do

@@ -54,8 +54,19 @@ import (
 	"github.com/goccy/googlesqlite/internal/functions/helper"
 	"github.com/goccy/googlesqlite/internal/functions/hll"
 	"github.com/goccy/googlesqlite/internal/functions/kll"
+	"github.com/goccy/googlesqlite/internal/functions/window"
 	"github.com/goccy/googlesqlite/internal/value"
 )
+
+// stepDoneAggregator is the replay surface every registered body exposes:
+// helper.Aggregator (the plain aggregate shape) and the window-native
+// Step/Inverse/Done bodies (e.g. the percentile accumulators) both
+// satisfy it. The replay model only ever needs Step + Done — Inverse is
+// a sliding-frame optimization the collect/replay pipeline doesn't use.
+type stepDoneAggregator interface {
+	Step(stepArgs ...any) error
+	Done() (any, error)
+}
 
 // DuckDB type-id constants for the aggregate result columns, mirroring the
 // duckdb_type C enum values the cgo file passes (DUCKDB_TYPE_BIGINT = 5,
@@ -83,6 +94,10 @@ type aggSpec struct {
 	minParams int
 	maxParams int
 	newAgg    func() *helper.Aggregator
+	// newWindowAgg, when set, supplies the replay body instead of newAgg.
+	// Used for the window-native Step/Done accumulators (percentile
+	// family) that don't come in the helper.Aggregator shape.
+	newWindowAgg func() stepDoneAggregator
 	// resultType is the DuckDB result type to declare. Zero value means
 	// VARCHAR (the value-layer envelope every non-DP aggregate returns).
 	// The differential-privacy aggregates declare DOUBLE / BIGINT so their
@@ -180,6 +195,29 @@ func duckdbAggSpecs() []aggSpec {
 		// as a clean tf_idf(tokens) OVER () call with no option markers.
 		{name: "tf_idf", minParams: 1, maxParams: 1, newAgg: newTfIdfAggregator, singleState: true},
 
+		// PERCENTILE_CONT / PERCENTILE_DISC with RESPECT NULLS. DuckDB's
+		// quantile_cont / quantile_disc always ignore NULLs, so the
+		// formatter routes the RESPECT NULLS modifier to these names and
+		// the pure-Go window percentile bodies do the null-respecting
+		// sort. Arity band: (value, fraction) plus up to two option
+		// markers. PERCENTILE_* only ever runs under OVER () spanning the
+		// whole partition (GoogleSQL forbids ORDER BY / frames on it), so
+		// singleState routes every partition row into one accumulator.
+		{
+			name: "googlesqlite_window_percentile_cont", minParams: 2, maxParams: 4,
+			newWindowAgg: func() stepDoneAggregator {
+				return window.NewPercentileContWindowNative()().(stepDoneAggregator)
+			},
+			singleState: true,
+		},
+		{
+			name: "googlesqlite_window_percentile_disc", minParams: 2, maxParams: 4,
+			newWindowAgg: func() stepDoneAggregator {
+				return window.NewPercentileDiscWindowNative()().(stepDoneAggregator)
+			},
+			singleState: true,
+		},
+
 		// Differential-privacy / anonymization OUTER aggregates. The
 		// analyzer's RewriteAnonymization stage lowers SELECT WITH
 		// ANONYMIZATION / WITH DIFFERENTIAL_PRIVACY into a per-privacy-unit
@@ -226,7 +264,7 @@ type aggState struct {
 // googlesqliteAggUpdate / googlesqliteAggCombine / aggState.finalize +
 // writeResult pipeline.
 type replayAggregate struct {
-	newAgg     func() *helper.Aggregator
+	newAgg     func() stepDoneAggregator
 	resultType int32
 }
 
@@ -348,7 +386,12 @@ func registerDuckDBAggregates(db *sql.DB) error {
 		if resultType == 0 {
 			resultType = aggTypeVarchar
 		}
-		impl := &replayAggregate{newAgg: spec.newAgg, resultType: resultType}
+		newBody := spec.newWindowAgg
+		if newBody == nil {
+			newAgg := spec.newAgg
+			newBody = func() stepDoneAggregator { return newAgg() }
+		}
+		impl := &replayAggregate{newAgg: newBody, resultType: resultType}
 		opts := convergeduckdb.AggregateOptions{
 			MinArgs:      spec.minParams,
 			MaxArgs:      spec.maxParams,
