@@ -20,6 +20,8 @@ type Formatter interface {
 	FormatSQL(context.Context) (string, error)
 }
 
+const setOperationOrdinalColumn = "__gsx_setop_ordinal"
+
 func New(node googlesql.ResolvedNode) Formatter {
 	return newNode(node)
 }
@@ -5126,6 +5128,31 @@ func aggregateScanNeedsInputOrdinal(scan *googlesql.ResolvedAggregateScan) bool 
 	return false
 }
 
+func orderExprForColumn(col *googlesql.ResolvedColumn, formattedName string) string {
+	if col == nil {
+		return formattedName
+	}
+	t, err := col.Type()
+	if err != nil || t == nil {
+		return formattedName
+	}
+	k, err := t.Kind()
+	if err != nil {
+		return formattedName
+	}
+	if isPlainTextOrderableKind(k) {
+		return fmt.Sprintf("googlesqlite_plain_string(%s)", formattedName)
+	}
+	return formattedName
+}
+
+func defaultNullOrderSQL(desc bool) string {
+	if desc {
+		return " NULLS LAST"
+	}
+	return " NULLS FIRST"
+}
+
 func (n *AggregateScanNode) FormatSQL(ctx context.Context) (string, error) {
 	if n.node == nil {
 		return "", nil
@@ -5145,24 +5172,17 @@ func (n *AggregateScanNode) FormatSQL(ctx context.Context) (string, error) {
 		return "", err
 	}
 	groupByColumns := []string{}
-	groupOrderColumns := []string{}
+	groupByOrderColumns := []string{}
 	groupByColumnMap := map[string]struct{}{}
 	for _, col := range m1(n.node.GroupByList()) {
 		if _, err := newNode(col).FormatSQL(ctx); err != nil {
 			return "", err
 		}
-		colName := uniqueColumnName(ctx, m1(col.Column()))
-		groupColSQL := fmt.Sprintf("\"%s\"", colName)
-		groupByColumns = append(groupByColumns, groupColSQL)
-		orderColSQL := groupColSQL
-		if expr := m1(col.Expr()); expr != nil {
-			if typ, _ := expr.Type(); typ != nil {
-				if kind, _ := typ.Kind(); kind == googlesql.TypeKindTypeString {
-					orderColSQL = fmt.Sprintf("googlesqlite_plain_string(%s)", groupColSQL)
-				}
-			}
-		}
-		groupOrderColumns = append(groupOrderColumns, orderColSQL)
+		resolvedCol := m1(col.Column())
+		colName := uniqueColumnName(ctx, resolvedCol)
+		formattedCol := fmt.Sprintf("\"%s\"", colName)
+		groupByColumns = append(groupByColumns, formattedCol)
+		groupByOrderColumns = append(groupByOrderColumns, orderExprForColumn(resolvedCol, formattedCol)+defaultNullOrderSQL(false))
 		groupByColumnMap[colName] = struct{}{}
 	}
 	columns := []string{}
@@ -5262,7 +5282,7 @@ func (n *AggregateScanNode) FormatSQL(ctx context.Context) (string, error) {
 		return fmt.Sprintf(
 			"%s ORDER BY %s",
 			strings.Join(stmts, " UNION ALL "),
-			strings.Join(groupByColumns, ","),
+			strings.Join(groupByOrderColumns, ","),
 		), nil
 	}
 	var groupBy string
@@ -5273,28 +5293,28 @@ func (n *AggregateScanNode) FormatSQL(ctx context.Context) (string, error) {
 		// raw value-layer encoding directly - rows that are equal under
 		// GoogleSQL semantics share a byte-identical encoded string, so
 		// native GROUP BY on the bare column is correct.
-		groupBy = fmt.Sprintf(
-			"GROUP BY %s ORDER BY %s",
-			strings.Join(groupByColumns, ","),
-			strings.Join(groupOrderColumns, ","),
-		)
+		groupBy = fmt.Sprintf("GROUP BY %s", strings.Join(groupByColumns, ","))
 	}
 	formattedColumns := strings.Join(columns, ",")
+	orderBy := ""
+	if len(groupByOrderColumns) > 0 {
+		orderBy = " ORDER BY " + strings.Join(groupByOrderColumns, ",")
+	}
 	if needsInputOrdinal {
 		formattedInput, err := formatInput(input)
 		if err != nil {
 			return "", err
 		}
 		input = fmt.Sprintf("(SELECT *, row_number() OVER () AS \"%s\" %s)", aggregateInputOrdinalColumn, formattedInput)
-		return fmt.Sprintf("SELECT %s FROM %s %s", formattedColumns, input, groupBy), nil
+		return fmt.Sprintf("SELECT %s FROM %s %s%s", formattedColumns, input, groupBy, orderBy), nil
 	}
 	switch getInputPattern(input) {
 	case InputKeep:
-		return fmt.Sprintf("SELECT %s %s %s", formattedColumns, input, groupBy), nil
+		return fmt.Sprintf("SELECT %s %s %s%s", formattedColumns, input, groupBy, orderBy), nil
 	case InputNeedsWrap:
-		return fmt.Sprintf("SELECT %s FROM (%s) %s", formattedColumns, input, groupBy), nil
+		return fmt.Sprintf("SELECT %s FROM (%s) %s%s", formattedColumns, input, groupBy, orderBy), nil
 	case InputNeedsFrom:
-		return fmt.Sprintf("SELECT %s FROM %s %s", formattedColumns, input, groupBy), nil
+		return fmt.Sprintf("SELECT %s FROM %s %s%s", formattedColumns, input, groupBy, orderBy), nil
 	}
 	return "", fmt.Errorf("unexpected input pattern: %s", input)
 }
@@ -5516,10 +5536,14 @@ func (n *SetOperationScanNode) FormatSQL(ctx context.Context) (string, error) {
 		opType = "UNKNOWN"
 	}
 	var queries []string
-	for _, item := range m1(n.node.InputItemList()) {
+	carryOrdinal := m1(n.node.OpType()) == googlesql.ResolvedSetOperationScanEnums_SetOperationTypeUnionAll
+	for idx, item := range m1(n.node.InputItemList()) {
 		var outputColumns []string
 		for _, outputColumn := range m1(item.OutputColumnList()) {
 			outputColumns = append(outputColumns, fmt.Sprintf("\"%s\"", uniqueColumnName(ctx, outputColumn)))
+		}
+		if carryOrdinal {
+			outputColumns = append(outputColumns, fmt.Sprintf("%d AS \"%s\"", idx+1, setOperationOrdinalColumn))
 		}
 		query, err := newNode(item).FormatSQL(ctx)
 		if err != nil {
@@ -5552,6 +5576,9 @@ func (n *SetOperationScanNode) FormatSQL(ctx context.Context) (string, error) {
 			)
 		}
 	}
+	if carryOrdinal {
+		columnMaps = append(columnMaps, fmt.Sprintf("\"%s\"", setOperationOrdinalColumn))
+	}
 	return fmt.Sprintf(
 		"SELECT %s FROM (%s)",
 		strings.Join(columnMaps, ","),
@@ -5583,37 +5610,26 @@ func (n *OrderByScanNode) FormatSQL(ctx context.Context) (string, error) {
 	}
 	orderByColumns := []string{}
 	for _, item := range m1(n.node.OrderByItemList()) {
-		colName := uniqueColumnName(ctx, m1(m1(item.ColumnRef()).Column()))
-		nullOrder := m1(item.NullOrder())
-		switch nullOrder {
+		col := m1(m1(item.ColumnRef()).Column())
+		colName := uniqueColumnName(ctx, col)
+		formattedCol := fmt.Sprintf("\"%s\"", colName)
+		isDesc := m1(item.IsDescending())
+		nullOrder := defaultNullOrderSQL(isDesc)
+		switch m1(item.NullOrder()) {
 		case googlesql.ResolvedOrderByItemEnums_NullOrderModeNullsFirst:
-			orderByColumns = append(
-				orderByColumns,
-				fmt.Sprintf("(\"%s\" IS NOT NULL)", colName),
-			)
+			nullOrder = " NULLS FIRST"
 		case googlesql.ResolvedOrderByItemEnums_NullOrderModeNullsLast:
-			orderByColumns = append(
-				orderByColumns,
-				fmt.Sprintf("(\"%s\" IS NULL)", colName),
-			)
+			nullOrder = " NULLS LAST"
 		}
 		// DuckDB retarget: drop the googlesqlite_collate SQLite collation
-		// (no DuckDB callback-collation API). Native DuckDB ordering is
-		// correct because equal-under-GoogleSQL values share an identical
-		// value-layer encoding.
-		if m1(item.IsDescending()) {
-			nullSuffix := " NULLS LAST"
-			if nullOrder == googlesql.ResolvedOrderByItemEnums_NullOrderModeNullsFirst {
-				nullSuffix = " NULLS FIRST"
-			}
-			orderByColumns = append(orderByColumns, fmt.Sprintf("\"%s\" DESC%s", colName, nullSuffix))
-		} else {
-			nullSuffix := " NULLS FIRST"
-			if nullOrder == googlesql.ResolvedOrderByItemEnums_NullOrderModeNullsLast {
-				nullSuffix = " NULLS LAST"
-			}
-			orderByColumns = append(orderByColumns, fmt.Sprintf("\"%s\"%s", colName, nullSuffix))
+		// (no DuckDB callback-collation API). STRING/UUID keys sort by
+		// decoded payload text; other scalar storage orders natively.
+		orderExpr := orderExprForColumn(col, formattedCol)
+		direction := ""
+		if isDesc {
+			direction = " DESC"
 		}
+		orderByColumns = append(orderByColumns, orderExpr+direction+nullOrder)
 	}
 	formattedInput, err := formatInput(input)
 	if err != nil {
@@ -5699,6 +5715,9 @@ func (n *WithRefScanNode) FormatSQL(ctx context.Context) (string, error) {
 			fmt.Sprintf("\"%s\" AS \"%s\"", uniqueColumnName(ctx, columnDefs[i]), uniqueColumnName(ctx, columns[i])),
 		)
 	}
+	if cteSetOperationOrdinals(ctx)[tableName] {
+		formattedColumns = append(formattedColumns, fmt.Sprintf("\"%s\"", setOperationOrdinalColumn))
+	}
 	return fmt.Sprintf("(SELECT %s FROM \"%s\")", strings.Join(formattedColumns, ","), tableName), nil
 }
 
@@ -5709,6 +5728,10 @@ func (n *AnalyticScanNode) FormatSQL(ctx context.Context) (string, error) {
 	input, err := newNode(m1(n.node.InputScan())).FormatSQL(ctx)
 	if err != nil {
 		return "", err
+	}
+	rowIDExpr := "ROW_NUMBER() OVER()"
+	if strings.Count(input, fmt.Sprintf("\"%s\"", setOperationOrdinalColumn)) == 1 {
+		rowIDExpr = fmt.Sprintf("ROW_NUMBER() OVER(ORDER BY \"%s\")", setOperationOrdinalColumn)
 	}
 	formattedInput, err := formatInput(input)
 	if err != nil {
@@ -5810,8 +5833,9 @@ func (n *AnalyticScanNode) FormatSQL(ctx context.Context) (string, error) {
 	// as a deterministic intra-tie ordering key, and the trailing output
 	// ORDER BY uses it as the final tiebreak).
 	return fmt.Sprintf(
-		"SELECT %s FROM (SELECT *, ROW_NUMBER() OVER() AS \"row_id\" %s) %s",
+		"SELECT %s FROM (SELECT *, %s AS \"row_id\" %s) %s",
 		strings.Join(columns, ","),
+		rowIDExpr,
 		formattedInput,
 		orderBy,
 	), nil
@@ -6160,6 +6184,7 @@ func (n *WithScanNode) FormatSQL(ctx context.Context) (string, error) {
 		}
 	}
 	subCtx := withCteRefCounts(ctx, refCounts)
+	subCtx = withCteSetOperationOrdinals(subCtx, map[string]bool{})
 	queries := []string{}
 	for _, entry := range m1(n.node.WithEntryList()) {
 		sql, err := newNode(entry).FormatSQL(subCtx)
@@ -6216,6 +6241,11 @@ func (n *WithEntryNode) FormatSQL(ctx context.Context) (string, error) {
 	subquery, err := newNode(sub).FormatSQL(subCtx)
 	if err != nil {
 		return "", err
+	}
+	if strings.Contains(subquery, fmt.Sprintf("\"%s\"", setOperationOrdinalColumn)) {
+		if ordinals := cteSetOperationOrdinals(ctx); ordinals != nil {
+			ordinals[queryName] = true
+		}
 	}
 	tableToColumnList := tableNameToColumnListMap(ctx)
 	tableToColumnList[queryName] = m1(sub.MutableColumnList())

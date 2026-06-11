@@ -17,6 +17,7 @@ type (
 	systemVarsKey                   struct{}
 	connKey                         struct{}
 	cteRefCountsKey                 struct{}
+	cteSetOperationOrdinalKey       struct{}
 	analyticOrderColumnNamesKey     struct{}
 	analyticPartitionColumnNamesKey struct{}
 	analyticInputScanKey            struct{}
@@ -152,6 +153,18 @@ func cteRefCounts(ctx context.Context) map[string]int {
 		return nil
 	}
 	return value.(map[string]int)
+}
+
+func withCteSetOperationOrdinals(ctx context.Context, m map[string]bool) context.Context {
+	return context.WithValue(ctx, cteSetOperationOrdinalKey{}, m)
+}
+
+func cteSetOperationOrdinals(ctx context.Context) map[string]bool {
+	value := ctx.Value(cteSetOperationOrdinalKey{})
+	if value == nil {
+		return nil
+	}
+	return value.(map[string]bool)
 }
 
 // nullOrderMode represents the OVER (ORDER BY ... NULLS FIRST/LAST)
