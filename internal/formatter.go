@@ -137,6 +137,23 @@ func formatInput(input string) (string, error) {
 	return "", fmt.Errorf("unexpected input pattern: %s", input)
 }
 
+type aggregateInputOrdinalKey struct{}
+
+const aggregateInputOrdinalColumn = "__gsx_agg_rn"
+
+func withAggregateInputOrdinal(ctx context.Context) context.Context {
+	return context.WithValue(ctx, aggregateInputOrdinalKey{}, aggregateInputOrdinalColumn)
+}
+
+func aggregateInputOrdinalFromContext(ctx context.Context) string {
+	v := ctx.Value(aggregateInputOrdinalKey{})
+	if v == nil {
+		return ""
+	}
+	s, _ := v.(string)
+	return s
+}
+
 func getFuncNameAndArgs(ctx context.Context, node *ResolvedBaseFunctionCallNode, isWindowFunc bool) (string, []string, error) {
 	args := []string{}
 	for _, a := range m1(node.ArgumentList()) {
@@ -1004,6 +1021,14 @@ func tryNativeApproxAggregate(funcName string, args []string) (string, bool) {
 		return fmt.Sprintf("approx_top_k(CAST(%s AS VARCHAR), %s)", args[0], args[2]), true
 	}
 	return "", false
+}
+
+func usesDuckDBAggregateOptionMarkers(funcName string) bool {
+	switch funcName {
+	case "approx_quantiles", "approx_top_count", "approx_top_sum":
+		return true
+	}
+	return false
 }
 
 // nativeScalarRenames maps a GoogleSQL scalar built-in (its bare catalog
@@ -2892,13 +2917,6 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 	if spec, exists := funcMap[funcName]; exists {
 		return spec.CallSQL(ctx, n.node.ResolvedFunctionCallBase, args)
 	}
-	// DuckDB retarget: the approximate-aggregate family lowers to a
-	// complete native expression (quantile_disc / approx_top_k with a
-	// reshaped argument list), so return it directly before the generic
-	// DISTINCT / ORDER BY emit, which would otherwise mangle the call.
-	if sql, ok := tryNativeApproxAggregate(funcName, args); ok {
-		return sql, nil
-	}
 	// DuckDB retarget: COUNTIF. DuckDB exposes countif/count_if, but it
 	// returns NULL over an empty input whereas GoogleSQL COUNTIF returns
 	// 0. COUNT(CASE WHEN cond THEN 1 END) matches both the truthy-count
@@ -2936,16 +2954,39 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 		args = castArgs
 		resultWrap = rw
 	}
-	// DuckDB retarget (PATH B): the predecessor encoded the aggregate
-	// modifiers (DISTINCT, ORDER BY, IGNORE NULLS, LIMIT) as trailing
-	// googlesqlite_* pseudo-args that its custom SQLite aggregate UDFs
-	// parsed out. DuckDB's native aggregates take those modifiers as
-	// real in-call SQL syntax, so emit them that way. DISTINCT becomes a
-	// `DISTINCT ` argument prefix and ORDER BY becomes an in-aggregate
-	// `ORDER BY` clause - both native DuckDB aggregate syntax. (IGNORE
-	// NULLS / inline LIMIT have no general native form and stay markers;
-	// they are the documented backlog boundary, not on the example
-	// validation path.)
+	if usesDuckDBAggregateOptionMarkers(funcName) {
+		var opts []string
+		for _, item := range m1(n.node.OrderByItemList()) {
+			columnRef := m1(item.ColumnRef())
+			colName := uniqueColumnName(ctx, m1(columnRef.Column()))
+			if m1(item.IsDescending()) {
+				opts = append(opts, fmt.Sprintf("googlesqlite_order_by(\"%s\", false)", colName))
+			} else {
+				opts = append(opts, fmt.Sprintf("googlesqlite_order_by(\"%s\", true)", colName))
+			}
+		}
+		if m1(n.node.Distinct()) {
+			opts = append(opts, "googlesqlite_distinct()")
+		}
+		if m1(n.node.Limit()) != nil {
+			limitValue, err := newNode(m1(n.node.Limit())).FormatSQL(ctx)
+			if err != nil {
+				return "", err
+			}
+			opts = append(opts, fmt.Sprintf("googlesqlite_limit(%s)", limitValue))
+		}
+		switch m1(n.node.NullHandlingModifier()) {
+		case googlesql.ResolvedNonScalarFunctionCallBaseEnums_NullHandlingModifierIgnoreNulls:
+			opts = append(opts, "googlesqlite_ignore_nulls()")
+		case googlesql.ResolvedNonScalarFunctionCallBaseEnums_NullHandlingModifierRespectNulls:
+		}
+		args = append(args, opts...)
+		return fmt.Sprintf("%s(%s)", funcName, strings.Join(args, ",")), nil
+	}
+	// DuckDB retarget (PATH B): native aggregates take DISTINCT and
+	// ORDER BY as in-call SQL syntax. BigQuery's default null placement is
+	// NULLS FIRST for ascending and NULLS LAST for descending, so emit it
+	// explicitly for DuckDB.
 	argPrefix := ""
 	if m1(n.node.Distinct()) {
 		argPrefix = "DISTINCT "
@@ -2956,28 +2997,36 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 		columnRef := m1(item.ColumnRef())
 		colName := uniqueColumnName(ctx, m1(columnRef.Column()))
 		if m1(item.IsDescending()) {
-			orderByItems = append(orderByItems, fmt.Sprintf("\"%s\" DESC", colName))
+			orderByItems = append(orderByItems, fmt.Sprintf("\"%s\" DESC NULLS LAST", colName))
 		} else {
-			orderByItems = append(orderByItems, fmt.Sprintf("\"%s\"", colName))
+			orderByItems = append(orderByItems, fmt.Sprintf("\"%s\" NULLS FIRST", colName))
+		}
+	}
+	if len(orderByItems) == 0 {
+		if ordinal := aggregateInputOrdinalFromContext(ctx); ordinal != "" {
+			switch funcName {
+			case "array_agg", "array_concat_agg":
+				orderByItems = append(orderByItems, fmt.Sprintf("\"%s\"", ordinal))
+			}
 		}
 	}
 	if len(orderByItems) > 0 {
 		orderByClause = " ORDER BY " + strings.Join(orderByItems, ",")
 	}
-	var opts []string
+	limitSQL := "NULL"
 	if m1(n.node.Limit()) != nil {
 		limitValue, err := newNode(m1(n.node.Limit())).FormatSQL(ctx)
 		if err != nil {
 			return "", err
 		}
-		opts = append(opts, fmt.Sprintf("googlesqlite_limit(%s)", limitValue))
+		limitSQL = limitValue
 	}
+	ignoreNullsSQL := "FALSE"
 	switch m1(n.node.NullHandlingModifier()) {
 	case googlesql.ResolvedNonScalarFunctionCallBaseEnums_NullHandlingModifierIgnoreNulls:
-		opts = append(opts, "googlesqlite_ignore_nulls()")
+		ignoreNullsSQL = "TRUE"
 	case googlesql.ResolvedNonScalarFunctionCallBaseEnums_NullHandlingModifierRespectNulls:
 	}
-	args = append(args, opts...)
 	// DuckDB retarget: a few GoogleSQL aggregate builtins resolve to bare
 	// names that DuckDB spells differently. LOGICAL_AND / LOGICAL_OR (the
 	// boolean aggregates the analyzer emits inside ARRAY_INCLUDES_ALL /
@@ -2985,6 +3034,16 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 	// identical NULL-skipping semantics.
 	if native, ok := nativeAggregateFuncMap[funcName]; ok {
 		funcName = native
+	}
+	if funcName == "array_agg" && len(args) == 1 {
+		return fmt.Sprintf(
+			"googlesqlite_array_agg_from_native(array_agg(%s%s%s), %s, %s)",
+			argPrefix,
+			args[0],
+			orderByClause,
+			ignoreNullsSQL,
+			limitSQL,
+		), nil
 	}
 	// DuckDB retarget: ARRAY_CONCAT_AGG flattens per-row ARRAY<T> values
 	// into one ARRAY<T>. DuckDB has no array_concat_agg, and duckdb-go
@@ -2996,9 +3055,23 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 	// GoogleSQL then surfaces as NULL on the result path.
 	if funcName == "array_concat_agg" {
 		return fmt.Sprintf(
-			"googlesqlite_array_concat_agg_flatten(array_agg(%s%s%s))",
+			"googlesqlite_array_concat_agg_flatten(array_agg(%s%s%s), %s)",
 			argPrefix,
 			strings.Join(args, ","),
+			orderByClause,
+			limitSQL,
+		), nil
+	}
+	if funcName == "string_agg" && len(args) >= 1 {
+		callArgs := append([]string{}, args...)
+		callArgs[0] = fmt.Sprintf("googlesqlite_plain_string(%s)", callArgs[0])
+		if len(callArgs) >= 2 {
+			callArgs[1] = fmt.Sprintf("googlesqlite_plain_string(%s)", callArgs[1])
+		}
+		return fmt.Sprintf(
+			"string_agg(%s%s%s)",
+			argPrefix,
+			strings.Join(callArgs, ","),
 			orderByClause,
 		), nil
 	}
@@ -3175,12 +3248,26 @@ func (n *AnalyticFunctionCallNode) FormatSQL(ctx context.Context) (string, error
 			return n.formatNative(ctx, "googlesqlite_window_"+rawName, orderColumns, true)
 		}
 	}
+	if rawName == "array_agg" && !n.requiresPredecessorEmulation() {
+		inner, err := n.formatNative(ctx, "array_agg", orderColumns, false)
+		if err != nil {
+			return "", err
+		}
+		ignoreNulls := "FALSE"
+		if m1(n.node.NullHandlingModifier()) == googlesql.ResolvedNonScalarFunctionCallBaseEnums_NullHandlingModifierIgnoreNulls {
+			ignoreNulls = "TRUE"
+		}
+		return fmt.Sprintf("googlesqlite_array_agg_from_native(%s, %s, NULL)", inner, ignoreNulls), nil
+	}
+	if rawName == "string_agg" && !n.requiresPredecessorEmulation() {
+		return n.formatNative(ctx, "string_agg", orderColumns, false)
+	}
 	if rawName == "array_concat_agg" && !n.requiresPredecessorEmulation() {
 		inner, err := n.formatNative(ctx, "array_agg", orderColumns, false)
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("googlesqlite_array_concat_agg_flatten(%s)", inner), nil
+		return fmt.Sprintf("googlesqlite_array_concat_agg_flatten(%s, NULL)", inner), nil
 	}
 	if native := nativeWindowFuncForName(rawName); native != "" && !n.requiresPredecessorEmulation() {
 		return n.formatNative(ctx, native, orderColumns, false)
@@ -3344,6 +3431,12 @@ func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName 
 	// DuckDB auto-casts JSON integers for it, so it is left as-is.
 	if sqliteName == "quantile_cont" && len(valueArgs) >= 1 {
 		valueArgs[0] = fmt.Sprintf("CAST(%s AS DOUBLE)", valueArgs[0])
+	}
+	if sqliteName == "string_agg" && len(valueArgs) >= 1 {
+		valueArgs[0] = fmt.Sprintf("googlesqlite_plain_string(%s)", valueArgs[0])
+		if len(valueArgs) >= 2 {
+			valueArgs[1] = fmt.Sprintf("googlesqlite_plain_string(%s)", valueArgs[1])
+		}
 	}
 	// SUM / AVG in OVER context reject the JSON value-layer encoding the
 	// UNNEST source produces (`sum(JSON)` does not bind), the same way the
@@ -5015,9 +5108,31 @@ func nullSetContains(set map[string]struct{}, name string) bool {
 	return ok
 }
 
+func aggregateScanNeedsInputOrdinal(scan *googlesql.ResolvedAggregateScan) bool {
+	if scan == nil {
+		return false
+	}
+	for _, col := range m1(scan.AggregateList()) {
+		call, ok := m1(col.Expr()).(*googlesql.ResolvedAggregateFunctionCall)
+		if !ok {
+			continue
+		}
+		name := strings.TrimPrefix(strings.ReplaceAll(m1(m1(call.Function()).FullName(false)), ".", "_"), "$")
+		switch name {
+		case "array_agg", "array_concat_agg", "string_agg":
+			return true
+		}
+	}
+	return false
+}
+
 func (n *AggregateScanNode) FormatSQL(ctx context.Context) (string, error) {
 	if n.node == nil {
 		return "", nil
+	}
+	needsInputOrdinal := aggregateScanNeedsInputOrdinal(n.node)
+	if needsInputOrdinal {
+		ctx = withAggregateInputOrdinal(ctx)
 	}
 	for _, agg := range m1(n.node.AggregateList()) {
 		// assign sql to column ref map
@@ -5030,13 +5145,24 @@ func (n *AggregateScanNode) FormatSQL(ctx context.Context) (string, error) {
 		return "", err
 	}
 	groupByColumns := []string{}
+	groupOrderColumns := []string{}
 	groupByColumnMap := map[string]struct{}{}
 	for _, col := range m1(n.node.GroupByList()) {
 		if _, err := newNode(col).FormatSQL(ctx); err != nil {
 			return "", err
 		}
 		colName := uniqueColumnName(ctx, m1(col.Column()))
-		groupByColumns = append(groupByColumns, fmt.Sprintf("\"%s\"", colName))
+		groupColSQL := fmt.Sprintf("\"%s\"", colName)
+		groupByColumns = append(groupByColumns, groupColSQL)
+		orderColSQL := groupColSQL
+		if expr := m1(col.Expr()); expr != nil {
+			if typ, _ := expr.Type(); typ != nil {
+				if kind, _ := typ.Kind(); kind == googlesql.TypeKindTypeString {
+					orderColSQL = fmt.Sprintf("googlesqlite_plain_string(%s)", groupColSQL)
+				}
+			}
+		}
+		groupOrderColumns = append(groupOrderColumns, orderColSQL)
 		groupByColumnMap[colName] = struct{}{}
 	}
 	columns := []string{}
@@ -5147,9 +5273,21 @@ func (n *AggregateScanNode) FormatSQL(ctx context.Context) (string, error) {
 		// raw value-layer encoding directly - rows that are equal under
 		// GoogleSQL semantics share a byte-identical encoded string, so
 		// native GROUP BY on the bare column is correct.
-		groupBy = fmt.Sprintf("GROUP BY %s", strings.Join(groupByColumns, ","))
+		groupBy = fmt.Sprintf(
+			"GROUP BY %s ORDER BY %s",
+			strings.Join(groupByColumns, ","),
+			strings.Join(groupOrderColumns, ","),
+		)
 	}
 	formattedColumns := strings.Join(columns, ",")
+	if needsInputOrdinal {
+		formattedInput, err := formatInput(input)
+		if err != nil {
+			return "", err
+		}
+		input = fmt.Sprintf("(SELECT *, row_number() OVER () AS \"%s\" %s)", aggregateInputOrdinalColumn, formattedInput)
+		return fmt.Sprintf("SELECT %s FROM %s %s", formattedColumns, input, groupBy), nil
+	}
 	switch getInputPattern(input) {
 	case InputKeep:
 		return fmt.Sprintf("SELECT %s %s %s", formattedColumns, input, groupBy), nil
@@ -5446,7 +5584,8 @@ func (n *OrderByScanNode) FormatSQL(ctx context.Context) (string, error) {
 	orderByColumns := []string{}
 	for _, item := range m1(n.node.OrderByItemList()) {
 		colName := uniqueColumnName(ctx, m1(m1(item.ColumnRef()).Column()))
-		switch m1(item.NullOrder()) {
+		nullOrder := m1(item.NullOrder())
+		switch nullOrder {
 		case googlesql.ResolvedOrderByItemEnums_NullOrderModeNullsFirst:
 			orderByColumns = append(
 				orderByColumns,
@@ -5463,9 +5602,17 @@ func (n *OrderByScanNode) FormatSQL(ctx context.Context) (string, error) {
 		// correct because equal-under-GoogleSQL values share an identical
 		// value-layer encoding.
 		if m1(item.IsDescending()) {
-			orderByColumns = append(orderByColumns, fmt.Sprintf("\"%s\" DESC", colName))
+			nullSuffix := " NULLS LAST"
+			if nullOrder == googlesql.ResolvedOrderByItemEnums_NullOrderModeNullsFirst {
+				nullSuffix = " NULLS FIRST"
+			}
+			orderByColumns = append(orderByColumns, fmt.Sprintf("\"%s\" DESC%s", colName, nullSuffix))
 		} else {
-			orderByColumns = append(orderByColumns, fmt.Sprintf("\"%s\"", colName))
+			nullSuffix := " NULLS FIRST"
+			if nullOrder == googlesql.ResolvedOrderByItemEnums_NullOrderModeNullsLast {
+				nullSuffix = " NULLS LAST"
+			}
+			orderByColumns = append(orderByColumns, fmt.Sprintf("\"%s\"%s", colName, nullSuffix))
 		}
 	}
 	formattedInput, err := formatInput(input)

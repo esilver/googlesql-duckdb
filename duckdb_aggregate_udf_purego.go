@@ -50,6 +50,7 @@ import (
 	convergeduckdb "github.com/esilver/duckdb-go-pure"
 
 	"github.com/goccy/googlesqlite/internal/functions/aggregate"
+	approx "github.com/goccy/googlesqlite/internal/functions/approx_aggregate"
 	geofn "github.com/goccy/googlesqlite/internal/functions/geography"
 	"github.com/goccy/googlesqlite/internal/functions/helper"
 	"github.com/goccy/googlesqlite/internal/functions/hll"
@@ -148,10 +149,17 @@ func duckdbAggSpecs() []aggSpec {
 		// the same pure-Go aggregators the SQLite path uses (hll.BindHllCount*).
 		// HLL_COUNT.EXTRACT is a scalar: it rides the googlesqlite_hll_count_extract
 		// UDF registered by registerNormalFuncUDFs (the formatter remaps the bare
-		// `extract` leaf to it). HLL_COUNT.MERGE_PARTIAL stays on the SQLite path
-		// (its spec is status=partial, documentation-only on this target).
+		// `extract` leaf to it).
 		{name: "init", minParams: 1, maxParams: 2, newAgg: hll.BindHllCountInit()},
 		{name: "merge", minParams: 1, maxParams: 1, newAgg: hll.BindHllCountMerge()},
+		{name: "hll_count_merge_partial", minParams: 1, maxParams: 1, newAgg: hll.BindHllCountMergePartial()},
+
+		// BigQuery approximate aggregates. Keep these on the existing Go
+		// bodies instead of DuckDB's native approximations so result shape
+		// and the small conformance examples match the SQLite baseline.
+		{name: "approx_quantiles", minParams: 2, maxParams: 5, newAgg: approx.BindApproxQuantiles()},
+		{name: "approx_top_count", minParams: 2, maxParams: 5, newAgg: approx.BindApproxTopCount()},
+		{name: "approx_top_sum", minParams: 3, maxParams: 6, newAgg: approx.BindApproxTopSum()},
 
 		// ANY_VALUE(value HAVING { MAX | MIN } key): the formatter lowers
 		// the HAVING modifier to having_any_value(value, key, 'MAX'|'MIN'),

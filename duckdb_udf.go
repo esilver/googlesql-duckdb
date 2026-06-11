@@ -493,6 +493,7 @@ func vectorDistanceUDFConfig() duckdb.ScalarFuncConfig {
 // pure-Go bodies operating over the base64 envelope wire form instead of
 // DuckDB's native array_* functions, which expect native LIST values.
 var envelopeArrayUDFs = map[string]func(...any) (any, error){
+	"googlesqlite_array_agg_from_native":    internal.GoogleSQLArrayAggFromNative,
 	"googlesqlite_array_concat":             internal.GoogleSQLArrayConcat,
 	"googlesqlite_array_concat_agg_flatten": internal.GoogleSQLArrayConcatAggFlatten,
 	"googlesqlite_array_from_native":        internal.GoogleSQLArrayFromNative,

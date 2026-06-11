@@ -183,6 +183,66 @@ func GoogleSQLArrayFromNative(args ...any) (any, error) {
 	return s, nil
 }
 
+// GoogleSQLArrayAggFromNative finishes a DuckDB-native array_agg/list result
+// as a GoogleSQL ARRAY value. The formatter keeps DISTINCT / ORDER BY in
+// DuckDB's aggregate syntax, then lets this bridge apply GoogleSQL's final
+// LIMIT and NULL-element rule.
+func GoogleSQLArrayAggFromNative(args ...any) (any, error) {
+	if len(args) != 3 {
+		return nil, fmt.Errorf("googlesqlite_array_agg_from_native: want 3 args, got %d", len(args))
+	}
+	list, ok := args[0].([]any)
+	if !ok {
+		if args[0] == nil {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("googlesqlite_array_agg_from_native: want LIST arg, got %T", args[0])
+	}
+	ignoreNulls, ok := args[1].(bool)
+	if !ok {
+		return nil, fmt.Errorf("googlesqlite_array_agg_from_native: want BOOL ignore_nulls arg, got %T", args[1])
+	}
+	limit := int64(-1)
+	if args[2] != nil {
+		switch v := args[2].(type) {
+		case int64:
+			limit = v
+		case int32:
+			limit = int64(v)
+		case int:
+			limit = int64(v)
+		default:
+			return nil, fmt.Errorf("googlesqlite_array_agg_from_native: want INT64 limit arg, got %T", args[2])
+		}
+	}
+	elems := make([]value.Value, 0, len(list))
+	for _, e := range list {
+		if limit >= 0 && int64(len(elems)) >= limit {
+			break
+		}
+		v, err := value.DecodeValue(e)
+		if err != nil {
+			return nil, err
+		}
+		if v == nil {
+			if ignoreNulls {
+				continue
+			}
+			return nil, fmt.Errorf("ARRAY_AGG: input value must be not null")
+		}
+		elems = append(elems, v)
+	}
+	out := &value.ArrayValue{Values: elems}
+	s, isNull, err := value.EncodeValueString(out)
+	if err != nil {
+		return nil, err
+	}
+	if isNull {
+		return nil, nil
+	}
+	return s, nil
+}
+
 // GoogleSQLArrayConcatAggFlatten is the scalar half of the ARRAY_CONCAT_AGG
 // lowering. The formatter collects each row's ARRAY<T> value with native
 // array_agg, producing a DuckDB LIST (a Go []any) whose elements are the
@@ -193,8 +253,8 @@ func GoogleSQLArrayFromNative(args ...any) (any, error) {
 // ignores NULL inputs); an empty / all-NULL result encodes to an empty array
 // so the result path can surface the GoogleSQL NULL.
 func GoogleSQLArrayConcatAggFlatten(args ...any) (any, error) {
-	if len(args) != 1 {
-		return nil, fmt.Errorf("googlesqlite_array_concat_agg_flatten: want 1 arg, got %d", len(args))
+	if len(args) != 2 {
+		return nil, fmt.Errorf("googlesqlite_array_concat_agg_flatten: want 2 args, got %d", len(args))
 	}
 	list, ok := args[0].([]any)
 	if !ok {
@@ -205,8 +265,24 @@ func GoogleSQLArrayConcatAggFlatten(args ...any) (any, error) {
 		}
 		return nil, fmt.Errorf("googlesqlite_array_concat_agg_flatten: want LIST arg, got %T", args[0])
 	}
+	limit := int64(-1)
+	if args[1] != nil {
+		switch v := args[1].(type) {
+		case int64:
+			limit = v
+		case int32:
+			limit = int64(v)
+		case int:
+			limit = int64(v)
+		default:
+			return nil, fmt.Errorf("googlesqlite_array_concat_agg_flatten: want INT64 limit arg, got %T", args[1])
+		}
+	}
 	var concatenated []value.Value
-	for _, elem := range list {
+	for idx, elem := range list {
+		if limit >= 0 && int64(idx) >= limit {
+			break
+		}
 		v, err := value.DecodeValue(elem)
 		if err != nil {
 			return nil, err
