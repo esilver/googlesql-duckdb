@@ -435,7 +435,7 @@ func (n *FunctionCallNode) FormatSQL(ctx context.Context) (string, error) {
 	// runs before tryNativeOperator so the bare SAFE_DIVIDE name keeps
 	// its NULL-on-zero semantics instead of being mistaken for the
 	// raising `divide` operator after a naive `safe_` prefix strip.
-	if sql, ok := tryNativeMathFunc(funcName, args); ok {
+	if sql, ok := tryNativeMathFunc(funcName, args, argKinds(m1(n.node.ArgumentList()))); ok {
 		return sql, nil
 	}
 	if sql, ok := tryNativeOperator(funcName, args, argKinds(m1(n.node.ArgumentList()))); ok {
@@ -527,12 +527,32 @@ func (n *FunctionCallNode) FormatSQL(ctx context.Context) (string, error) {
 	case "googlesqlite_error", "googlesqlite_safe_error", "error", "safe_error":
 		return n.formatErrorBuiltin(ctx, funcName, args)
 	case "googlesqlite_ifnull":
+		// NUMERIC args take the same dual-carrier normalization as
+		// COALESCE below: the CASE arms must agree on one engine type.
+		args = normalizeNumericCarrierArgs(args, argKinds(m1(n.node.ArgumentList())))
 		return fmt.Sprintf(
 			"CASE WHEN %s IS NULL THEN %s ELSE %s END",
 			args[0],
 			args[1],
 			args[0],
 		), nil
+	case "coalesce", "ifnull":
+		// COALESCE / IFNULL over NUMERIC operands (issue #21, dbt decimal-math
+		// shape COALESCE(CAST(col AS NUMERIC), 0)): since the native-storage
+		// migration a NUMERIC expression has TWO carrier forms — native
+		// DECIMAL(38,9) (stored columns, literals, operator results) and the
+		// value-layer envelope VARCHAR (googlesqlite_cast / UDF results,
+		// legacy-table cells). DuckDB's COALESCE/IFNULL require one common
+		// type, so mixing the forms fails to bind ("Cannot mix values of type
+		// VARCHAR and DECIMAL(38,9)"). Normalize every NUMERIC-kind argument
+		// to the native form through numericStorageReadSQL (pass-through cost
+		// for already-native operands); non-NUMERIC arguments emit unchanged,
+		// so the output matches the default native lowering this case
+		// otherwise mirrors (both names reach the generic funcName(args) emit
+		// on the DuckDB path — the googlesqlite_ifnull CASE form above only
+		// fires when the SQLite normalFuncMap shells the name).
+		return fmt.Sprintf("%s(%s)", funcName, strings.Join(
+			normalizeNumericCarrierArgs(args, argKinds(m1(n.node.ArgumentList()))), ",")), nil
 	case "googlesqlite_if":
 		return fmt.Sprintf(
 			"CASE WHEN %s THEN %s ELSE %s END",
@@ -863,6 +883,25 @@ func numericStorageReadSQL(expr string) string {
 		"COALESCE(TRY_CAST(%s AS DECIMAL(38,9)), CAST(googlesqlite_plain_string(%s) AS DECIMAL(38,9)))",
 		expr, expr,
 	)
+}
+
+// normalizeNumericCarrierArgs returns args with every NUMERIC-kind operand
+// wrapped in numericStorageReadSQL, so an argument list whose members carry
+// different NUMERIC forms (native DECIMAL(38,9) vs the value-layer envelope
+// VARCHAR) binds under one common engine type. Non-NUMERIC arguments pass
+// through untouched, and the wrap is pass-through cost for operands already
+// in native form (the TRY_CAST arm claims them). BIGNUMERIC stays on the
+// envelope carrier everywhere (it exceeds DuckDB's DECIMAL ceiling), so it
+// never mixes and needs no wrap.
+func normalizeNumericCarrierArgs(args []string, kinds []googlesql.TypeKind) []string {
+	normalized := make([]string, len(args))
+	for i, a := range args {
+		if kindAt(kinds, i) == googlesql.TypeKindTypeNumeric {
+			a = numericStorageReadSQL(a)
+		}
+		normalized[i] = a
+	}
+	return normalized
 }
 
 // bytesStorageReadSQL renders a BYTES-typed operand as a native payload
@@ -1250,7 +1289,10 @@ func trySearchObjectRefFunc(funcName string, args []string) (string, bool) {
 // unprefixed identity). Returns (sql, true) when handled, else
 // ("", false) so the caller falls through. Semantics are verified
 // against the googlesql spec cases (arg order, NULL behavior, IEEE /0).
-func tryNativeMathFunc(funcName string, args []string) (string, bool) {
+// kinds carries the analyzer-resolved type kind of each argument; today
+// only SAFE_DIVIDE consults it (to route exact NUMERIC / BIGNUMERIC
+// operands away from the DOUBLE lowering).
+func tryNativeMathFunc(funcName string, args []string, kinds []googlesql.TypeKind) (string, bool) {
 	switch funcName {
 	case "is_nan":
 		// DuckDB native isnan; GoogleSQL IS_NAN over FLOAT64.
@@ -1276,6 +1318,22 @@ func tryNativeMathFunc(funcName string, args []string) (string, bool) {
 	case "safe_divide":
 		// NULL on divide-by-zero; FLOAT64 division otherwise.
 		if len(args) == 2 {
+			// NUMERIC / BIGNUMERIC operands (issue #21): SAFE_DIVIDE over
+			// exact types returns the SAME exact type in BigQuery, so the
+			// DOUBLE lowering below is wrong twice over (approximate
+			// result, and a BIGNUMERIC envelope VARCHAR does not survive
+			// CAST AS DOUBLE). Route to the googlesqlite_safe_divide
+			// scalar UDF — the same exact mathfn.OP_DIV body the raising
+			// $divide fallback uses, with the zero-divisor error folded
+			// to NULL by the safe bridge. Mirrors tryNativeOperator's
+			// "divide" refusal, which is what keeps the raising form off
+			// the native float path for these kinds.
+			if kindAt(kinds, 0) == googlesql.TypeKindTypeNumeric ||
+				kindAt(kinds, 1) == googlesql.TypeKindTypeNumeric ||
+				isNumericEnvelopeKind(kindAt(kinds, 0)) ||
+				isNumericEnvelopeKind(kindAt(kinds, 1)) {
+				return fmt.Sprintf("googlesqlite_safe_divide(%s,%s)", args[0], args[1]), true
+			}
 			return fmt.Sprintf("(CASE WHEN (%s) = 0 THEN NULL ELSE CAST(%s AS DOUBLE) / (%s) END)", args[1], args[0], args[1]), true
 		}
 	case "safe_negate":

@@ -251,6 +251,25 @@ var duckDBNormalUDFNames = append(append([]string{}, stringFamilyUDFNames...),
 	// INSERTs started succeeding). Result is a JSON value (envelope
 	// VARCHAR) re-typed by the consumer (INT64()/JSON_VALUE()/decoder).
 	"get_json_field",
+	// NUMERIC / BIGNUMERIC division (issue #21): the formatter's
+	// tryNativeOperator deliberately refuses to claim $divide natively when
+	// either operand is NUMERIC or BIGNUMERIC (BigQuery `/` over NUMERIC is
+	// EXACT and errors on a zero divisor, while the native float lowering
+	// computes in DOUBLE and yields Inf), so the default emit produces
+	// googlesqlite_divide / googlesqlite_safe_divide — names the legacy
+	// SQLite backend registered via normalFuncs (mathfn.OP_DIV) but the
+	// DuckDB bridge set was missing, failing every NUMERIC division at bind
+	// time with a Catalog Error. The body is the same exact-arithmetic
+	// implementation: operands arrive as exact carriers (a native
+	// DECIMAL(38,9) becomes a NumericValue via the duckdb.Decimal
+	// foreign-decoder hook; a BIGNUMERIC envelope decodes through the
+	// value layer), NumericValue.Div computes the exact rational and
+	// raises on a zero divisor, and the result re-encodes as the
+	// NUMERIC / BIGNUMERIC envelope VARCHAR. The googlesqlite_safe_divide
+	// companion (registered automatically by registerNormalFuncUDFs) folds
+	// the zero-divisor error to NULL for SAFE_DIVIDE and the IFERROR /
+	// ISERROR / NULLIFERROR safe-eval wraps.
+	"divide",
 )
 
 // StringFamilyUDFSpecs returns the DuckDB scalar UDF specs for the string
