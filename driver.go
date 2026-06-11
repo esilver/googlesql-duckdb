@@ -6,7 +6,6 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
-	"os"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -38,56 +37,42 @@ func dsnParts(dsn string) (path, query string) {
 }
 
 // WasmCompilationMode selects how the embedded GoogleSQL wasm module
-// is executed. It is the value of the EnvWasmCompilationMode
-// environment variable.
+// is executed.
+//
+// Deprecated: since go-googlesql moved from the wazero interpreter to a
+// wasm2go-transpiled native-Go module (github.com/goccy/googlesqlwasm2go),
+// there is no wasm runtime to configure. The type and its constants are
+// retained for source compatibility only and have no effect.
 type WasmCompilationMode string
 
 const (
-	// WasmCompilationModeInterpreter runs the wasm on the wazero
-	// interpreter: portable and zero-setup, but slower at hot SQL
-	// workloads. This is the default.
+	// WasmCompilationModeInterpreter is retained for source
+	// compatibility; the analyzer now always runs as ordinary Go code.
+	//
+	// Deprecated: no effect; see WasmCompilationMode.
 	WasmCompilationModeInterpreter WasmCompilationMode = "interpreter"
-	// WasmCompilationModeCompiler AOT-compiles the wasm with the
-	// wazero compiler for higher steady-state performance, at a
-	// one-time compile cost on the first sql.Open. Pair it with
-	// EnvWasmCacheDir to amortise that cost across processes.
+	// WasmCompilationModeCompiler is retained for source compatibility;
+	// the analyzer now always runs as ordinary Go code.
+	//
+	// Deprecated: no effect; see WasmCompilationMode.
 	WasmCompilationModeCompiler WasmCompilationMode = "compiler"
 )
 
-// Environment variables that configure the embedded GoogleSQL wasm
-// runtime. They are read once, on the first sql.Open of a googlesqlite
-// database in the process, and let CI and other out-of-process callers
-// tune the runtime without code changes.
+// Environment variables that previously configured the embedded
+// GoogleSQL wasm runtime. The analyzer is now a wasm2go-transpiled
+// native-Go module, so both are ignored.
 const (
-	// EnvWasmCompilationMode selects the wazero execution engine. Its
-	// value is a WasmCompilationMode; absent or unrecognised, the
-	// runtime defaults to WasmCompilationModeInterpreter.
+	// EnvWasmCompilationMode previously selected the wazero execution
+	// engine.
+	//
+	// Deprecated: ignored; the analyzer runs as ordinary Go code.
 	EnvWasmCompilationMode = "GOOGLESQLITE_WASM_COMPILATION_MODE"
-	// EnvWasmCacheDir points the wazero on-disk compilation cache at a
-	// directory, so subsequent processes load the precompiled bytes
-	// instead of recompiling the wasm. Honoured only under
-	// WasmCompilationModeCompiler.
+	// EnvWasmCacheDir previously pointed the wazero compilation cache
+	// at a directory.
+	//
+	// Deprecated: ignored; there is no wasm compilation step.
 	EnvWasmCacheDir = "GOOGLESQLITE_WASM_CACHE_DIR"
 )
-
-// wasmOptions is the resolved wasm runtime configuration.
-type wasmOptions struct {
-	mode     WasmCompilationMode
-	cacheDir string
-}
-
-// resolveWasmOptions reads the EnvWasmCompilationMode / EnvWasmCacheDir
-// environment variables; absent them it returns the interpreter-mode
-// default.
-func resolveWasmOptions() wasmOptions {
-	if strings.EqualFold(os.Getenv(EnvWasmCompilationMode), string(WasmCompilationModeCompiler)) {
-		return wasmOptions{
-			mode:     WasmCompilationModeCompiler,
-			cacheDir: os.Getenv(EnvWasmCacheDir),
-		}
-	}
-	return wasmOptions{mode: WasmCompilationModeInterpreter}
-}
 
 // ensureGoogleSQLInit initialises the embedded GoogleSQL WASM runtime
 // once per process. Subsequent calls are no-ops (Init uses sync.Once).
@@ -101,18 +86,7 @@ func resolveWasmOptions() wasmOptions {
 // duckdb_execute_pending. That ordering is what keeps the extension loader
 // from racing the steady-state query stream (see loadSpatialExtension).
 var ensureGoogleSQLInit = sync.OnceValue(func() error {
-	opts := resolveWasmOptions()
-	googlesqlOpts := make([]googlesql.Option, 0, 2)
-	switch opts.mode {
-	case WasmCompilationModeCompiler:
-		googlesqlOpts = append(googlesqlOpts, googlesql.WithCompilationMode(googlesql.CompilationModeCompiler))
-		if opts.cacheDir != "" {
-			googlesqlOpts = append(googlesqlOpts, googlesql.WithCompilationCache(opts.cacheDir))
-		}
-	default:
-		googlesqlOpts = append(googlesqlOpts, googlesql.WithCompilationMode(googlesql.CompilationModeInterpreter))
-	}
-	if err := googlesql.Init(googlesqlOpts...); err != nil {
+	if err := googlesql.Init(); err != nil {
 		return err
 	}
 	return loadSpatialExtension(nil)
