@@ -382,7 +382,7 @@ func (s *DMLStmt) Exec(args []driver.Value) (driver.Result, error) {
 			err,
 		)
 	}
-	return result, nil
+	return &execResult{result: result}, nil
 }
 
 func (s *DMLStmt) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {

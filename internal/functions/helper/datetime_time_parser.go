@@ -1031,7 +1031,10 @@ func unixtimeSecondsParser(text []rune, t *time.Time) (int, error) {
 	if u < 0 {
 		return 0, fmt.Errorf("invalid unixtime number %d", u)
 	}
-	*t = time.Unix(u, 0)
+	// Unix seconds name an absolute instant; render it in UTC so the
+	// parsed calendar fields are zone-independent (time.Unix returns a
+	// local-zone time, which shifts the day for processes west of UTC).
+	*t = time.Unix(u, 0).UTC()
 	return unixtimeLen, nil
 }
 

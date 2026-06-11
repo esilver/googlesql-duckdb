@@ -445,7 +445,10 @@ func (a *QueryStmtAction) ExecContext(ctx context.Context, conn *Conn) (driver.R
 }
 
 func (a *QueryStmtAction) ExplainQueryPlan(ctx context.Context, conn *Conn) error {
-	rows, err := conn.QueryContext(ctx, fmt.Sprintf("EXPLAIN QUERY PLAN %s", a.formattedQuery), a.args...)
+	// DuckDB has no `EXPLAIN QUERY PLAN` (that was SQLite syntax); its
+	// `EXPLAIN <query>` returns (explain_key, explain_value) VARCHAR
+	// rows carrying the rendered physical plan.
+	rows, err := conn.QueryContext(ctx, fmt.Sprintf("EXPLAIN %s", a.formattedQuery), a.args...)
 	if err != nil {
 		return fmt.Errorf("failed to explain query plan: %w", err)
 	}
@@ -453,17 +456,12 @@ func (a *QueryStmtAction) ExplainQueryPlan(ctx context.Context, conn *Conn) erro
 		return fmt.Errorf("failed to explain query plan: %w", err)
 	}
 	defer rows.Close()
-	fmt.Println("|selectid|order|from|detail|")
-	fmt.Println("----------------------------")
 	for rows.Next() {
-		var (
-			selectID, order, from int
-			detail                string
-		)
-		if err := rows.Scan(&selectID, &order, &from, &detail); err != nil {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
 			return fmt.Errorf("failed to scan: %w", err)
 		}
-		fmt.Printf("|%d|%d|%d|%s|\n", selectID, order, from, detail)
+		fmt.Printf("%s\n%s\n", key, value)
 	}
 	return nil
 }
