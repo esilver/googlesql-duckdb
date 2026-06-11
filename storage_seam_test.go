@@ -28,9 +28,9 @@ package googlesqlite_test
 // reference pages (e.g. timestamp_functions.md, array_functions.md).
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"os"
 	"strings"
 	"testing"
@@ -232,12 +232,16 @@ func TestStorageSeam_Bytes(t *testing.T) {
 		"SELECT c FROM t").Scan(&got); err != nil {
 		t.Fatalf("scan BYTES: %v", err)
 	}
-	// Native-storage migration: the BLOB cell holds the PAYLOAD bytes
-	// (this was an xfail skip while the cell held the value-layer
-	// envelope's ASCII — BYTE_LENGTH returned 44 and TO_HEX hex-dumped
-	// the envelope).
-	if !bytes.Equal(got, []byte("abc")) {
-		t.Fatalf("stored BYTES round-trip: got %q want %q", got, "abc")
+	// The BLOB cell holds the PAYLOAD bytes (native storage; this was
+	// an xfail skip while the cell held the value-layer envelope's
+	// ASCII — BYTE_LENGTH returned 44 and TO_HEX hex-dumped the
+	// envelope), but the SCAN contract renders BYTES as the payload's
+	// base64 text — BigQuery's wire form and the upstream driver
+	// contract — so a []byte destination receives the base64 text's
+	// bytes. The BYTE_LENGTH / TO_HEX assertions below prove the CELL
+	// is the raw payload.
+	if want := base64.StdEncoding.EncodeToString([]byte("abc")); string(got) != want {
+		t.Fatalf("stored BYTES round-trip: got %q want %q", got, want)
 	}
 	wantInt64(t, db, "SELECT BYTE_LENGTH(c) FROM t", 3)
 	wantString(t, db, "SELECT TO_HEX(c) FROM t", "616263")
