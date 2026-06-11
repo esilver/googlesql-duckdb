@@ -1489,12 +1489,27 @@ func NewCatalog(db *sql.DB) *Catalog {
 	// wiring. Acquire wasmAnalyzeMu around the proto FFI block so
 	// other goroutines that are mid-Analyze do not see a partially-
 	// populated DescriptorPool / SimpleCatalog while AddType is in
-	// flight.
-	wasmAnalyzeMu.Lock()
-	_ = registerWellKnownProtos(c)
-	wasmAnalyzeMu.Unlock()
+	// flight. The unlock is deferred inside a closure: the body
+	// crosses the analyzer FFI boundary, and an abort there surfaces
+	// as a Go panic — a bare Lock/Unlock pair would orphan
+	// wasmAnalyzeMu for every Analyze in the process even when the
+	// caller recovers the panic (issue #18).
+	func() {
+		wasmAnalyzeMu.Lock()
+		defer wasmAnalyzeMu.Unlock()
+		if h := newCatalogProtoBlockHookForTest; h != nil {
+			h()
+		}
+		_ = registerWellKnownProtos(c)
+	}()
 	return c
 }
+
+// newCatalogProtoBlockHookForTest, when non-nil, runs inside
+// NewCatalog's wasmAnalyzeMu-guarded proto block, before
+// registerWellKnownProtos. Test-only seam for the issue #18
+// lock-leak-on-panic regression test; never set in production.
+var newCatalogProtoBlockHookForTest func()
 
 // DescriptorPool returns the catalog's protobuf DescriptorPool. The
 // pool is created at NewCatalog time and shared across the catalog's
@@ -1533,14 +1548,18 @@ func (c *Catalog) RegisterProto(fileDescriptorProtoBytes []byte) error {
 	if !ok {
 		return fmt.Errorf("RegisterProto: invalid FileDescriptorProto wire format")
 	}
-	c.mu.Lock()
-	fd, err := c.descriptorPool.BuildFile(fdProto)
-	if err != nil {
-		c.mu.Unlock()
+	// Deferred unlock inside a closure: BuildFile crosses the wasm
+	// FFI boundary, and an analyzer abort there surfaces as a Go
+	// panic — manual Unlock calls on each return path would leak
+	// c.mu on that panic (issue #18).
+	if err := func() error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		_, err := c.descriptorPool.BuildFile(fdProto)
+		return err
+	}(); err != nil {
 		return fmt.Errorf("RegisterProto: BuildFile: %w", err)
 	}
-	_ = fd
-	c.mu.Unlock()
 	// Mirror the registration on the Go-side proto registry so the
 	// runtime (CAST(STRING AS Proto) text-format parsing, value
 	// formatters, etc.) can resolve the descriptor without crossing
