@@ -1,10 +1,13 @@
 package internal
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/binary"
 	"fmt"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -203,6 +206,29 @@ func newSimpleCatalog(name string) *googlesql.SimpleCatalog {
 	}
 	registerBigQueryExtensionFunctions(catalog)
 	registerSpannerExtensionFunctions(catalog)
+	return catalog
+}
+
+// newBareSubCatalog constructs a SimpleCatalog WITHOUT the builtin /
+// extension function surface. Sub-catalogs only ever resolve tables,
+// nested sub-catalogs and explicitly-aliased UDF/TVF handles —
+// builtin function lookup happens against the root catalog the
+// analyzer was handed, never against a descended sub-catalog.
+//
+// Issue #19: registering the full GoogleSQL + BigQuery + Spanner
+// surface into every sub-catalog (the previous behavior — sub-
+// catalogs shared newSimpleCatalog with the root) allocated the whole
+// function/type set in analyzer linear memory once per
+// (dataset x catalog rebuild). Under a dbt build that was the
+// dominant term in both the per-statement cost climb and the
+// analyzer-heap exhaustion: the production bad_alloc stack is
+// getOrCreateSubCatalog -> newSimpleCatalog ->
+// registerBigQueryExtensionFunctions -> MakeSimpleType.
+func newBareSubCatalog(name string) *googlesql.SimpleCatalog {
+	catalog, err := googlesql.NewSimpleCatalog(name, tf())
+	if err != nil {
+		return nil
+	}
 	return catalog
 }
 
@@ -1704,7 +1730,7 @@ func (c *Catalog) getOrCreateSubCatalog(parent *googlesql.SimpleCatalog, name st
 	if existing, ok := subs[name]; ok {
 		return existing
 	}
-	sub := newSimpleCatalog(name)
+	sub := newBareSubCatalog(name)
 	if sub == nil {
 		return nil
 	}
@@ -2140,6 +2166,17 @@ func (c *Catalog) resetCatalog(tables []*TableSpec, functions []*FunctionSpec, t
 	// pressure that pins thousands of catalogs in the wasm heap until
 	// it exhausts and `wasm_alloc` starts returning OOB.
 	c.subCatalogs = map[*googlesql.SimpleCatalog]map[string]*googlesql.SimpleCatalog{}
+	// Issue #19: push the retired catalog tree toward reclamation NOW
+	// instead of waiting for an organic GC cycle. The wasm-side
+	// objects are released by Go finalizers (free is enqueued, then
+	// drained on the next top-level module entry — i.e. during the
+	// re-registration below), so a forced collection here turns
+	// "unreachable eventually" into "freed before the rebuild
+	// allocates its replacement". Under sustained DDL churn the
+	// organic-GC path let allocation outpace reclamation and the
+	// analyzer heap exhausted; resets are rare after the addTableSpec
+	// equivalence gates, so one collection per reset is cheap.
+	runtime.GC()
 	for _, spec := range tables {
 		if err := c.addTableSpec(spec); err != nil {
 			return err
@@ -2300,19 +2337,35 @@ func (c *Catalog) addFunctionSpec(spec *FunctionSpec) error {
 }
 
 func (c *Catalog) addTableSpec(spec *TableSpec) error {
-	c.bumpAnalysisGeneration()
 	tableName := spec.TableName()
-	if _, exists := c.tableMap[tableName]; exists {
-		// CREATE OR REPLACE TABLE/VIEW (issue #10): swap the spec
-		// pointer in the Go-side registries, then rebuild the
-		// analyzer catalog. The wasm-side SimpleCatalog has no table
-		// removal API and addTableSpecRecursive skips names that are
-		// already registered, so without the rebuild the resolver
-		// keeps the OLD SimpleTable handle — with the old column
-		// set — under every lookup alias. resetCatalog re-registers
-		// every spec from scratch (the same machinery DROP uses via
-		// deleteTableSpecByName), building a fresh handle for the
-		// replaced table and refreshing INFORMATION_SCHEMA too.
+	if old, exists := c.tableMap[tableName]; exists {
+		// CREATE OR REPLACE TABLE/VIEW and Sync re-loads of saved
+		// specs land here. Issue #19: the replace path used to call
+		// resetCatalog unconditionally, so a dbt build (every model
+		// is CREATE OR REPLACE, plus every save echoes back through
+		// the next Sync) rebuilt the WHOLE analyzer catalog — full
+		// builtin + extension function surface per sub-catalog — once
+		// per statement over a growing spec set. Per-statement cost
+		// climbed with catalog size and the analyzer wasm heap filled
+		// until bad_alloc. Gate the rebuild on what actually changed:
+		//
+		//  1. byte-identical spec (modulo bookkeeping timestamps):
+		//     typically a Sync echo of a row this process just saved.
+		//     Nothing the analyzer or the analysis cache can observe
+		//     changed — swap the pointer, keep the cache, done.
+		//  2. analyzer-equivalent spec (same name path, columns,
+		//     primary key, anonymization option): the registered
+		//     SimpleTable handle is still accurate. Swap the Go-side
+		//     registries and invalidate the analysis cache (Query /
+		//     DefaultExpr / options may differ — those are read from
+		//     tableMap at lowering time, so the pointer swap is
+		//     enough) but skip the wasm rebuild entirely.
+		//  3. schema change (issue #10): rebuild via resetCatalog.
+		//     The wasm-side SimpleCatalog has no table-removal API
+		//     and addTableSpecRecursive skips already-registered
+		//     names, so a fresh catalog is the only way to shed the
+		//     stale SimpleTable handle under every lookup alias.
+		identical := tableSpecsEqualIgnoringTimes(old, spec)
 		c.tableMap[tableName] = spec
 		for i := range c.tables {
 			if c.tables[i].TableName() == tableName {
@@ -2320,11 +2373,19 @@ func (c *Catalog) addTableSpec(spec *TableSpec) error {
 				break
 			}
 		}
+		if identical {
+			return nil
+		}
+		c.bumpAnalysisGeneration()
+		if tableSpecsAnalyzerEquivalent(old, spec) {
+			return nil
+		}
 		if err := c.resetCatalog(c.tables, c.functions, c.tvfs); err != nil {
 			return fmt.Errorf("failed to rebuild catalog for replaced table %q: %w", tableName, err)
 		}
 		return nil
 	}
+	c.bumpAnalysisGeneration()
 	c.tables = append(c.tables, spec)
 	c.tableMap[tableName] = spec
 	if err := c.addTableSpecRecursive(c.catalog, spec); err != nil {
@@ -2348,6 +2409,81 @@ func (c *Catalog) addTableSpec(spec *TableSpec) error {
 		}
 	}
 	return nil
+}
+
+// tableSpecsEqualIgnoringTimes reports whether two table specs are
+// byte-identical in their canonical JSON encoding once the
+// bookkeeping timestamps are zeroed. Used by addTableSpec to detect
+// Sync echoes: saveTableSpec bumps updatedAt on every save, so the
+// next Sync re-reads and re-adds a spec this process already holds.
+func tableSpecsEqualIgnoringTimes(a, b *TableSpec) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	ca, cb := *a, *b
+	ca.UpdatedAt, ca.CreatedAt = time.Time{}, time.Time{}
+	cb.UpdatedAt, cb.CreatedAt = time.Time{}, time.Time{}
+	ja, errA := json.Marshal(&ca)
+	jb, errB := json.Marshal(&cb)
+	return errA == nil && errB == nil && bytes.Equal(ja, jb)
+}
+
+// tableSpecsAnalyzerEquivalent reports whether two specs produce
+// indistinguishable analyzer-side registrations. tableHandleForSpec
+// reads the NamePath (which also fixes the alias set), the column
+// names and types, PrimaryKey, and the anonymization_userid_column
+// option — nothing else on the spec reaches the SimpleTable handle.
+// A view<->table flip is treated as a change out of caution even
+// though the handle itself would not differ.
+func tableSpecsAnalyzerEquivalent(a, b *TableSpec) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if a.IsView != b.IsView {
+		return false
+	}
+	if !slices.Equal(a.NamePath, b.NamePath) || !slices.Equal(a.PrimaryKey, b.PrimaryKey) {
+		return false
+	}
+	if len(a.Columns) != len(b.Columns) {
+		return false
+	}
+	for i := range a.Columns {
+		ca, cb := a.Columns[i], b.Columns[i]
+		if ca == nil || cb == nil {
+			if ca != cb {
+				return false
+			}
+			continue
+		}
+		if ca.Name != cb.Name || !columnTypesEqual(ca.Type, cb.Type) {
+			return false
+		}
+	}
+	return anonymizationUserIDColumn(a.Options) == anonymizationUserIDColumn(b.Options)
+}
+
+// columnTypesEqual compares two column type trees structurally via
+// their JSON encoding (Type is a plain JSON-codable value tree).
+func columnTypesEqual(a, b *Type) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	ja, errA := json.Marshal(a)
+	jb, errB := json.Marshal(b)
+	return errA == nil && errB == nil && bytes.Equal(ja, jb)
+}
+
+// anonymizationUserIDColumn extracts the analyzer-visible
+// anonymization_userid_column option value (see applyTableOptions);
+// empty string when the option is absent.
+func anonymizationUserIDColumn(opts []*tableOptionSpec) string {
+	for _, o := range opts {
+		if o != nil && strings.EqualFold(o.Name, "anonymization_userid_column") {
+			return stripQuotes(strings.TrimSpace(o.Value))
+		}
+	}
+	return ""
 }
 
 func (c *Catalog) addTableSpecRecursive(cat *googlesql.SimpleCatalog, spec *TableSpec) error {
