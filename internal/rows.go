@@ -87,12 +87,22 @@ func (r *Rows) Next(dest []driver.Value) error {
 		return unwrapSQLiteUserError(err)
 	}
 	colTypes := r.columnTypes()
-	values := make([]any, 0, len(dest))
-	for range dest {
+	scanCols, err := r.rows.Columns()
+	if err != nil {
+		return err
+	}
+	if len(scanCols) < len(dest) {
+		return fmt.Errorf("row scan returned %d columns; want at least %d", len(scanCols), len(dest))
+	}
+	values := make([]any, 0, len(scanCols))
+	for range scanCols {
 		var v any
 		values = append(values, &v)
 	}
 	retErr := r.rows.Scan(values...)
+	if retErr != nil {
+		return retErr
+	}
 	destV := reflect.ValueOf(dest)
 	for idx, colType := range colTypes {
 		src := reflect.ValueOf(values[idx]).Elem().Interface()
@@ -101,7 +111,7 @@ func (r *Rows) Next(dest []driver.Value) error {
 			return err
 		}
 	}
-	return retErr
+	return nil
 }
 
 func (r *Rows) assignValue(src any, dst reflect.Value, typ *Type) error {

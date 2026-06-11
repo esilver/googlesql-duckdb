@@ -629,15 +629,22 @@ func (a *ExportDataStmtAction) export(ctx context.Context, conn *Conn) error {
 // nil) terminator surfaces both natural end-of-stream and an underlying
 // scan error (via rows.Err()).
 func sqlRowsSource(rows *sql.Rows, ncols int) exportdata.RowSource {
+	scanCols, scanColsErr := rows.Columns()
 	return func() ([]any, bool, error) {
+		if scanColsErr != nil {
+			return nil, false, fmt.Errorf("EXPORT DATA: read inner query columns: %w", scanColsErr)
+		}
+		if len(scanCols) < ncols {
+			return nil, false, fmt.Errorf("EXPORT DATA: inner query returned %d columns; want at least %d", len(scanCols), ncols)
+		}
 		if !rows.Next() {
 			if err := rows.Err(); err != nil {
 				return nil, false, fmt.Errorf("EXPORT DATA: iterate inner query: %w", err)
 			}
 			return nil, false, nil
 		}
-		raw := make([]any, ncols)
-		ptrs := make([]any, ncols)
+		raw := make([]any, len(scanCols))
+		ptrs := make([]any, len(scanCols))
 		for i := range raw {
 			ptrs[i] = &raw[i]
 		}
@@ -645,7 +652,7 @@ func sqlRowsSource(rows *sql.Rows, ncols int) exportdata.RowSource {
 			return nil, false, fmt.Errorf("EXPORT DATA: scan row: %w", err)
 		}
 		out := make([]any, ncols)
-		for i, v := range raw {
+		for i, v := range raw[:ncols] {
 			decoded, err := decodeExportValue(v)
 			if err != nil {
 				return nil, false, fmt.Errorf("EXPORT DATA: decode column %d: %w", i, err)

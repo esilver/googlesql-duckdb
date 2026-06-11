@@ -4598,12 +4598,17 @@ func (n *SubqueryExprNode) FormatSQL(ctx context.Context) (string, error) {
 	}
 	columnNames := &arraySubqueryColumnNames{}
 	ctx = withArraySubqueryColumnName(ctx, columnNames)
-	sql, err := newNode(m1(n.node.Subquery())).FormatSQL(ctx)
+	subquery := m1(n.node.Subquery())
+	sql, err := newNode(subquery).FormatSQL(ctx)
 	if err != nil {
 		return "", err
 	}
 	switch m1(n.node.SubqueryType()) {
 	case googlesql.ResolvedSubqueryExprEnums_SubqueryTypeScalar:
+		valueSelect, err := formatSingleValueSubquery(ctx, subquery, sql)
+		if err != nil {
+			return "", err
+		}
 		if inSafeEvalMode(ctx) {
 			// GoogleSQL raises an error when a scalar subquery returns
 			// more than one row. In IFERROR / ISERROR / NULLIFERROR
@@ -4617,10 +4622,11 @@ func (n *SubqueryExprNode) FormatSQL(ctx context.Context) (string, error) {
 			// still forces the NULL fold. Re-evaluates the sub-select
 			// twice - acceptable in error-handling expressions.
 			return fmt.Sprintf(
-				"(SELECT CASE WHEN (SELECT COUNT(*) FROM (%s)) = 1 THEN (SELECT * FROM (%s) LIMIT 1) ELSE NULL END)",
-				sql, sql,
+				"(SELECT CASE WHEN (SELECT COUNT(*) FROM (%s)) = 1 THEN (%s LIMIT 1) ELSE NULL END)",
+				sql, valueSelect,
 			), nil
 		}
+		return fmt.Sprintf("(%s)", valueSelect), nil
 	case googlesql.ResolvedSubqueryExprEnums_SubqueryTypeArray:
 		subCols := m1(m1(n.node.Subquery()).MutableColumnList())
 		if len(subCols) == 0 {
@@ -4660,15 +4666,28 @@ func (n *SubqueryExprNode) FormatSQL(ctx context.Context) (string, error) {
 		if err != nil {
 			return "", err
 		}
+		valueSelect, err := formatSingleValueSubquery(ctx, subquery, sql)
+		if err != nil {
+			return "", err
+		}
 		// DuckDB retarget: DuckDB has no googlesqlite_collate callback
 		// collation, so IN compares the value-layer encoding directly.
 		// The anonymous-vs-named STRUCT positional-equality edge case is
 		// handled in the STRUCT family, not here.
-		return fmt.Sprintf("%s IN (%s)", expr, sql), nil
+		return fmt.Sprintf("%s IN (%s)", expr, valueSelect), nil
 	case googlesql.ResolvedSubqueryExprEnums_SubqueryTypeLikeAny:
 	case googlesql.ResolvedSubqueryExprEnums_SubqueryTypeLikeAll:
 	}
 	return fmt.Sprintf("(%s)", sql), nil
+}
+
+func formatSingleValueSubquery(ctx context.Context, subquery googlesql.ResolvedScanNode, sql string) (string, error) {
+	subCols := m1(subquery.MutableColumnList())
+	if len(subCols) == 0 {
+		return "", fmt.Errorf("failed to find computed column names for value subquery")
+	}
+	colName := uniqueColumnName(ctx, subCols[0])
+	return fmt.Sprintf("SELECT \"%s\" FROM (%s)", colName, sql), nil
 }
 
 func (n *SingleRowScanNode) FormatSQL(ctx context.Context) (string, error) {
