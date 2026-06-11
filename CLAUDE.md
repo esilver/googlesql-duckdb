@@ -123,3 +123,9 @@ docs/third_party/googlesql-docs/  Apache-2.0 snapshot of upstream googlesql/docs
 tools/       tool-only Go module (golangci-lint, etc.)
 ```
 
+
+## Commit identity
+
+Author and commit as `Eli Silver <6341360+esilver@users.noreply.github.com>`.
+Never use a corporate email address in commits, tags, or any published
+artifact. Co-Authored-By trailers for AI assistants are fine.
