@@ -123,6 +123,57 @@ type propertyGraphSpec struct {
 	EdgeTables []string
 }
 
+// catalogLangOpts returns the process-wide LanguageOptions used for
+// builtin registration at catalog construction. resetCatalog rebuilds
+// the SimpleCatalog on every DDL mutation — a dbt build does this per
+// node — and each rebuild previously created and abandoned a fresh
+// wasm-side LanguageOptions, arming one GC finalizer per node
+// (googlesqlite#16: the production crash trace is exactly
+// LanguageOptions.free on the runtime-finalizer goroutine). The
+// options are pure configuration read by AddGoogleSQLFunctions2, so
+// one shared instance is correct, kills the churn, and skips the
+// per-rebuild maximum-features setup calls.
+var catalogLangOpts = sync.OnceValue(func() *googlesql.LanguageOptions {
+	opts, err := googlesql.NewLanguageOptionsMaximumFeatures()
+	if err != nil || opts == nil {
+		return nil
+	}
+	// Explicitly enable the Anonymization / Differential
+	// Privacy language features. NewLanguageOptionsMaximumFeatures
+	// does NOT include them by default (DP/Anon are gated as
+	// "in development"), so without these the catalog wouldn't
+	// even contain the DP signature ids we ask for via
+	// IncludeFunctionIds.
+	for _, f := range []googlesql.LanguageFeature{
+		googlesql.LanguageFeatureFeatureDifferentialPrivacy,
+		googlesql.LanguageFeatureFeatureDifferentialPrivacyThresholding,
+		googlesql.LanguageFeatureFeatureDifferentialPrivacyReportFunctions,
+		googlesql.LanguageFeatureFeatureAnonymization,
+		googlesql.LanguageFeatureFeatureAnonymizationThresholding,
+		// AEAD / KEYS encryption family is gated behind the
+		// Encryption feature flag — not on by default in
+		// NewLanguageOptionsMaximumFeatures.
+		googlesql.LanguageFeatureFeatureEncryption,
+		// GoogleSQL proto-reflection feature flags. Enabling
+		// these on the catalog-construction options ensures the
+		// proto family is included in the builtin function set
+		// when Conn.RegisterProto plugs a DescriptorPool into
+		// the catalog.
+		googlesql.LanguageFeatureFeatureProtoBase,
+		googlesql.LanguageFeatureFeatureProtoDefaultIfNull,
+		googlesql.LanguageFeatureFeatureExtractFromProto,
+		googlesql.LanguageFeatureFeatureReplaceFields,
+		googlesql.LanguageFeatureFeatureFilterFields,
+		googlesql.LanguageFeatureFeatureProtoMaps,
+		googlesql.LanguageFeatureFeatureProtoExtensionsWithNew,
+		googlesql.LanguageFeatureFeatureProtoExtensionsWithSet,
+		googlesql.LanguageFeatureFeatureEnumValueDescriptorProto,
+	} {
+		_ = opts.EnableLanguageFeature(f)
+	}
+	return opts
+})
+
 func newSimpleCatalog(name string) *googlesql.SimpleCatalog {
 	catalog, err := googlesql.NewSimpleCatalog(name, tf())
 	if err != nil {
@@ -134,40 +185,7 @@ func newSimpleCatalog(name string) *googlesql.SimpleCatalog {
 	// for callers that turn the matching analyzer feature on. Having
 	// extras in the catalog is harmless — the analyzer's own
 	// LanguageOptions gates whether each call site can use them.
-	if opts, err := googlesql.NewLanguageOptionsMaximumFeatures(); err == nil && opts != nil {
-		// Explicitly enable the Anonymization / Differential
-		// Privacy language features. NewLanguageOptionsMaximumFeatures
-		// does NOT include them by default (DP/Anon are gated as
-		// "in development"), so without these the catalog wouldn't
-		// even contain the DP signature ids we ask for via
-		// IncludeFunctionIds.
-		for _, f := range []googlesql.LanguageFeature{
-			googlesql.LanguageFeatureFeatureDifferentialPrivacy,
-			googlesql.LanguageFeatureFeatureDifferentialPrivacyThresholding,
-			googlesql.LanguageFeatureFeatureDifferentialPrivacyReportFunctions,
-			googlesql.LanguageFeatureFeatureAnonymization,
-			googlesql.LanguageFeatureFeatureAnonymizationThresholding,
-			// AEAD / KEYS encryption family is gated behind the
-			// Encryption feature flag — not on by default in
-			// NewLanguageOptionsMaximumFeatures.
-			googlesql.LanguageFeatureFeatureEncryption,
-			// GoogleSQL proto-reflection feature flags. Enabling
-			// these on the catalog-construction options ensures the
-			// proto family is included in the builtin function set
-			// when Conn.RegisterProto plugs a DescriptorPool into
-			// the catalog.
-			googlesql.LanguageFeatureFeatureProtoBase,
-			googlesql.LanguageFeatureFeatureProtoDefaultIfNull,
-			googlesql.LanguageFeatureFeatureExtractFromProto,
-			googlesql.LanguageFeatureFeatureReplaceFields,
-			googlesql.LanguageFeatureFeatureFilterFields,
-			googlesql.LanguageFeatureFeatureProtoMaps,
-			googlesql.LanguageFeatureFeatureProtoExtensionsWithNew,
-			googlesql.LanguageFeatureFeatureProtoExtensionsWithSet,
-			googlesql.LanguageFeatureFeatureEnumValueDescriptorProto,
-		} {
-			_ = opts.EnableLanguageFeature(f)
-		}
+	if opts := catalogLangOpts(); opts != nil {
 		// Combine the public-builtin registration and the DP/Anon
 		// IncludeFunctionIds into a single AddGoogleSQLFunctions2
 		// call. Calling AddGoogleSQLFunctions3 first and then
