@@ -1510,6 +1510,15 @@ func (a *Analyzer) Analyze(ctx context.Context, conn *Conn, query string, args [
 	// AnalyzerOptions. See the doc on sharedAnalyzerOpt above.
 	wasmAnalyzeMu.Lock()
 	defer wasmAnalyzeMu.Unlock()
+	// Analyzer fairness (#18 follow-up): a caller whose context died while
+	// queued for this mutex must not run catalog sync + parse + analysis —
+	// those wasm spans are un-interruptible, and under a cancellation storm
+	// (a client in a tight timeout-retry loop, every query's text unique so
+	// the analysis cache never hits) the doomed analyses monopolize the
+	// analyzer and starve live callers.
+	if cerr := ctx.Err(); cerr != nil {
+		return nil, cerr
+	}
 	if err := a.catalog.Sync(ctx, conn); err != nil {
 		return nil, fmt.Errorf("failed to sync catalog: %w", err)
 	}
