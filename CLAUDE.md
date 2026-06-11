@@ -123,4 +123,3 @@ docs/third_party/googlesql-docs/  Apache-2.0 snapshot of upstream googlesql/docs
 tools/       tool-only Go module (golangci-lint, etc.)
 ```
 
-See `.claude/plans/` for the working architectural plan.

@@ -147,7 +147,6 @@ step 3-4 is the simplest proof the engine works end to end.)
   verified path here.
 - **Conformance is commit-pinned:** the authoritative number for this commit is
   **972/994**. Re-measure after any change.
-- **Architecture/history:** see design notes in the conformance
-  history; the engine lowers ZetaSQL-analyzed AST to DuckDB SQL + registers BigQuery
+- **Architecture/history:** the engine lowers ZetaSQL-analyzed AST to DuckDB SQL + registers BigQuery
   builtins as DuckDB scalar / aggregate (via the C `duckdb_create_aggregate_function`
   binding) / table UDFs.

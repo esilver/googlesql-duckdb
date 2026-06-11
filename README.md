@@ -127,4 +127,3 @@ significantly cut development costs. Could you return a small part of
 those savings to me? I believe doing so leads to a better future for
 both me and your company.
 
-See `CLAUDE.md` for the project's working rules.
