@@ -21,9 +21,29 @@ func (n *unknownNode) FormatSQL(_ context.Context) (string, error) {
 	return "", fmt.Errorf("internal: newNode: no formatter registered for ResolvedNodeKind %s", n.kind)
 }
 
+// nilResolvedNode is the Formatter newNode returns for a nil resolved
+// node. Resolved-AST accessors on the analyzer module return
+// (nil, nil) when the requested child handle reads as 0 — a shape that
+// is normally guarded by a node-level nil check at the call site, but
+// that also appears WITHOUT warning when the analyzer module is in a
+// degraded state (heap exhaustion / a trap mid-walk; issue #18: under
+// churn a CREATE OR REPLACE statement's accessor read produced a nil
+// node and the previous `return nil` here turned the very next
+// FormatSQL call into a nil-interface method-call panic, recovered at
+// the driver seam as a poisoned conn). Returning a loud-failing
+// Formatter instead converts every such miss — at all ~50
+// newNode(...).FormatSQL call sites, current and future — into an
+// ordinary error at format time while keeping the call sites
+// untouched.
+type nilResolvedNode struct{}
+
+func (nilResolvedNode) FormatSQL(_ context.Context) (string, error) {
+	return "", fmt.Errorf("internal: newNode: nil resolved node (analyzer accessor returned no node; possible analyzer-module failure or freed handle)")
+}
+
 func newNode(node googlesql.ResolvedNode) Formatter {
 	if node == nil {
-		return nil
+		return nilResolvedNode{}
 	}
 	kind := m1(node.NodeKind())
 	switch kind {
