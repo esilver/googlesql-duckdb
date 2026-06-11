@@ -24,3 +24,7 @@ type Decimal = convergeduckdb.Decimal
 // Go string; consumers above the duckdbgo façade (internal.DecodeValue and
 // the value-layer foreign-decoder hook) type-switch through this alias.
 type JSONValue = convergeduckdb.JSONValue
+
+// Interval mirrors duckdb-go's INTERVAL carrier. The pure-Go engine returns
+// this value directly for native INTERVAL result columns.
+type Interval = convergeduckdb.Interval

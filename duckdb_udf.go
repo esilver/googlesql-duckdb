@@ -55,6 +55,9 @@ func registerDuckDBUDFs(db *sql.DB) error {
 	if err := duckdb.RegisterScalarUDF(conn, "googlesqlite_unnest_temporal", &unnestTemporalUDF{}); err != nil {
 		return fmt.Errorf("googlesqlite: register googlesqlite_unnest_temporal: %w", err)
 	}
+	if err := duckdb.RegisterScalarUDF(conn, "googlesqlite_timestamp_envelope", &timestampEnvelopeUDF{}); err != nil {
+		return fmt.Errorf("googlesqlite: register googlesqlite_timestamp_envelope: %w", err)
+	}
 	if err := duckdb.RegisterScalarUDF(conn, "googlesqlite_cast", &castUDF{}); err != nil {
 		return fmt.Errorf("googlesqlite: register googlesqlite_cast: %w", err)
 	}
@@ -355,6 +358,31 @@ func (*unnestTemporalUDF) Executor() duckdb.ScalarFuncExecutor {
 				return nil, fmt.Errorf("googlesqlite_unnest_temporal: want 2 args, got %d", len(values))
 			}
 			return internal.GoogleSQLUnnestTemporal(values[0], values[1])
+		},
+	}
+}
+
+// timestampEnvelopeUDF preserves TIMESTAMP identity for polymorphic UDF
+// arguments whose DuckDB ANY carrier is otherwise an untyped time.Time.
+type timestampEnvelopeUDF struct{}
+
+func (*timestampEnvelopeUDF) Config() duckdb.ScalarFuncConfig {
+	varchar, _ := duckdb.NewTypeInfo(duckdb.TYPE_VARCHAR)
+	anyType, _ := duckdb.NewTypeInfo(duckdb.TYPE_ANY)
+	return duckdb.ScalarFuncConfig{
+		InputTypeInfos:      []duckdb.TypeInfo{anyType},
+		ResultTypeInfo:      varchar,
+		SpecialNullHandling: true,
+	}
+}
+
+func (*timestampEnvelopeUDF) Executor() duckdb.ScalarFuncExecutor {
+	return duckdb.ScalarFuncExecutor{
+		RowExecutor: func(values []driver.Value) (any, error) {
+			if len(values) != 1 {
+				return nil, fmt.Errorf("googlesqlite_timestamp_envelope: want 1 arg, got %d", len(values))
+			}
+			return internal.GoogleSQLTimestampEnvelope(values[0])
 		},
 	}
 }

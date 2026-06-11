@@ -170,6 +170,32 @@ func GoogleSQLUnnestTemporal(elem, kind any) (any, error) {
 	return nil, fmt.Errorf("googlesqlite_unnest_temporal: unknown kind %q", kindName)
 }
 
+// GoogleSQLTimestampEnvelope wraps a DuckDB-native TIMESTAMPTZ carrier in the
+// value-layer TIMESTAMP envelope before handing it to polymorphic UDFs. DuckDB's
+// ANY UDF carrier erases TIMESTAMP-vs-DATETIME to a bare time.Time; the
+// formatter inserts this bridge only at call sites where the resolved argument
+// kind is TIMESTAMP.
+func GoogleSQLTimestampEnvelope(v any) (any, error) {
+	if v == nil {
+		return nil, nil
+	}
+	if t, ok := v.(time.Time); ok {
+		return value.EncodeValue(value.TimestampValue(t))
+	}
+	decoded, err := DecodeValue(v)
+	if err != nil {
+		return nil, err
+	}
+	if decoded == nil {
+		return nil, nil
+	}
+	t, err := decoded.ToTime()
+	if err != nil {
+		return nil, err
+	}
+	return value.EncodeValue(value.TimestampValue(t))
+}
+
 // parseTemporalElementText parses the plain-text temporal forms a
 // DuckDB-native LIST element can arrive in: RFC3339 (json.Marshal of a Go
 // time.Time), the DuckDB render of a TIMESTAMP/DATETIME, a bare DATE, or a

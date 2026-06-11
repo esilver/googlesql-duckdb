@@ -1407,6 +1407,8 @@ var sqlRewritePipelinePreScriptVars = []sqlRewriteStep{
 // sqlRewritePipelinePostScriptVars holds the uniform-signature rewrites
 // that run after applyScriptVariables. ORDER IS LOAD-BEARING.
 var sqlRewritePipelinePostScriptVars = []sqlRewriteStep{
+	{"timestampDiffWeekRewrite", applyTimestampDiffWeekRewrite},
+	{"extractAtTimeZoneRewrite", applyExtractAtTimeZoneRewrite},
 	{"gapFillRewrite", applyGapFillRewrite},
 	{"rangeSessionizeRewrite", applyRangeSessionizeRewrite},
 	{"iferrorTypePropagation", applyIferrorTypePropagation},

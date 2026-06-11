@@ -1283,6 +1283,10 @@ func FormatTime(formatStr string, t *time.Time, typ TimeFormatType) (string, err
 				i += formatProgress
 				continue
 			}
+			if c == 't' && typ == FormatTypeTimestamp {
+				ret = append(ret, []rune(t.UTC().Format("2006-01-02 15:04:05")+"+00")...)
+				continue
+			}
 			info := formatPatternMap[c]
 			if info == nil {
 				return "", fmt.Errorf("unexpected format type %%%c", c)

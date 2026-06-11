@@ -642,6 +642,9 @@ func (n *FunctionCallNode) FormatSQL(ctx context.Context) (string, error) {
 	if spec, exists := funcMap[funcName]; exists {
 		return spec.CallSQL(ctx, n.node.ResolvedFunctionCallBase, args)
 	}
+	if funcName == "googlesqlite_format" || funcName == "googlesqlite_safe_format" {
+		args = wrapFormatTimestampArgs(args, argKinds(m1(n.node.ArgumentList())))
+	}
 	// DuckDB retarget: a handful of scalar built-ins resolve to their bare
 	// catalog name here (the SQLite normalFuncMap is never populated on
 	// this target) but DuckDB spells the equivalent function differently.
@@ -653,6 +656,20 @@ func (n *FunctionCallNode) FormatSQL(ctx context.Context) (string, error) {
 		funcName,
 		strings.Join(args, ","),
 	), nil
+}
+
+func wrapFormatTimestampArgs(args []string, kinds []googlesql.TypeKind) []string {
+	if len(args) < 2 {
+		return args
+	}
+	wrapped := make([]string, len(args))
+	copy(wrapped, args)
+	for i := 1; i < len(wrapped); i++ {
+		if kindAt(kinds, i) == googlesql.TypeKindTypeTimestamp {
+			wrapped[i] = fmt.Sprintf("googlesqlite_timestamp_envelope(%s)", wrapped[i])
+		}
+	}
+	return wrapped
 }
 
 // duckDBRangeFuncRemap maps the bare GoogleSQL RANGE-family function
@@ -2430,6 +2447,17 @@ func (n *FunctionCallNode) tryFormatExtract(_ context.Context, funcName string, 
 		return fmt.Sprintf("CAST(%s AS TIMESTAMP)", args[0]), true, nil
 	}
 	p, _ := duckDBDatePart(body)
+	switch strings.ToUpper(body) {
+	case "ISOWEEK":
+		return fmt.Sprintf(
+			"CAST(floor((date_diff('day', %s, CAST(%s AS DATE)) / 7.0) + 1) AS BIGINT)",
+			duckDBISOYearStartSQL(args[0]), args[0],
+		), true, nil
+	case "ISOYEAR":
+		return fmt.Sprintf("CAST(date_part('isoyear', CAST(%s AS DATE)) AS BIGINT)", args[0]), true, nil
+	case "WEEK":
+		return duckDBSundayWeekNumberSQL(args[0], 0), true, nil
+	}
 	return fmt.Sprintf("date_part(%s, %s)", sqlStringLiteral(p), args[0]), true, nil
 }
 

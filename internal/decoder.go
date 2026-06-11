@@ -3,6 +3,7 @@ package internal
 import (
 	"math/big"
 
+	"cloud.google.com/go/bigquery"
 	duckdb "github.com/goccy/googlesqlite/internal/duckdbgo"
 
 	"github.com/goccy/googlesqlite/internal/value"
@@ -28,6 +29,9 @@ func DecodeValue(v any) (value.Value, error) {
 		if _, ok := r.SetString(dec.String()); ok {
 			return &value.NumericValue{Rat: r}, nil
 		}
+	}
+	if iv, ok := v.(duckdb.Interval); ok {
+		return intervalValueFromDuckDB(iv), nil
 	}
 	// duckdb-go-pure >= v0.3.3 scans JSON-alias RESULT cells as
 	// duckdb.JSONValue (the raw JSON text, type-marked) instead of the
@@ -62,6 +66,13 @@ func init() {
 		}
 		return &value.NumericValue{Rat: r}, true
 	})
+	value.RegisterForeignDecoder(func(v any) (value.Value, bool) {
+		iv, ok := v.(duckdb.Interval)
+		if !ok {
+			return nil, false
+		}
+		return intervalValueFromDuckDB(iv), true
+	})
 	// Same hook for duckdb.JSONValue, so JSON-alias cells reached through
 	// the recursion paths (LIST elements, STRUCT fields, UDF arguments
 	// that skip the duckdbgo jsonAwareExecutor normalization) parse to
@@ -79,4 +90,31 @@ func init() {
 		}
 		return dv, true
 	})
+}
+
+func intervalValueFromDuckDB(iv duckdb.Interval) value.Value {
+	const (
+		microsPerSecond = int64(1000000)
+		microsPerMinute = 60 * microsPerSecond
+		microsPerHour   = 60 * microsPerMinute
+	)
+	months := iv.Months
+	years := months / 12
+	months = months % 12
+	micros := iv.Micros
+	hours := micros / microsPerHour
+	micros %= microsPerHour
+	minutes := micros / microsPerMinute
+	micros %= microsPerMinute
+	seconds := micros / microsPerSecond
+	micros %= microsPerSecond
+	return &value.IntervalValue{IntervalValue: &bigquery.IntervalValue{
+		Years:          years,
+		Months:         months,
+		Days:           iv.Days,
+		Hours:          int32(hours),
+		Minutes:        int32(minutes),
+		Seconds:        int32(seconds),
+		SubSecondNanos: int32(micros * 1000),
+	}}
 }
