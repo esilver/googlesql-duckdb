@@ -99,6 +99,26 @@ func DecodeValue(v any) (Value, error) {
 	}
 	v = coerceJSONNumber(v)
 	switch vv := v.(type) {
+	case time.Time:
+		// Engine-native temporal carrier (bigquery-emulator issue #17): a
+		// stored DATE / TIME / DATETIME / TIMESTAMP column (or a native
+		// temporal literal) that reaches a value-layer UDF argument, LIST
+		// element or STRUCT field arrives as a bare Go time.Time — the
+		// duckdb-go UDF codec decodes every temporal vector uniformly to a
+		// UTC time.Time and the logical column type is not carried along
+		// (DATE = midnight UTC, TIME = epoch day + clock, TIMESTAMP /
+		// DATETIME = the instant; see duckdb-go-pure udf_codec readCellT).
+		// The kind is therefore inferred from the carrier's shape. Every
+		// value-layer comparison (EQ/GT/GTE/LT/LTE on all four temporal
+		// kinds) funnels through ToTime on the SAME underlying time.Time,
+		// so ordering and equality — the operations that route raw native
+		// temporals here (e.g. googlesqlite_between for
+		// `d BETWEEN DATE '...' AND DATE '...'`) — are exact regardless of
+		// which temporal kind the inference picks; only kind-sensitive
+		// rendering can differ for the ambiguous midnight / epoch-day
+		// shapes, and those sites previously failed outright with
+		// "unexpected value type: time.Time".
+		return decodeNativeTime(vv), nil
 	case int64:
 		return IntValue(vv), nil
 	// DuckDB returns narrower integer widths natively (e.g. INT -> int32,
@@ -225,6 +245,37 @@ func DecodeValue(v any) (Value, error) {
 		return dv, err
 	}
 	return StringValue(s), nil
+}
+
+// decodeNativeTime wraps an engine-native bare time.Time carrier into the
+// temporal Value whose kind its shape implies. The duckdb-go UDF codec
+// produces every temporal as a UTC time.Time with the logical type erased:
+//
+//   - engine DATE        -> midnight UTC of the civil date
+//   - engine TIME        -> epoch day (1970-01-01) + the time of day
+//   - engine TIMESTAMP   -> the civil micros (gsx DATETIME storage)
+//   - engine TIMESTAMPTZ -> the absolute instant (gsx TIMESTAMP storage)
+//
+// Inference: an exact-midnight value reads as DATE (true for every engine
+// DATE cell; a TIMESTAMP/DATETIME landing exactly on midnight gets the DATE
+// reading — comparisons stay exact via ToTime, and its "2006-01-02" string
+// form casts back to all three types as the same instant under the
+// UTC-pinned session). A non-midnight value on the epoch day reads as TIME
+// (true for every engine TIME cell). Everything else reads as DATETIME:
+// TIMESTAMP and DATETIME carriers are indistinguishable, and the civil
+// "2006-01-02T15:04:05" rendering is interpretation-neutral — it re-parses
+// into both DuckDB TIMESTAMP and TIMESTAMPTZ as the same instant, whereas
+// an RFC3339 "Z" rendering would assert instant-ness a true DATETIME does
+// not have.
+func decodeNativeTime(t time.Time) Value {
+	h, m, s := t.Clock()
+	if h == 0 && m == 0 && s == 0 && t.Nanosecond() == 0 {
+		return DateValue(t)
+	}
+	if y, mo, d := t.Date(); y == 1970 && mo == time.January && d == 1 {
+		return TimeValue(t)
+	}
+	return DatetimeValue(t)
 }
 
 // decodeEnvelopeString probes s for the canonical value-layer carrier
