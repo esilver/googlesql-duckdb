@@ -2,6 +2,7 @@ package internal
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/goccy/go-json"
@@ -224,8 +225,22 @@ func GoogleSQLCast(expr, fromType, toType, isSafe any) (any, error) {
 	// GoogleSQLDecodeScalar. Without this, the ANON_AVG partial rewrite, which
 	// emits CAST(googlesqlite_cast(x, INT64, DOUBLE, false) AS DOUBLE), fails
 	// before the outer CAST can apply.
-	if s, ok := encoded.(string); ok {
-		return s, nil
+	switch ev := encoded.(type) {
+	case string:
+		return ev, nil
+	case float64:
+		// json.Marshal rejects NaN / ±Inf, but GoogleSQL CAST('NaN' AS
+		// FLOAT64) is legal and a FLOAT64 cast result rides this textual
+		// path (the formatter wraps the call in CAST(... AS DOUBLE)).
+		// Emit the spellings DuckDB's VARCHAR->DOUBLE cast parses.
+		switch {
+		case math.IsNaN(ev):
+			return "nan", nil
+		case math.IsInf(ev, 1):
+			return "inf", nil
+		case math.IsInf(ev, -1):
+			return "-inf", nil
+		}
 	}
 	b, err := json.Marshal(encoded)
 	if err != nil {

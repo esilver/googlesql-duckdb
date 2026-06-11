@@ -866,10 +866,11 @@ func tryNativeOperator(funcName string, args []string, kinds []googlesql.TypeKin
 		// `*(JSON, INTEGER_LITERAL)` for ARRAY_TRANSFORM([1,2,3], e -> e*2).
 		// Cast each operand to its analyzer-resolved scalar type so the
 		// arithmetic binds natively. The cast is idempotent for operands
-		// that are already native (literals, prior casts). The comparison
-		// operators are left untouched: their operands are compared in the
-		// value-layer form (struct / string equality relies on the envelope),
-		// and json_each.value comparisons already round-trip through the
+		// that are already native (literals, prior casts). The equality
+		// operators (=, <>) are left untouched: their operands are compared
+		// in the value-layer form (struct / string equality relies on the
+		// envelope, whose encoding is deterministic and injective), and
+		// json_each.value comparisons already round-trip through the
 		// forgiving spec comparator.
 		if isArithmeticOperator(op) {
 			// temporal +/- INTERVAL: the resolved tree reaches here as
@@ -901,6 +902,38 @@ func tryNativeOperator(funcName string, args []string, kinds []googlesql.TypeKin
 				}
 			}
 			return fmt.Sprintf("(%s %s %s)", castOperandToKind(args[0], kindAt(kinds, 0)), tok, castOperandToKind(args[1], kindAt(kinds, 1))), true
+		}
+		// ORDERING comparisons (<, <=, >, >=) over STRING / UUID operands
+		// must compare the PAYLOAD text, not the value-layer envelope: the
+		// envelope is base64 of {"header":"string","body":...}, and
+		// base64's alphabet order ('A'-'Z' < 'a'-'z' < '0'-'9' in encoded
+		// value, but ASCII sorts digits BEFORE uppercase) is not monotonic
+		// over the encoded bytes, so envelope VARCHAR order does not track
+		// payload code-point order. Caught by the uuid spec: NEW_UUID() >=
+		// "00000000-..." flipped false for ~2.5% of UUIDs (a body starting
+		// '3'+[a-f] encodes a digit-class char where the zero envelope has
+		// 'D'). Unwrap both sides to plain text — UTF-8 byte order equals
+		// code-point order, GoogleSQL's STRING ordering — exactly the
+		// MIN/MAX STRING unwrap above (issue #9 coverage class). The wrap
+		// is a no-op for operands already in plain form (json_each.value
+		// strings, native VARCHAR), and NULL passes through.
+		//
+		// UUID rides the same unwrap: the analyzer types NEW_UUID() and
+		// its coerced literal as UUID, but the wire form is the STRING
+		// envelope holding the canonical lowercase-hex text. Canonical
+		// UUID text order IS the 128-bit value order (fixed length,
+		// lowercase hex, dashes at aligned positions), so the plain-text
+		// compare is exact. Deliberately NOT lowered to a native DuckDB
+		// UUID compare: engine-side UUID is a HUGEINT with the MSB
+		// flipped, whose raw order differs from a naive reading of the
+		// bits for the high-bit half of the space.
+		if isOrderingOperator(op) &&
+			isPlainTextOrderableKind(kindAt(kinds, 0)) &&
+			isPlainTextOrderableKind(kindAt(kinds, 1)) {
+			return fmt.Sprintf(
+				"(googlesqlite_plain_string(%s) %s googlesqlite_plain_string(%s))",
+				args[0], tok, args[1],
+			), true
 		}
 		return fmt.Sprintf("(%s %s %s)", args[0], tok, args[1]), true
 	}
@@ -3032,14 +3065,41 @@ func valueLayerScalarCastType(kind googlesql.TypeKind) (string, bool) {
 // isArithmeticOperator reports whether op is one of the additive /
 // multiplicative operator builtins whose operands must be native numerics
 // (so a JSON-typed array element needs a CAST). The comparison operators
-// in nativeBinaryOperators are excluded - they tolerate the value-layer
-// operand form.
+// in nativeBinaryOperators are excluded here — they bind against the
+// value-layer operand form — but the ORDERING subset gets its own STRING
+// unwrap (see isOrderingOperator).
 func isArithmeticOperator(op string) bool {
 	switch op {
 	case "add", "subtract", "multiply":
 		return true
 	}
 	return false
+}
+
+// isOrderingOperator reports whether op is one of the ordering comparison
+// builtins (<, <=, >, >=). Unlike equality, ordering over the value-layer
+// STRING envelope is incorrect (base64 text order is not monotonic with
+// payload order), so tryNativeOperator unwraps STRING operands to plain
+// text for these. Equality (=, <>) is excluded: the envelope encoding is
+// deterministic and injective, so envelope equality equals payload
+// equality, and struct equality relies on the envelope form.
+func isOrderingOperator(op string) bool {
+	switch op {
+	case "less", "less_or_equal", "greater", "greater_or_equal":
+		return true
+	}
+	return false
+}
+
+// isPlainTextOrderableKind reports whether kind's value-layer wire form is
+// a STRING envelope whose plain payload text orders identically to the
+// GoogleSQL value ordering: STRING itself (UTF-8 byte order == code-point
+// order) and UUID (canonical lowercase-hex text order == 128-bit value
+// order). Ordering comparisons over these kinds unwrap their operands
+// with googlesqlite_plain_string. Other envelope kinds (BYTES, NUMERIC,
+// temporals, ENUM) keep their existing lowering.
+func isPlainTextOrderableKind(kind googlesql.TypeKind) bool {
+	return kind == googlesql.TypeKindTypeString || kind == googlesql.TypeKindTypeUuid
 }
 
 // rangeEnvelopeArgs rewrites the formatted SQL of each temporal-typed
@@ -3214,10 +3274,29 @@ func (n *CastNode) FormatSQL(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf(
+	udf := fmt.Sprintf(
 		"googlesqlite_cast(%s, '%s', '%s', %t)",
 		expr, encodedFromType, encodedToType, m1(n.node.ReturnNullOnError()),
-	), nil
+	)
+	// Native-representable scalar targets (BOOL / INT64-family /
+	// FLOAT64-family) re-type the UDF's textual result with a wrapping
+	// native CAST, the same decode GetStructFieldNode applies to scalar
+	// struct fields. GoogleSQLCast already returns the plain parseable
+	// text ("true", "42", "1.5") for these kinds precisely so an outer
+	// DuckDB CAST can retype it. Without the wrap the cast result stays a
+	// VARCHAR, and any branching construct (COALESCE / IF / IFNULL /
+	// CASE) mixing it with a native-literal sibling fails DuckDB's binder
+	// ("Cannot mix values of type VARCHAR and BOOLEAN"), issue #15 — and
+	// ORDER BY / MIN / MAX over the cast result compare lexicographically.
+	// The native value is storage-safe too: BOOL / INT64 / FLOAT64
+	// columns are stored native (storageTypeForKind), so an INSERT of the
+	// cast result lands in the column type directly. Temporal targets are
+	// already native via tryNativeCast above; STRING / NUMERIC / BYTES /
+	// other envelope targets keep the envelope contract untouched.
+	if castType, ok := valueLayerScalarCastType(toType.kindAs()); ok {
+		return fmt.Sprintf("CAST(%s AS %s)", udf, castType), nil
+	}
+	return udf, nil
 }
 
 func (n *MakeStructNode) FormatSQL(ctx context.Context) (string, error) {
