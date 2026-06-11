@@ -536,7 +536,7 @@ func (n *FunctionCallNode) FormatSQL(ctx context.Context) (string, error) {
 			args[1],
 			args[0],
 		), nil
-	case "coalesce", "ifnull":
+	case "coalesce", "ifnull", "if", "nullif", "greatest", "least":
 		// COALESCE / IFNULL over NUMERIC operands (issue #21, dbt decimal-math
 		// shape COALESCE(CAST(col AS NUMERIC), 0)): since the native-storage
 		// migration a NUMERIC expression has TWO carrier forms — native
@@ -551,9 +551,24 @@ func (n *FunctionCallNode) FormatSQL(ctx context.Context) (string, error) {
 		// otherwise mirrors (both names reach the generic funcName(args) emit
 		// on the DuckDB path — the googlesqlite_ifnull CASE form above only
 		// fires when the SQLite normalFuncMap shells the name).
+		//
+		// IF / NULLIF / GREATEST / LEAST (issue #22) are the rest of the
+		// multi-branch family that binds branch / operand types together:
+		// each lowers to the identically named DuckDB native, which
+		// refuses the carrier mix at bind time (IF / NULLIF emit "Cannot
+		// mix values ... in CASE expression", GREATEST / LEAST "Cannot
+		// combine types") — and even when an implicit cast would bind,
+		// the envelope form must not reach a comparison (NULLIF equality,
+		// GREATEST/LEAST ordering) as raw VARCHAR. The same per-argument
+		// NUMERIC normalization fixes both: every operand lands on the
+		// native DECIMAL(38,9) form, so the bind unifies and comparisons
+		// run by value. IF's condition is BOOL and passes through.
 		return fmt.Sprintf("%s(%s)", funcName, strings.Join(
 			normalizeNumericCarrierArgs(args, argKinds(m1(n.node.ArgumentList()))), ",")), nil
 	case "googlesqlite_if":
+		// Same NUMERIC dual-carrier normalization as googlesqlite_ifnull
+		// above: the THEN / ELSE arms must agree on one engine type.
+		args = normalizeNumericCarrierArgs(args, argKinds(m1(n.node.ArgumentList())))
 		return fmt.Sprintf(
 			"CASE WHEN %s THEN %s ELSE %s END",
 			args[0],
@@ -2243,8 +2258,25 @@ func (n *FunctionCallNode) formatErrorHandling(ctx context.Context, funcName str
 		// untouched - decoding it would pass a BIGINT to googlesqlite_decode_
 		// scalar, which only binds VARCHAR. Non-scalar result types (STRING /
 		// STRUCT / ARRAY / temporal) also keep the untouched form.
+		//
+		// A NUMERIC result (issue #22) is the dual-carrier shape instead:
+		// the try arm can be the value-layer envelope VARCHAR (a
+		// googlesqlite_safe_divide result) while the catch arm is a native
+		// DECIMAL(38,9), which this CASE then refuses to bind. Normalize
+		// both arms through numericStorageReadSQL, same as the CASE / IF /
+		// COALESCE family. The wrapped try arm stays NULL exactly when the
+		// safe-evaluated inner expression is NULL (both decode arms of the
+		// dual form map NULL to NULL), so the error-to-NULL detection in
+		// the WHEN clause is preserved.
 		tryArm := iferrorTryArmSQL(n, safeX)
-		return fmt.Sprintf("CASE WHEN (%s) IS NULL THEN %s ELSE (%s) END", tryArm, args[1], tryArm), nil
+		catchArm := args[1]
+		if t, _ := n.node.Type(); t != nil {
+			if k, kerr := t.Kind(); kerr == nil && k == googlesql.TypeKindTypeNumeric {
+				tryArm = numericStorageReadSQL(tryArm)
+				catchArm = numericStorageReadSQL(catchArm)
+			}
+		}
+		return fmt.Sprintf("CASE WHEN (%s) IS NULL THEN %s ELSE (%s) END", tryArm, catchArm, tryArm), nil
 	case "googlesqlite_iserror":
 		return fmt.Sprintf("((%s) IS NULL)", safeX), nil
 	case "googlesqlite_nulliferror":
@@ -2319,7 +2351,22 @@ func (n *FunctionCallNode) formatErrorBuiltin(ctx context.Context, funcName stri
 
 // formatCaseNoValue lowers a searched CASE expression
 // (CASE WHEN ... THEN ... [ELSE ...] END).
+//
+// DuckDB requires every CASE result branch to bind under one common
+// type, but a NUMERIC branch can carry either of the two carrier forms
+// (native DECIMAL(38,9) vs the value-layer envelope VARCHAR) — e.g. a
+// division result (googlesqlite_divide envelope) in one branch and a
+// CAST literal (native DECIMAL) in another fails with "Cannot mix
+// values of type DECIMAL(38,9) and VARCHAR in CASE expression" (issue
+// #22, the dbt unit-dispatch model). Normalize every NUMERIC-kind
+// argument the same way COALESCE / IFNULL do (issue #21): the WHEN
+// conditions are BOOL and pass through untouched, the THEN / ELSE
+// results land on the native form. The same normalization runs for the
+// value-match form below, where it additionally covers the CASE value
+// and WHEN comparand operands (the binder builds an equality between
+// them, which must also compare by value, not by envelope text).
 func (n *FunctionCallNode) formatCaseNoValue(_ context.Context, args []string) (string, error) {
+	args = normalizeNumericCarrierArgs(args, argKinds(m1(n.node.ArgumentList())))
 	var whenStmts []string
 	for i := 0; i < len(args)-1; i += 2 {
 		whenStmts = append(whenStmts, fmt.Sprintf("WHEN %s THEN %s", args[i], args[i+1]))
@@ -2334,11 +2381,16 @@ func (n *FunctionCallNode) formatCaseNoValue(_ context.Context, args []string) (
 }
 
 // formatCaseWithValue lowers a simple CASE expression
-// (CASE value WHEN ... THEN ... [ELSE ...] END).
+// (CASE value WHEN ... THEN ... [ELSE ...] END). NUMERIC-kind operands
+// take the dual-carrier normalization described on formatCaseNoValue —
+// here it covers all three slots (CASE value, WHEN comparands, branch
+// results), since the value/comparand equality and the result-branch
+// unification both demand one engine type.
 func (n *FunctionCallNode) formatCaseWithValue(_ context.Context, args []string) (string, error) {
 	if len(args) < 2 {
 		return "", fmt.Errorf("not enough arguments for case with value")
 	}
+	args = normalizeNumericCarrierArgs(args, argKinds(m1(n.node.ArgumentList())))
 	val := args[0]
 	args = args[1:]
 	var whenStmts []string
