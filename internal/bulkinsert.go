@@ -24,11 +24,12 @@
 //	DATE                      -> native time.Time (DATE column)
 //	DATETIME                  -> native time.Time (TIMESTAMP column)
 //	TIMESTAMP                 -> native time.Time (TIMESTAMPTZ column)
-//	NUMERIC/BIGNUMERIC        -> the value-layer envelope (TEXT column; the
+//	BIGNUMERIC                -> the value-layer envelope (TEXT column; the
 //	                             per-row path binds the same envelope VARCHAR)
-//	BYTES                     -> the value-layer envelope's bytes (BLOB column;
-//	                             the per-row path binds the envelope VARCHAR and
-//	                             DuckDB's VARCHAR->BLOB cast stores its bytes)
+//	BYTES                     -> the PAYLOAD bytes (BLOB column; native-storage
+//	                             migration — the per-row path binds the same
+//	                             payload []byte). Legacy-version tables (compat
+//	                             mode (b)) keep the envelope's ASCII bytes.
 //	ARRAY/STRUCT              -> the value-layer envelope (TEXT column; same
 //	                             encoder the per-row encode layer uses)
 //
@@ -37,10 +38,13 @@
 // binds and the flush applies the same engine cast the per-row INSERT applies
 // implicitly (issue #6 "cast-in-flush"):
 //
-//	TIME -> "15:04:05.999999" text, CAST(c AS TIME)   (TIME column)
-//	JSON -> raw JSON text,         CAST(c AS JSON)    (JSON column; a string
-//	        value is the JSON text itself, validated with the same PARSE_JSON
-//	        the per-row reference path runs — issue #14)
+//	TIME    -> "15:04:05.999999" text, CAST(c AS TIME)   (TIME column)
+//	JSON    -> raw JSON text,          CAST(c AS JSON)   (JSON column; a string
+//	           value is the JSON text itself, validated with the same PARSE_JSON
+//	           the per-row reference path runs — issue #14)
+//	NUMERIC -> plain decimal text, CAST(c AS DECIMAL(38,9)) (native-storage
+//	           migration; DECIMAL is outside the appender's writable set.
+//	           Legacy-version tables keep the DIRECT TEXT-envelope class.)
 //
 // Because duckdb.NewAppender rejects any table containing a TIME/JSON column,
 // tables with CAST-class columns load through a private TEMP staging table
@@ -150,7 +154,18 @@ const (
 	bulkClassNullOnly                        // fast path only while every batch value is NULL
 )
 
-func bulkColumnClassOf(kind googlesql.TypeKind) bulkColumnClass {
+// bulkColumnClassOf classifies one column kind under the table's storage
+// convention. legacy selects the pre-native-migration classes (compat
+// mode (b)): a legacy NUMERIC column is a TEXT envelope cell the
+// appender writes directly, while a native NUMERIC column is
+// DECIMAL(38,9) — outside the appender's writable set, so it takes the
+// cast-in-flush staging path (plain decimal text feed +
+// CAST(c AS DECIMAL(38,9)), the same vectorized cast the per-row INSERT
+// applies to its plain-text parameter).
+func bulkColumnClassOf(kind googlesql.TypeKind, legacy bool) bulkColumnClass {
+	if kind == googlesql.TypeKindTypeNumeric && !legacy {
+		return bulkClassCast
+	}
 	switch kind {
 	case googlesql.TypeKindTypeInt32, googlesql.TypeKindTypeInt64,
 		googlesql.TypeKindTypeUint32, googlesql.TypeKindTypeUint64,
@@ -220,11 +235,12 @@ func BulkInsert(ctx context.Context, conn *Conn, catalog *Catalog, namePath []st
 	// storage types (TIME/JSON) force the staging flush for the whole table —
 	// duckdb.NewAppender rejects any table containing such a column, targeted
 	// or not. NULL-ONLY columns are confirmed value-by-value below.
+	legacy := spec.legacyStorage()
 	classes := make([]bulkColumnClass, len(spec.Columns))
 	needStage := false
 	for i, cs := range spec.Columns {
 		kind := googlesql.TypeKind(cs.Type.Kind)
-		classes[i] = bulkColumnClassOf(kind)
+		classes[i] = bulkColumnClassOf(kind, legacy)
 		if classes[i] == bulkClassCast {
 			needStage = true
 		}
@@ -260,7 +276,7 @@ func BulkInsert(ctx context.Context, conn *Conn, catalog *Catalog, namePath []st
 				}
 				continue // vals[p] stays nil
 			}
-			cell, err := bulkEncodeCell(cs.Type, v)
+			cell, err := bulkEncodeCell(cs.Type, v, legacy)
 			if err != nil {
 				return 0, fmt.Errorf("googlesqlite: bulk insert: row %d, column %q: %w", ri, columns[ci], err)
 			}
@@ -317,16 +333,17 @@ func bulkFlushStaged(ctx context.Context, conn *Conn, tableName string, spec *Ta
 	}
 	stage := fmt.Sprintf("__gsx_bulk_stage_%d", bulkStageSeq.Add(1))
 
+	legacy := spec.legacyStorage()
 	colDefs := make([]string, len(spec.Columns))
 	selExprs := make([]string, len(spec.Columns))
 	for i, cs := range spec.Columns {
 		kind := googlesql.TypeKind(cs.Type.Kind)
-		colType := storageTypeForKind(kind)
+		colType := storageTypeForKindVersioned(kind, legacy)
 		ref := fmt.Sprintf(`"c%d"`, i)
 		selExprs[i] = ref
 		if classes[i] == bulkClassCast {
 			colType = "VARCHAR"
-			selExprs[i] = fmt.Sprintf("CAST(%s AS %s)", ref, storageTypeForKind(kind))
+			selExprs[i] = fmt.Sprintf("CAST(%s AS %s)", ref, storageTypeForKindVersioned(kind, legacy))
 		}
 		colDefs[i] = fmt.Sprintf(`"c%d" %s`, i, colType)
 	}
@@ -382,8 +399,10 @@ func bulkIsNullValue(v any) bool {
 // per-row INSERT path stores for a column of this type (or, for CAST-class
 // columns, the canonical VARCHAR the per-row path binds). The coercions
 // mirror the per-row parameter pipeline — ValueFromGoValue -> castValueWithKind
-// -> encodeParamValue — in pure Go (no analyzer-module entry).
-func bulkEncodeCell(t *Type, v any) (any, error) {
+// -> encodeParamValue — in pure Go (no analyzer-module entry). legacy selects
+// the pre-native-migration cell forms for compat-mode tables (NUMERIC TEXT
+// envelopes, BYTES envelope-ASCII blobs).
+func bulkEncodeCell(t *Type, v any, legacy bool) (any, error) {
 	if v == nil {
 		return nil, nil
 	}
@@ -429,7 +448,7 @@ func bulkEncodeCell(t *Type, v any) (any, error) {
 	case googlesql.TypeKindTypeNumeric, googlesql.TypeKindTypeBignumeric,
 		googlesql.TypeKindTypeBytes, googlesql.TypeKindTypeTime, googlesql.TypeKindTypeJson,
 		googlesql.TypeKindTypeArray, googlesql.TypeKindTypeStruct:
-		return bulkEncodeComplexCell(t, kind, v, val)
+		return bulkEncodeComplexCell(t, kind, v, val, legacy)
 	}
 	return nil, fmt.Errorf("%w: type %s", ErrBulkInsertUnsupported, typeKindToSQLName(kind))
 }
@@ -446,12 +465,19 @@ func bulkEncodeCell(t *Type, v any) (any, error) {
 //     per-row path binds: envelopes for NUMERIC/ARRAY/STRUCT/BYTES, canonical
 //     text for TIME, raw JSON text for JSON.
 //
-// The only divergence from encodeParamValue's output is BYTES: the per-row
-// path binds the envelope as a VARCHAR parameter and DuckDB's VARCHAR->BLOB
-// insert cast stores the string's bytes; the appender writes the BLOB column
-// directly, so the envelope is converted to its []byte form here (the stored
-// cell is byte-identical — measured in the storage-parity tests).
-func bulkEncodeComplexCell(t *Type, kind googlesql.TypeKind, raw any, val value.Value) (any, error) {
+// Two kinds diverge from encodeParamValue's output:
+//
+//   - BYTES on a LEGACY table: the legacy per-row path bound the envelope
+//     as a VARCHAR parameter and DuckDB's VARCHAR->BLOB insert cast stored
+//     the string's bytes; the appender writes the BLOB column directly, so
+//     the envelope is converted to its []byte form here (byte-identical —
+//     measured in the storage-parity tests). On native tables
+//     encodeParamValue already produces the payload []byte.
+//   - NUMERIC on a LEGACY table: encodeParamValue now renders plain decimal
+//     text (the native DECIMAL(38,9) feed), but a legacy TEXT column stores
+//     the value-layer envelope, so the legacy branch re-encodes through
+//     EncodeValue.
+func bulkEncodeComplexCell(t *Type, kind googlesql.TypeKind, raw any, val value.Value, legacy bool) (any, error) {
 	if kind == googlesql.TypeKindTypeJson {
 		return bulkEncodeJSONCell(raw, val)
 	}
@@ -472,6 +498,18 @@ func bulkEncodeComplexCell(t *Type, kind googlesql.TypeKind, raw any, val value.
 			return nil, nil
 		}
 		casted = c
+	}
+	if legacy && (kind == googlesql.TypeKindTypeNumeric || kind == googlesql.TypeKindTypeBytes) {
+		enc, err := value.EncodeValue(casted)
+		if err != nil {
+			return nil, err
+		}
+		if kind == googlesql.TypeKindTypeBytes {
+			if s, ok := enc.(string); ok {
+				return []byte(s), nil
+			}
+		}
+		return enc, nil
 	}
 	enc, err := encodeParamValue(casted)
 	if err != nil {
