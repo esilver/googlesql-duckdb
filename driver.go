@@ -351,6 +351,22 @@ func freshMemoryDSN(name string) string {
 	return name + "?" + suffix
 }
 
+// RawEngineDB returns the raw-engine *sql.DB the googlesqlite driver is
+// sharing for the given DSN, if one is currently open. Callers that need
+// raw-engine reads (the CLI's .tables/.functions catalog queries) MUST use
+// this handle rather than sql.Open a second engine on the same DSN:
+// duckdb-go-pure >= v0.3.3 enforces DuckDB's single-instance file lock, so
+// a second engine on the same on-disk database fails with "Conflicting
+// lock is held". The returned handle is owned by the driver — callers must
+// not Close it. Private in-memory connectors (bare :memory:) are connector-
+// owned and not in the DSN cache; they report false.
+func RawEngineDB(name string) (*sql.DB, bool) {
+	nameToValueMapMu.Lock()
+	defer nameToValueMapMu.Unlock()
+	db, ok := nameToDBMap[name]
+	return db, ok
+}
+
 var _ driver.DriverContext = (*Driver)(nil)
 
 type Conn struct {

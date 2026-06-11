@@ -7,6 +7,8 @@ import (
 	"io"
 	"sort"
 	"strings"
+
+	googlesqlite "github.com/goccy/googlesqlite"
 )
 
 // Session couples a Runner with the mutable CLI state (debug mode,
@@ -251,11 +253,21 @@ func (r *Runner) catalogNames(ctx context.Context, kinds ...string) ([]string, e
 	if len(kinds) == 0 {
 		return nil, nil
 	}
-	db, err := sql.Open(rawDriverName, r.dsn)
-	if err != nil {
-		return nil, err
+	// Prefer the raw-engine handle the googlesqlite driver already holds
+	// for this DSN: duckdb-go-pure >= v0.3.3 enforces DuckDB's
+	// single-instance file lock, so opening a SECOND engine on the same
+	// on-disk database fails with "Conflicting lock is held". The shared
+	// handle is driver-owned (never closed here); the short-lived open
+	// below remains only for DSNs the driver is not currently serving.
+	db, shared := googlesqlite.RawEngineDB(r.dsn)
+	if !shared {
+		opened, err := sql.Open(rawDriverName, r.dsn)
+		if err != nil {
+			return nil, err
+		}
+		defer opened.Close()
+		db = opened
 	}
-	defer db.Close()
 
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(kinds)), ",")
 	args := make([]any, len(kinds))
