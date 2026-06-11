@@ -61,6 +61,23 @@ func ConvertArgs(args ...any) ([]Value, error) {
 	return values, nil
 }
 
+// foreignDecoders holds decoder hooks for engine-specific Go carrier
+// types this dialect-agnostic leaf package must not import — e.g. the
+// DuckDB driver's duckdb.Decimal, which a native DECIMAL(38,9) NUMERIC
+// column delivers for UDF arguments, LIST elements and STRUCT fields.
+// internal/decoder.go installs the DuckDB hooks at init. Hooks run for
+// every value DecodeValue's own type switch does not claim, including
+// recursive element/field decodes.
+var foreignDecoders []func(any) (Value, bool)
+
+// RegisterForeignDecoder appends fn to the decoder hooks consulted by
+// DecodeValue for engine-specific carrier types (see foreignDecoders).
+// Must be called from package init functions only — the slice is read
+// without synchronization afterwards.
+func RegisterForeignDecoder(fn func(any) (Value, bool)) {
+	foreignDecoders = append(foreignDecoders, fn)
+}
+
 // DecodeValue is the inverse of EncodeValue: given the over-the-wire
 // form (Go primitive or base64-encoded ValueLayout JSON) produce the
 // matching googlesqlite Value.
@@ -74,6 +91,11 @@ func DecodeValue(v any) (Value, error) {
 	// decoder must treat an incoming Value as a no-op rather than reject it.
 	if vv, ok := v.(Value); ok {
 		return vv, nil
+	}
+	for _, fd := range foreignDecoders {
+		if dv, ok := fd(v); ok {
+			return dv, nil
+		}
 	}
 	v = coerceJSONNumber(v)
 	switch vv := v.(type) {

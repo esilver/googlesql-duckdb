@@ -31,3 +31,26 @@ func DecodeValue(v any) (value.Value, error) {
 	}
 	return value.DecodeValue(v)
 }
+
+// init installs the duckdb.Decimal case as a foreign-decoder hook on the
+// leaf value package, so the SAME conversion runs everywhere
+// value.DecodeValue is reached without going through this shim: scalar /
+// aggregate UDF arguments (value.ConvertArgs — a native DECIMAL(38,9)
+// NUMERIC column delivers duckdb.Decimal carriers since the
+// native-storage migration), LIST elements ([]any recursion, e.g.
+// array_agg over a stored NUMERIC column) and STRUCT field values. The
+// explicit case in DecodeValue above stays as the fast path for the
+// result-row scan.
+func init() {
+	value.RegisterForeignDecoder(func(v any) (value.Value, bool) {
+		dec, ok := v.(duckdb.Decimal)
+		if !ok {
+			return nil, false
+		}
+		r := new(big.Rat)
+		if _, ok := r.SetString(dec.String()); !ok {
+			return nil, false
+		}
+		return &value.NumericValue{Rat: r}, true
+	})
+}
