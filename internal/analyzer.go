@@ -2726,24 +2726,28 @@ func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, args []driv
 		sourceColumn = m1(colA.Column())
 		targetColumn = m1(colB.Column())
 	}
-	// Source relation for the INSERT arms. A real table keeps the
-	// historical raw-table reference (its plain column names line up
-	// with the unuseColumnID formatting of the insert row); a
-	// computed-subquery source has no backing table, so re-format the
-	// scan without column IDs (plain output names) and parenthesize.
-	insertSourceTable := fmt.Sprintf("\"%s\"", m1(sourceColumn.TableName()))
-	if m1(m1(node.FromScan()).NodeKind()) != googlesql.ResolvedNodeKindResolvedTableScan {
-		plainSource, err := newNode(m1(node.FromScan())).FormatSQL(unuseColumnID(ctx))
-		if err != nil {
-			return nil, err
-		}
-		if getInputPattern(plainSource) == InputNeedsWrap {
-			plainSource = fmt.Sprintf("(%s)", plainSource)
-		}
-		insertSourceTable = plainSource
-	}
 	mergedTableSourceColumnName := fmt.Sprintf("\"%s\"", uniqueColumnName(ctx, sourceColumn))
 	mergedTableTargetColumnName := fmt.Sprintf("\"%s\"", uniqueColumnName(ctx, targetColumn))
+	// Source relation, correlated column name, and insert-row formatting
+	// context for the INSERT arms. A real table keeps the historical
+	// shape: the raw table (plain column names) with the insert row
+	// formatted without column IDs. A computed-subquery source has no
+	// backing table — and re-formatting it without column IDs collides
+	// whenever a projected alias shadows a base column (`SELECT id+1 AS
+	// id ... WHERE id <= 1` made the filter's column ref pick up the
+	// aliased expression) — so the subquery path reuses the ID-aliased
+	// sourceTable relation and formats the insert row with column IDs to
+	// match. The INSERT statement aliases the relation as
+	// googlesqlite_merge_source so the EXISTS correlation survives the
+	// name overlap with googlesqlite_merged_table's columns.
+	insertSourceTable := fmt.Sprintf("\"%s\"", m1(sourceColumn.TableName()))
+	insertSourceColumnName := fmt.Sprintf("\"%s\"", m1(sourceColumn.Name()))
+	insertRowCtx := unuseColumnID(ctx)
+	if m1(m1(node.FromScan()).NodeKind()) != googlesql.ResolvedNodeKindResolvedTableScan {
+		insertSourceTable = sourceTable
+		insertSourceColumnName = mergedTableSourceColumnName
+		insertRowCtx = ctx
+	}
 	mergedTableOutputColumns := []string{
 		mergedTableTargetColumnName,
 		mergedTableSourceColumnName,
@@ -2779,10 +2783,11 @@ func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, args []driv
 		mergedTableSourceColumnName,
 	)
 
-	// exists source table but not exists target table
+	// exists source table but not exists target table (correlated to the
+	// aliased source relation of the INSERT arm — see insertSourceTable)
 	notMatchedByTargetFromStmt := fmt.Sprintf(
-		"FROM googlesqlite_merged_table WHERE %[2]s = \"%[1]s\" AND %[3]s IS NULL",
-		m1(sourceColumn.Name()),
+		"FROM googlesqlite_merged_table WHERE %[2]s = googlesqlite_merge_source.%[1]s AND %[3]s IS NULL",
+		insertSourceColumnName,
 		mergedTableSourceColumnName,
 		mergedTableTargetColumnName,
 	)
@@ -2807,12 +2812,12 @@ func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, args []driv
 			for _, col := range m1(when.InsertColumnList()) {
 				columns = append(columns, fmt.Sprintf("\"%s\"", m1(col.Name())))
 			}
-			row, err := newNode(m1(when.InsertRow())).FormatSQL(unuseColumnID(ctx))
+			row, err := newNode(m1(when.InsertRow())).FormatSQL(insertRowCtx)
 			if err != nil {
 				return nil, err
 			}
 			stmts = append(stmts, fmt.Sprintf(
-				"INSERT INTO \"%[1]s\"(%[2]s) SELECT %[3]s FROM (SELECT * FROM %[4]s %[5]s)",
+				"INSERT INTO \"%[1]s\"(%[2]s) SELECT %[3]s FROM (SELECT * FROM %[4]s AS googlesqlite_merge_source %[5]s)",
 				m1(targetColumn.TableName()),
 				strings.Join(columns, ","),
 				row,

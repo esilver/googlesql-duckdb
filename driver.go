@@ -405,8 +405,30 @@ type Conn struct {
 // handle had been closed (typically by a request whose context was
 // cancelled mid-statement; database/sql's tx watcher then ran
 // Rollback(discardConn=true) on the inner connection).
+//
+// A non-nil c.tx at validation time is the second poisoned state: a
+// driver conn can only re-enter the pool with an open driver-level
+// transaction when the OUTER tx was discarded by its context watcher
+// (expiry/cancel mid-statement — e.g. a watchdog budget interrupting a
+// runaway statement) WITHOUT calling Tx.Rollback on us. The inner tx
+// watcher has closed (or is about to close) the inner conn, so the
+// next caller would eat one "driver: bad connection" — fatal on a
+// dedicated sql.Conn, where database/sql cannot retry. Reporting
+// invalid here makes the pool prune us at put-back/fetch instead.
 func (c *Conn) IsValid() bool {
-	return !c.dead.Load()
+	return !c.dead.Load() && c.tx == nil
+}
+
+// ResetSession implements driver.SessionResetter as a second line of
+// defense for the same poisoned states IsValid covers: database/sql
+// calls it on every cached-conn fetch and silently swaps in a fresh
+// conn when it reports driver.ErrBadConn, so the caller never observes
+// the dead conn even if it slipped past put-back validation.
+func (c *Conn) ResetSession(_ context.Context) error {
+	if c.dead.Load() || c.tx != nil {
+		return driver.ErrBadConn
+	}
+	return nil
 }
 
 // translateConnDone is the single point that converts the inner
@@ -440,11 +462,31 @@ func (c *Conn) translateConnDone(err error) error {
 	return err
 }
 
+// markDeadOnExpiredTx marks the Conn dead when an operation failed
+// inside an open driver-level transaction whose context has expired.
+// The inner tx was begun on that same context, so database/sql's inner
+// tx watcher is guaranteed to discard the inner connection — but the
+// discard races the operation's return, and at put-back time the Conn
+// can look healthy (the watcher's driver Rollback has already cleared
+// c.tx, dead is unset). Without this, the conn re-enters the pool and
+// the NEXT caller eats one "driver: bad connection" — fatal on a
+// dedicated sql.Conn, where database/sql cannot retry. Observed behind
+// the bigquery-emulator statement watchdog: the v0.3.5 engine interrupt
+// kills the runaway statement, then the very next request failed.
+func (c *Conn) markDeadOnExpiredTx(ctx context.Context, e *error) {
+	if *e != nil && c.tx != nil && ctx.Err() != nil {
+		c.dead.Store(true)
+	}
+}
+
 // Static contract check: database/sql's pool only calls IsValid via a
 // type assertion against driver.Validator. Failing this assertion at
 // compile time keeps a future refactor that drops the method visible
 // instead of silently regressing the fix.
-var _ driver.Validator = (*Conn)(nil)
+var (
+	_ driver.Validator       = (*Conn)(nil)
+	_ driver.SessionResetter = (*Conn)(nil)
+)
 
 func newConn(db *sql.DB, catalog *internal.Catalog) (*Conn, error) {
 	conn, err := db.Conn(context.Background())
@@ -538,6 +580,7 @@ func (c *Conn) rollbackDanglingTx() {
 
 func (c *Conn) PrepareContext(ctx context.Context, query string) (s driver.Stmt, e error) {
 	defer func() { e = c.translateConnDone(e) }()
+	defer c.markDeadOnExpiredTx(ctx, &e)
 	defer func() {
 		if e != nil {
 			c.rollbackDanglingTx()
@@ -566,6 +609,7 @@ func (c *Conn) PrepareContext(ctx context.Context, query string) (s driver.Stmt,
 
 func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (r driver.Result, e error) {
 	defer func() { e = c.translateConnDone(e) }()
+	defer c.markDeadOnExpiredTx(ctx, &e)
 	defer func() {
 		if e != nil {
 			c.rollbackDanglingTx()
@@ -607,6 +651,7 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 
 func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (r driver.Rows, e error) {
 	defer func() { e = c.translateConnDone(e) }()
+	defer c.markDeadOnExpiredTx(ctx, &e)
 	defer func() {
 		if e != nil {
 			c.rollbackDanglingTx()
@@ -688,14 +733,28 @@ func (tx *Tx) Commit() error {
 	defer func() {
 		tx.conn.tx = nil
 	}()
-	return tx.tx.Commit()
+	return tx.conn.markDeadOnLostTx(tx.tx.Commit())
 }
 
 func (tx *Tx) Rollback() error {
 	defer func() {
 		tx.conn.tx = nil
 	}()
-	return tx.tx.Rollback()
+	return tx.conn.markDeadOnLostTx(tx.tx.Rollback())
+}
+
+// markDeadOnLostTx inspects a driver-level Commit/Rollback result: at
+// this level database/sql calls each exactly once, so ErrTxDone means
+// the INNER tx watcher finished the transaction first (context expiry
+// mid-transaction) and has discarded — or is discarding — the inner
+// connection. ErrConnDone is the same story observed later. Either way
+// this Conn must not return to the pool; see markDeadOnExpiredTx for
+// the statement-time twin of this put-back-time check.
+func (c *Conn) markDeadOnLostTx(err error) error {
+	if err != nil && (errors.Is(err, sql.ErrTxDone) || errors.Is(err, sql.ErrConnDone)) {
+		c.dead.Store(true)
+	}
+	return err
 }
 
 // AnalysisCacheCounters reports the process-wide GoogleSQL

@@ -111,6 +111,38 @@ WHEN NOT MATCHED THEN INSERT (k, v) VALUES (s.k, s.v)`)
 	}
 }
 
+// TestMergeUsingFilteredAliasShadowingSubquery is the bqe wedge-stress
+// MERGE shape: the USING subquery projects a computed column whose
+// alias SHADOWS the base column it filters on (`SELECT 13 + k AS k ...
+// WHERE k <= 2`). The first INSERT-arm lowering re-formatted the source
+// without column IDs, so the filter's column ref picked up the aliased
+// projection (`... WHERE ((13 + k) AS k <= 2)`) — a Parser Error.
+func TestMergeUsingFilteredAliasShadowingSubquery(t *testing.T) {
+	t.Parallel()
+	conn, ctx, mustExec := mergeTestConn(t, "merge_subq_shadow")
+	mustExec("CREATE TABLE sink (k INT64, v STRING)")
+	mustExec("CREATE TABLE seed (k INT64, v STRING)")
+	mustExec("INSERT INTO sink (k, v) VALUES (14, 'old14')")
+	mustExec("INSERT INTO seed (k, v) VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+
+	// Source rows: k in {14, 15} (filter keeps seed k <= 2, then +13).
+	// k=14 exists in sink (MATCHED -> UPDATE), k=15 is new (INSERT).
+	mustExec(`MERGE sink t USING (SELECT 13 + k AS k, CONCAT(v, '_m') AS v FROM seed WHERE k <= 2) s
+ON t.k = s.k
+WHEN MATCHED THEN UPDATE SET v = s.v
+WHEN NOT MATCHED THEN INSERT (k, v) VALUES (s.k, s.v)`)
+	got := readKV(t, ctx, conn, "sink")
+	want := map[int64]string{14: "a_m", 15: "b_m"}
+	if len(got) != len(want) {
+		t.Fatalf("rows = %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("k=%d: got %q, want %q", k, got[k], v)
+		}
+	}
+}
+
 // TestMergeUsingSubqueryNotMatchedBySource covers the WHEN NOT MATCHED
 // BY SOURCE arm (DELETE) with a computed-subquery source.
 func TestMergeUsingSubqueryNotMatchedBySource(t *testing.T) {
