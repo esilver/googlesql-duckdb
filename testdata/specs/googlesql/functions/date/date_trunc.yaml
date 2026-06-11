@@ -11,3 +11,28 @@ cases:
     expected:
       rows:
         - ["2024-01-01"]
+  - desc: truncate to default Sunday week
+    sql: SELECT DATE_TRUNC(DATE "2017-11-06", WEEK)
+    expected:
+      rows:
+        - ["2017-11-05"]
+  - desc: truncate to Monday week
+    sql: SELECT DATE_TRUNC(DATE "2017-11-05", WEEK(MONDAY))
+    expected:
+      rows:
+        - ["2017-10-30"]
+  - desc: truncate to Thursday week
+    sql: SELECT DATE_TRUNC(DATE "2017-11-05", WEEK(THURSDAY))
+    expected:
+      rows:
+        - ["2017-11-02"]
+  - desc: truncate to ISO week
+    sql: SELECT DATE_TRUNC(DATE "2017-11-05", ISOWEEK)
+    expected:
+      rows:
+        - ["2017-10-30"]
+  - desc: truncate to ISO year boundary
+    sql: SELECT DATE_TRUNC(DATE "2015-06-15", ISOYEAR)
+    expected:
+      rows:
+        - ["2014-12-29"]

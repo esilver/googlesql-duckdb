@@ -21,13 +21,15 @@ type Type int
 // TYPE_ANY (34) is load-bearing: 451/456 scalar registrations are variadic over
 // TYPE_ANY, and the value layer relies on ANY args arriving un-coerced.
 const (
-	TYPE_BOOLEAN   Type = 1  // DUCKDB_TYPE_BOOLEAN
-	TYPE_BIGINT    Type = 5  // DUCKDB_TYPE_BIGINT
-	TYPE_DOUBLE    Type = 11 // DUCKDB_TYPE_DOUBLE
-	TYPE_TIMESTAMP Type = 12 // DUCKDB_TYPE_TIMESTAMP
-	TYPE_VARCHAR   Type = 17 // DUCKDB_TYPE_VARCHAR
-	TYPE_BLOB      Type = 18 // DUCKDB_TYPE_BLOB
-	TYPE_ANY       Type = 34 // DUCKDB_TYPE_ANY
+	TYPE_BOOLEAN      Type = 1  // DUCKDB_TYPE_BOOLEAN
+	TYPE_BIGINT       Type = 5  // DUCKDB_TYPE_BIGINT
+	TYPE_DOUBLE       Type = 11 // DUCKDB_TYPE_DOUBLE
+	TYPE_TIMESTAMP    Type = 12 // DUCKDB_TYPE_TIMESTAMP
+	TYPE_DATE         Type = 13 // DUCKDB_TYPE_DATE
+	TYPE_VARCHAR      Type = 17 // DUCKDB_TYPE_VARCHAR
+	TYPE_BLOB         Type = 18 // DUCKDB_TYPE_BLOB
+	TYPE_TIMESTAMP_TZ Type = 31 // DUCKDB_TYPE_TIMESTAMP_TZ
+	TYPE_ANY          Type = 34 // DUCKDB_TYPE_ANY
 )
 
 // TypeInfo is the opaque type carrier the emulator threads through

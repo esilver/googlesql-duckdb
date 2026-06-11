@@ -6,3 +6,13 @@ cases:
     expected:
       rows:
         - ["2024-03-15T12:00:00"]
+  - desc: trunc to Monday week
+    sql: SELECT CAST(DATETIME_TRUNC(DATETIME "2017-11-05T12:30:00", WEEK(MONDAY)) AS STRING)
+    expected:
+      rows:
+        - ["2017-10-30T00:00:00"]
+  - desc: trunc to ISO year boundary
+    sql: SELECT CAST(DATETIME_TRUNC(DATETIME "2015-06-15T12:30:00", ISOYEAR) AS STRING)
+    expected:
+      rows:
+        - ["2014-12-29T00:00:00"]

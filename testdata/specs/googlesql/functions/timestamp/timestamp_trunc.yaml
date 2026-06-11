@@ -7,3 +7,15 @@ cases:
     expected:
       rows:
         - [1710460800]
+  - desc: trunc to ISO week in UTC
+    sql: |
+      SELECT UNIX_SECONDS(TIMESTAMP_TRUNC(TIMESTAMP "2017-11-05 12:30:00+00", ISOWEEK, "UTC"))
+    expected:
+      rows:
+        - [1509321600]
+  - desc: trunc to ISO year in UTC
+    sql: |
+      SELECT UNIX_SECONDS(TIMESTAMP_TRUNC(TIMESTAMP "2015-06-15 12:30:00+00", ISOYEAR, "UTC"))
+    expected:
+      rows:
+        - [1419811200]

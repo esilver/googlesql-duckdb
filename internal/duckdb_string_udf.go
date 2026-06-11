@@ -62,6 +62,8 @@ var duckDBNormalResultKinds = map[string]DuckDBUDFResultKind{
 	"contains_substr":    DuckDBResultBoolean,
 	"search":             DuckDBResultBoolean,
 	"like":               DuckDBResultBoolean,
+	"is_true":            DuckDBResultBoolean,
+	"is_false":           DuckDBResultBoolean,
 	"keys_keyset_length": DuckDBResultBigint,
 	// Hash + bit functions whose pure-Go body returns IntValue must
 	// declare BIGINT so the value-layer bridge hands DuckDB a native
@@ -165,6 +167,7 @@ var duckDBNormalUDFNames = append(append([]string{}, stringFamilyUDFNames...),
 	"contains_substr",
 	"like",
 	"make_array",
+	"subscript",
 	"generate_uuid",
 	"new_uuid",
 	"typeof",
@@ -226,6 +229,9 @@ var duckDBNormalUDFNames = append(append([]string{}, stringFamilyUDFNames...),
 	// (no DuckDB-native date_part overload accepts the interval
 	// envelope). The extracted interval field is an INT64.
 	"extract",
+	// EXTRACT(DATE FROM TIMESTAMP/DATETIME) can lower to the legacy normal
+	// helper name in paths that cannot use a DuckDB-native date expression.
+	"extract_date",
 	// HLL_COUNT.EXTRACT(sketch) reads a serialized HyperLogLog++ sketch and
 	// returns its INT64 cardinality. The analyzer lowers it to the bare leaf
 	// `extract`, which collides with SQL's EXTRACT keyword, so the formatter
@@ -270,6 +276,14 @@ var duckDBNormalUDFNames = append(append([]string{}, stringFamilyUDFNames...),
 	// the zero-divisor error to NULL for SAFE_DIVIDE and the IFERROR /
 	// ISERROR / NULLIFERROR safe-eval wraps.
 	"divide",
+	// Aggregate option marker helpers emitted by aggregate/window formatting
+	// when DISTINCT / IGNORE NULLS must be represented as value-layer options.
+	"distinct",
+	"ignore_nulls",
+	// Boolean predicate helpers emitted for IS TRUE / IS FALSE when the
+	// operator cannot be lowered natively.
+	"is_true",
+	"is_false",
 )
 
 // StringFamilyUDFSpecs returns the DuckDB scalar UDF specs for the string

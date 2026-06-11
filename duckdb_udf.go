@@ -5,10 +5,16 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	stdtime "time"
 
 	duckdb "github.com/goccy/googlesqlite/internal/duckdbgo"
 
 	internal "github.com/goccy/googlesqlite/internal"
+	datefn "github.com/goccy/googlesqlite/internal/functions/date"
+	datetimefn "github.com/goccy/googlesqlite/internal/functions/datetime"
+	timefn "github.com/goccy/googlesqlite/internal/functions/time"
+	timestampfn "github.com/goccy/googlesqlite/internal/functions/timestamp"
+	"github.com/goccy/googlesqlite/internal/value"
 )
 
 // registerDuckDBUDFs installs the minimal set of googlesqlite_* scalar
@@ -90,11 +96,125 @@ func registerDuckDBUDFs(db *sql.DB) error {
 	if err := registerRangeUDFs(conn); err != nil {
 		return err
 	}
+	if err := registerTemporalFormatParseUDFs(conn); err != nil {
+		return err
+	}
 	if err := registerNormalFuncUDFs(conn); err != nil {
 		return err
 	}
 	if err := registerChangeHistoryTableUDFs(conn); err != nil {
 		return err
+	}
+	return nil
+}
+
+type temporalFormatParseUDF struct {
+	name       string
+	safe       bool
+	bind       internal.BindFunction
+	resultInfo duckdb.TypeInfo
+	encode     func(value.Value) (any, error)
+}
+
+func (u *temporalFormatParseUDF) Config() duckdb.ScalarFuncConfig {
+	anyInfo, _ := duckdb.NewTypeInfo(duckdb.TYPE_ANY)
+	return duckdb.ScalarFuncConfig{
+		VariadicTypeInfo:    anyInfo,
+		ResultTypeInfo:      u.resultInfo,
+		SpecialNullHandling: true,
+	}
+}
+
+func (u *temporalFormatParseUDF) Executor() duckdb.ScalarFuncExecutor {
+	return duckdb.ScalarFuncExecutor{
+		RowExecutor: func(values []driver.Value) (any, error) {
+			args := make([]any, len(values))
+			for i, v := range values {
+				args[i] = v
+			}
+			converted, err := value.ConvertArgs(args...)
+			if err != nil {
+				if u.safe {
+					return nil, nil
+				}
+				return nil, err
+			}
+			ret, err := u.bind(converted...)
+			if err != nil {
+				if u.safe {
+					return nil, nil
+				}
+				return nil, err
+			}
+			if ret == nil {
+				return nil, nil
+			}
+			return u.encode(ret)
+		},
+	}
+}
+
+func registerTemporalFormatParseUDFs(conn *sql.Conn) error {
+	varchar, _ := duckdb.NewTypeInfo(duckdb.TYPE_VARCHAR)
+	dateType, _ := duckdb.NewTypeInfo(duckdb.TYPE_DATE)
+	timestamp, _ := duckdb.NewTypeInfo(duckdb.TYPE_TIMESTAMP)
+	timestamptz, _ := duckdb.NewTypeInfo(duckdb.TYPE_TIMESTAMP_TZ)
+
+	stringResult := func(v value.Value) (any, error) {
+		return v.ToString()
+	}
+	dateResult := func(v value.Value) (any, error) {
+		t, err := v.ToTime()
+		if err != nil {
+			return nil, err
+		}
+		y, m, d := t.Date()
+		return stdtime.Date(y, m, d, 0, 0, 0, 0, stdtime.UTC), nil
+	}
+	timeResult := func(v value.Value) (any, error) {
+		t, err := v.ToTime()
+		if err != nil {
+			return nil, err
+		}
+		h, m, s := t.Clock()
+		return stdtime.Date(1970, 1, 1, h, m, s, t.Nanosecond(), stdtime.UTC), nil
+	}
+	timestampResult := func(v value.Value) (any, error) {
+		return v.ToTime()
+	}
+
+	udfs := []struct {
+		name       string
+		bind       internal.BindFunction
+		resultInfo duckdb.TypeInfo
+		encode     func(value.Value) (any, error)
+	}{
+		{"format_date", datefn.BindFormatDate, varchar, stringResult},
+		{"format_datetime", datetimefn.BindFormatDatetime, varchar, stringResult},
+		{"format_time", timefn.BindFormatTime, varchar, stringResult},
+		{"format_timestamp", timestampfn.BindFormatTimestamp, varchar, stringResult},
+		{"parse_date", datefn.BindParseDate, dateType, dateResult},
+		{"parse_datetime", datetimefn.BindParseDatetime, timestamp, timestampResult},
+		{"parse_time", timefn.BindParseTime, timestamp, timeResult},
+		{"parse_timestamp", timestampfn.BindParseTimestamp, timestamptz, timestampResult},
+	}
+	for _, u := range udfs {
+		for _, safe := range []bool{false, true} {
+			prefix := "googlesqlite_"
+			if safe {
+				prefix = "googlesqlite_safe_"
+			}
+			udf := &temporalFormatParseUDF{
+				name:       u.name,
+				safe:       safe,
+				bind:       u.bind,
+				resultInfo: u.resultInfo,
+				encode:     u.encode,
+			}
+			if err := duckdb.RegisterScalarUDF(conn, prefix+u.name, udf); err != nil {
+				return fmt.Errorf("googlesqlite: register %s%s: %w", prefix, u.name, err)
+			}
+		}
 	}
 	return nil
 }

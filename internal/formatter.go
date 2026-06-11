@@ -204,6 +204,9 @@ func getFuncNameAndArgs(ctx context.Context, node *ResolvedBaseFunctionCallNode,
 		if _, ok := nativelySafeValueLayerBuiltins[bare]; ok {
 			existsNormalFuncForSafe = true
 		}
+		if isDuckDBTemporalFormatParseFunc(bare) {
+			existsNormalFuncForSafe = true
+		}
 	}
 	currentTime := CurrentTime(ctx)
 
@@ -238,6 +241,8 @@ func getFuncNameAndArgs(ctx context.Context, node *ResolvedBaseFunctionCallNode,
 		funcName = fmt.Sprintf("%s_%s", funcPrefix, funcName)
 	} else if existsNormalFunc {
 		funcName = fmt.Sprintf("%s_%s", funcPrefix, funcName)
+	} else if isDuckDBTemporalFormatParseFunc(funcName) {
+		funcName = fmt.Sprintf("%s_%s", funcPrefix, funcName)
 	} else if !isWindowFunc && existsAggregateFunc {
 		funcName = fmt.Sprintf("%s_%s", funcPrefix, funcName)
 	} else if isWindowFunc && existsWindowFunc {
@@ -250,6 +255,36 @@ func getFuncNameAndArgs(ctx context.Context, node *ResolvedBaseFunctionCallNode,
 		funcName = fname
 	}
 	return funcName, args, nil
+}
+
+func isDuckDBTemporalFormatParseFunc(funcName string) bool {
+	switch strings.TrimPrefix(strings.TrimPrefix(funcName, "googlesqlite_safe_"), "googlesqlite_") {
+	case "format_date", "format_datetime", "format_time", "format_timestamp",
+		"parse_date", "parse_datetime", "parse_time", "parse_timestamp":
+		return true
+	}
+	return false
+}
+
+func formatDuckDBTemporalFormatParseFunc(funcName string, args []string) (string, bool) {
+	safe := strings.HasPrefix(funcName, "googlesqlite_safe_")
+	bare := strings.TrimPrefix(strings.TrimPrefix(funcName, "googlesqlite_safe_"), "googlesqlite_")
+	if !isDuckDBTemporalFormatParseFunc(bare) {
+		return "", false
+	}
+	prefix := "googlesqlite_"
+	if safe {
+		prefix = "googlesqlite_safe_"
+	}
+	call := fmt.Sprintf("%s%s(%s)", prefix, bare, strings.Join(args, ", "))
+	switch bare {
+	case "parse_date":
+		return fmt.Sprintf("CAST(%s AS DATE)", call), true
+	case "parse_time":
+		return fmt.Sprintf("CAST(%s AS TIME)", call), true
+	default:
+		return call, true
+	}
 }
 
 func (n *LiteralNode) FormatSQL(ctx context.Context) (string, error) {
@@ -405,7 +440,7 @@ func (n *FunctionCallNode) FormatSQL(ctx context.Context) (string, error) {
 	if funcName == "googlesqlite_string" {
 		kinds := argKinds(m1(n.node.ArgumentList()))
 		if len(kinds) >= 1 && isTemporalTypeKind(kinds[0]) {
-			if sql, ok := tryNativeDatetimeFunc("string", args); ok {
+			if sql, ok := tryNativeDatetimeFunc("string", args, kinds); ok {
 				return sql, nil
 			}
 		}
@@ -441,16 +476,20 @@ func (n *FunctionCallNode) FormatSQL(ctx context.Context) (string, error) {
 	if sql, ok := tryNativeOperator(funcName, args, argKinds(m1(n.node.ArgumentList()))); ok {
 		return sql, nil
 	}
+	if sql, ok := formatDuckDBTemporalFormatParseFunc(funcName, args); ok {
+		return sql, nil
+	}
 	// DuckDB retarget: date / datetime / time / timestamp builtins lower
 	// to native DuckDB date functions (strftime, date_diff, date_trunc,
 	// epoch, make_timestamp, ...) instead of googlesqlite_* UDFs.
-	if sql, ok := tryNativeDatetimeFunc(funcName, args); ok {
+	kinds := argKinds(m1(n.node.ArgumentList()))
+	if sql, ok := tryNativeDatetimeFunc(funcName, args, kinds); ok {
 		return sql, nil
 	}
 	if sql, ok, err := n.tryFormatExtract(ctx, funcName, args); ok || err != nil {
 		return sql, err
 	}
-	if sql, ok, err := n.tryFormatDateConstructor(funcName, args); ok || err != nil {
+	if sql, ok, err := n.tryFormatDateConstructor(funcName, args, kinds); ok || err != nil {
 		return sql, err
 	}
 	// DuckDB retarget: the array-family value-layer functions resolve to
@@ -1004,6 +1043,9 @@ func tryNativeOperator(funcName string, args []string, kinds []googlesql.TypeKin
 		// json_each.value comparisons already round-trip through the
 		// forgiving spec comparator.
 		if isArithmeticOperator(op) {
+			if sql, ok := tryNativeDateIntegerArithmetic(op, tok, args, kinds); ok {
+				return sql, true
+			}
 			// temporal +/- INTERVAL: the resolved tree reaches here as
 			// $add/$subtract over (DATE|TIME|DATETIME|TIMESTAMP, INTERVAL),
 			// and the INTERVAL operand was lowered to the VARCHAR-typed
@@ -1595,6 +1637,108 @@ func intervalWidthSeconds(count, part string) (string, bool) {
 	return "", false
 }
 
+func weekPartOffset(part string) (int, bool) {
+	switch strings.ToUpper(strings.TrimSpace(part)) {
+	case "WEEK", "WEEK_SUNDAY", "WEEK(SUNDAY)":
+		return 0, true
+	case "WEEK_MONDAY", "WEEK(MONDAY)", "ISOWEEK":
+		return 1, true
+	case "WEEK_TUESDAY", "WEEK(TUESDAY)":
+		return 2, true
+	case "WEEK_WEDNESDAY", "WEEK(WEDNESDAY)":
+		return 3, true
+	case "WEEK_THURSDAY", "WEEK(THURSDAY)":
+		return 4, true
+	case "WEEK_FRIDAY", "WEEK(FRIDAY)":
+		return 5, true
+	case "WEEK_SATURDAY", "WEEK(SATURDAY)":
+		return 6, true
+	}
+	return 0, false
+}
+
+func duckDBWeekStartSQL(expr string, offset int) string {
+	dateExpr := fmt.Sprintf("CAST(%s AS DATE)", expr)
+	return fmt.Sprintf(
+		"(%[1]s - (((dayofweek(%[1]s) - %d + 7) %% 7) * INTERVAL '1 day'))",
+		dateExpr, offset,
+	)
+}
+
+func duckDBISOYearStartSQL(expr string) string {
+	isoYear := fmt.Sprintf("CAST(date_part('isoyear', CAST(%s AS DATE)) AS INTEGER)", expr)
+	jan4 := fmt.Sprintf("make_date(%s, 1, 4)", isoYear)
+	return fmt.Sprintf(
+		"(%[1]s - (((dayofweek(%[1]s) - 1 + 7) %% 7) * INTERVAL '1 day'))",
+		jan4,
+	)
+}
+
+func duckDBTruncToPartSQL(expr, part, castType string) (string, bool) {
+	if offset, ok := weekPartOffset(part); ok {
+		return fmt.Sprintf("CAST(%s AS %s)", duckDBWeekStartSQL(expr, offset), castType), true
+	}
+	if strings.EqualFold(strings.TrimSpace(part), "ISOYEAR") {
+		return fmt.Sprintf("CAST(%s AS %s)", duckDBISOYearStartSQL(expr), castType), true
+	}
+	return "", false
+}
+
+var googleSQLTimeZoneOffsetRE = regexp.MustCompile(`^([+-])(\d{2})(?::?(\d{2}))?$`)
+
+func pinnedUnixNanoArg(args []string) (string, []string, bool) {
+	if len(args) == 0 {
+		return "", args, false
+	}
+	last := strings.TrimSpace(args[len(args)-1])
+	if _, err := strconv.ParseInt(last, 10, 64); err != nil {
+		return "", args, false
+	}
+	return last, args[:len(args)-1], true
+}
+
+func googleSQLTimeZoneOffsetMinutes(zone string) (int, bool) {
+	m := googleSQLTimeZoneOffsetRE.FindStringSubmatch(strings.TrimSpace(zone))
+	if m == nil {
+		return 0, false
+	}
+	hour, err := strconv.Atoi(m[2])
+	if err != nil {
+		return 0, false
+	}
+	min := 0
+	if m[3] != "" {
+		min, err = strconv.Atoi(m[3])
+		if err != nil {
+			return 0, false
+		}
+	}
+	total := hour*60 + min
+	if m[1] == "-" {
+		total = -total
+	}
+	return total, true
+}
+
+func currentCivilTimestampSQL(zoneArgs []string, utcTimestampSQL, instantSQL string) string {
+	if len(zoneArgs) == 0 {
+		return fmt.Sprintf("timezone('UTC', %s)", instantSQL)
+	}
+	if zone, ok := decodeLiteralArgBody(zoneArgs[0]); ok {
+		if minutes, ok := googleSQLTimeZoneOffsetMinutes(zone); ok {
+			return fmt.Sprintf("(%s + INTERVAL '%d minutes')", utcTimestampSQL, minutes)
+		}
+		return fmt.Sprintf("timezone(%s, %s)", sqlStringLiteral(zone), instantSQL)
+	}
+	return fmt.Sprintf("timezone(%s, %s)", zoneArgs[0], instantSQL)
+}
+
+func currentPinnedTimestampSQL(unixNanoSQL string) (string, string) {
+	utcTimestampSQL := fmt.Sprintf("make_timestamp(CAST(%s AS BIGINT) // 1000)", unixNanoSQL)
+	instantSQL := fmt.Sprintf("(%s AT TIME ZONE 'UTC')", utcTimestampSQL)
+	return utcTimestampSQL, instantSQL
+}
+
 // tryNativeDatetimeFunc lowers the GoogleSQL date / datetime / time /
 // timestamp builtins to native DuckDB forms. The formatter reaches this
 // with funcName == the function's storage name (the lowercase BQ name,
@@ -1607,7 +1751,7 @@ func intervalWidthSeconds(count, part string) (string, bool) {
 //     two date operands swap and the part moves to the front.
 //   - the date-part keyword arrives base64-wrapped (a STRING literal),
 //     so it is decoded back to a bare lowercase part token.
-func tryNativeDatetimeFunc(funcName string, args []string) (string, bool) {
+func tryNativeDatetimeFunc(funcName string, args []string, kinds []googlesql.TypeKind) (string, bool) {
 	part := func(i int) string {
 		if i >= len(args) {
 			return "'day'"
@@ -1644,6 +1788,22 @@ func tryNativeDatetimeFunc(funcName string, args []string) (string, bool) {
 			return args[i]
 		}
 		return sqlStringLiteral(translateBQDateFormat(body))
+	}
+	zoneArg := func(i int) string {
+		if i >= len(args) {
+			return "'UTC'"
+		}
+		body, ok := decodeLiteralArgBody(args[i])
+		if ok {
+			return sqlStringLiteral(body)
+		}
+		return fmt.Sprintf("googlesqlite_plain_string(%s)", args[i])
+	}
+	localTimestamp := func(ts, zone string) string {
+		return fmt.Sprintf("timezone(%s, CAST(%s AS TIMESTAMP WITH TIME ZONE))", zone, ts)
+	}
+	timestampFromLocal := func(civil, zone string) string {
+		return fmt.Sprintf("timezone(%s, CAST(%s AS TIMESTAMP))", zone, civil)
 	}
 	// partBody returns the decoded date-part keyword (upper-cased) for
 	// the unit/granularity argument at index i.
@@ -1689,16 +1849,14 @@ func tryNativeDatetimeFunc(funcName string, args []string) (string, bool) {
 		if len(args) < 3 {
 			return "", false
 		}
-		if partBody(2) == "WEEK" {
-			// GoogleSQL WEEK counts Sunday-started week boundaries
-			// between the two operands; DuckDB date_diff('week') counts
-			// 7-day blocks from its own (Monday) anchor. Snap both
-			// operands back to the prior Sunday, then count whole weeks.
+		if offset, ok := weekPartOffset(partBody(2)); ok {
+			// GoogleSQL WEEK variants count week-start boundaries between
+			// the operands. Snap both dates to their containing week start,
+			// then count 7-day blocks between those aligned boundaries.
 			return fmt.Sprintf(
-				"CAST(date_diff('day', "+
-					"CAST(%[2]s AS DATE) - dayofweek(CAST(%[2]s AS DATE)) * INTERVAL '1 day', "+
-					"CAST(%[1]s AS DATE) - dayofweek(CAST(%[1]s AS DATE)) * INTERVAL '1 day') / 7 AS BIGINT)",
-				args[0], args[1],
+				"CAST(date_diff('day', %s, %s) / 7 AS BIGINT)",
+				duckDBWeekStartSQL(args[1], offset),
+				duckDBWeekStartSQL(args[0], offset),
 			), true
 		}
 		return fmt.Sprintf("date_diff(%s, %s, %s)", part(2), args[1], args[0]), true
@@ -1725,21 +1883,31 @@ func tryNativeDatetimeFunc(funcName string, args []string) (string, bool) {
 		if len(args) < 2 {
 			return "", false
 		}
+		if sql, ok := duckDBTruncToPartSQL(args[0], partBody(1), "DATE"); ok {
+			return sql, true
+		}
 		return fmt.Sprintf("CAST(date_trunc(%s, %s) AS DATE)", part(1), args[0]), true
 	case "datetime_trunc":
 		if len(args) < 2 {
 			return "", false
 		}
+		if sql, ok := duckDBTruncToPartSQL(args[0], partBody(1), "TIMESTAMP"); ok {
+			return sql, true
+		}
 		return fmt.Sprintf("date_trunc(%s, %s)", part(1), args[0]), true
 	case "timestamp_trunc":
-		// Optional 3rd arg is a time zone; DuckDB date_trunc on a
-		// TIMESTAMPTZ truncates in the session zone. The specs pin UTC,
-		// which matches the test harness default, so the zone arg is a
-		// no-op for the covered cases.
 		if len(args) < 2 {
 			return "", false
 		}
-		return fmt.Sprintf("date_trunc(%s, %s)", part(1), args[0]), true
+		zone := "'UTC'"
+		if len(args) >= 3 {
+			zone = zoneArg(2)
+		}
+		civil := localTimestamp(args[0], zone)
+		if sql, ok := duckDBTruncToPartSQL(civil, partBody(1), "TIMESTAMP"); ok {
+			return timestampFromLocal(sql, zone), true
+		}
+		return timestampFromLocal(fmt.Sprintf("date_trunc(%s, %s)", part(1), civil), zone), true
 	case "time_trunc":
 		// DuckDB date_trunc rejects TIME, so lift the time onto the
 		// epoch date (DuckDB has no TIMESTAMP+TIME operator, so go via
@@ -1823,11 +1991,14 @@ func tryNativeDatetimeFunc(funcName string, args []string) (string, bool) {
 		}
 		return fmt.Sprintf("strftime(%s, %s)", timeLiftedToTimestamp(args[1]), fmtArg(0)), true
 	case "format_timestamp":
-		// FORMAT_TIMESTAMP(fmt, ts[, tz]); UTC pinned by spec.
 		if len(args) < 2 {
 			return "", false
 		}
-		return fmt.Sprintf("strftime(%s AT TIME ZONE 'UTC', %s)", args[1], fmtArg(0)), true
+		zone := "'UTC'"
+		if len(args) >= 3 {
+			zone = zoneArg(2)
+		}
+		return fmt.Sprintf("strftime(%s, %s)", localTimestamp(args[1], zone), fmtArg(0)), true
 
 	// ---- STRING(timestamp[, tz]): canonical text. Spec only asserts
 	// non-null, so a plain cast to VARCHAR suffices. ----
@@ -1843,7 +2014,25 @@ func tryNativeDatetimeFunc(funcName string, args []string) (string, bool) {
 		if len(args) < 1 {
 			return "", false
 		}
-		return fmt.Sprintf("CAST(%s AS TIMESTAMP WITH TIME ZONE)", strLit(0)), true
+		zone := "'UTC'"
+		if len(args) >= 2 {
+			zone = zoneArg(1)
+		}
+		if len(kinds) >= 1 {
+			switch kinds[0] {
+			case googlesql.TypeKindTypeString:
+				if len(args) >= 2 {
+					return timestampFromLocal(fmt.Sprintf("CAST(%s AS TIMESTAMP)", strLit(0)), zone), true
+				}
+				return fmt.Sprintf("CAST(%s AS TIMESTAMP WITH TIME ZONE)", strLit(0)), true
+			case googlesql.TypeKindTypeDate, googlesql.TypeKindTypeDatetime:
+				return timestampFromLocal(args[0], zone), true
+			}
+		}
+		if len(args) >= 2 {
+			return timestampFromLocal(args[0], zone), true
+		}
+		return fmt.Sprintf("CAST(%s AS TIMESTAMP WITH TIME ZONE)", args[0]), true
 
 	// ---- PARSE_*: strptime(value, format) cast to the target type.
 	// Both the format pattern (arg 0) and the input string (arg 1)
@@ -1916,10 +2105,19 @@ func tryNativeDatetimeFunc(funcName string, args []string) (string, bool) {
 
 	// ---- civil constructors ----
 	case "time":
-		// TIME(hour, minute, second) -> make_time; the TIME(timestamp[,tz])
-		// extraction overload keeps its single/double-arg shape for CAST.
+		// TIME(hour, minute, second) -> make_time; TIME(timestamp[,tz])
+		// projects an instant into a civil zone before taking the clock.
 		if len(args) == 3 {
 			return fmt.Sprintf("make_time(%s, %s, CAST(%s AS DOUBLE))", args[0], args[1], args[2]), true
+		}
+		if len(args) == 1 {
+			if len(kinds) >= 1 && kinds[0] == googlesql.TypeKindTypeTimestamp {
+				return fmt.Sprintf("CAST(%s AS TIME)", localTimestamp(args[0], "'UTC'")), true
+			}
+			return fmt.Sprintf("CAST(%s AS TIME)", args[0]), true
+		}
+		if len(args) == 2 {
+			return fmt.Sprintf("CAST(%s AS TIME)", localTimestamp(args[0], zoneArg(1))), true
 		}
 		return "", false
 	case "last_day":
@@ -1931,16 +2129,37 @@ func tryNativeDatetimeFunc(funcName string, args []string) (string, bool) {
 		return "", false
 
 	// ---- current-time builtins. These sit in currentTimeFuncMap, so
-	// getFuncNameAndArgs shells them to googlesqlite_current_* (and, when
-	// a deterministic clock is pinned via WithCurrentTime, appends a nanos
-	// arg). DuckDB has native equivalents; the appended arg is ignored. ----
+	// getFuncNameAndArgs shells them to googlesqlite_current_* and, when
+	// a deterministic clock is pinned via WithCurrentTime, appends a UnixNano
+	// arg after any user-supplied zone argument. Use the appended instant
+	// when present; otherwise keep the native volatile DuckDB forms. ----
 	case "current_date", "googlesqlite_current_date", "googlesqlite_safe_current_date":
-		return "current_date", true
+		if unixNano, zoneArgs, ok := pinnedUnixNanoArg(args); ok {
+			utcTS, instant := currentPinnedTimestampSQL(unixNano)
+			civil := currentCivilTimestampSQL(zoneArgs, utcTS, instant)
+			return fmt.Sprintf("CAST(%s AS DATE)", civil), true
+		}
+		civil := currentCivilTimestampSQL(args, "timezone('UTC', now())", "now()")
+		return fmt.Sprintf("CAST(%s AS DATE)", civil), true
 	case "current_datetime", "googlesqlite_current_datetime", "googlesqlite_safe_current_datetime":
-		return "CAST(current_localtimestamp() AS TIMESTAMP)", true
+		if unixNano, zoneArgs, ok := pinnedUnixNanoArg(args); ok {
+			utcTS, instant := currentPinnedTimestampSQL(unixNano)
+			return currentCivilTimestampSQL(zoneArgs, utcTS, instant), true
+		}
+		return currentCivilTimestampSQL(args, "timezone('UTC', now())", "now()"), true
 	case "current_time", "googlesqlite_current_time", "googlesqlite_safe_current_time":
-		return "CAST(get_current_time() AS TIME)", true
+		if unixNano, zoneArgs, ok := pinnedUnixNanoArg(args); ok {
+			utcTS, instant := currentPinnedTimestampSQL(unixNano)
+			civil := currentCivilTimestampSQL(zoneArgs, utcTS, instant)
+			return fmt.Sprintf("CAST(%s AS TIME)", civil), true
+		}
+		civil := currentCivilTimestampSQL(args, "timezone('UTC', now())", "now()")
+		return fmt.Sprintf("CAST(%s AS TIME)", civil), true
 	case "current_timestamp", "googlesqlite_current_timestamp", "googlesqlite_safe_current_timestamp":
+		if unixNano, _, ok := pinnedUnixNanoArg(args); ok {
+			_, instant := currentPinnedTimestampSQL(unixNano)
+			return instant, true
+		}
 		return "now()", true
 	}
 	return "", false
@@ -2026,17 +2245,33 @@ func (n *FunctionCallNode) tryFormatExtract(_ context.Context, funcName string, 
 // across "build from components" and "convert from an instant"; DuckDB
 // splits these across make_date / make_timestamp and CAST, so the right
 // lowering depends on arity.
-func (n *FunctionCallNode) tryFormatDateConstructor(funcName string, args []string) (string, bool, error) {
+func (n *FunctionCallNode) tryFormatDateConstructor(funcName string, args []string, kinds []googlesql.TypeKind) (string, bool, error) {
+	zoneArg := func(i int) string {
+		if i >= len(args) {
+			return "'UTC'"
+		}
+		body, ok := decodeLiteralArgBody(args[i])
+		if ok {
+			return sqlStringLiteral(body)
+		}
+		return fmt.Sprintf("googlesqlite_plain_string(%s)", args[i])
+	}
+	localTimestamp := func(ts, zone string) string {
+		return fmt.Sprintf("timezone(%s, CAST(%s AS TIMESTAMP WITH TIME ZONE))", zone, ts)
+	}
 	switch funcName {
 	case "date":
 		switch len(args) {
 		case 3:
 			// DATE(year, month, day)
 			return fmt.Sprintf("make_date(%s, %s, %s)", args[0], args[1], args[2]), true, nil
-		case 1, 2:
-			// DATE(timestamp) / DATE(timestamp, tz) / DATE(datetime):
-			// project the instant onto its civil date. The optional tz
-			// arg is a no-op under the UTC-pinned harness.
+		case 2:
+			return fmt.Sprintf("CAST(%s AS DATE)", localTimestamp(args[0], zoneArg(1))), true, nil
+		case 1:
+			// DATE(timestamp) / DATE(datetime): project to civil date.
+			if len(kinds) >= 1 && kinds[0] == googlesql.TypeKindTypeTimestamp {
+				return fmt.Sprintf("CAST(%s AS DATE)", localTimestamp(args[0], "'UTC'")), true, nil
+			}
 			return fmt.Sprintf("CAST(%s AS DATE)", args[0]), true, nil
 		}
 		return "", false, fmt.Errorf("DATE: unexpected argument count %d", len(args))
@@ -2049,10 +2284,17 @@ func (n *FunctionCallNode) tryFormatDateConstructor(funcName string, args []stri
 				args[0], args[1], args[2], args[3], args[4], args[5],
 			), true, nil
 		case 2:
-			// DATETIME(date, time)
-			return fmt.Sprintf("CAST(%s AS TIMESTAMP) + (%s - TIME '00:00:00')", args[0], args[1]), true, nil
+			if len(kinds) >= 2 && kinds[0] == googlesql.TypeKindTypeDate && kinds[1] == googlesql.TypeKindTypeTime {
+				// DATETIME(date, time)
+				return fmt.Sprintf("CAST(%s AS TIMESTAMP) + (%s - TIME '00:00:00')", args[0], args[1]), true, nil
+			}
+			// DATETIME(timestamp, zone)
+			return localTimestamp(args[0], zoneArg(1)), true, nil
 		case 1:
 			// DATETIME(timestamp) / DATETIME(date)
+			if len(kinds) >= 1 && kinds[0] == googlesql.TypeKindTypeTimestamp {
+				return localTimestamp(args[0], "'UTC'"), true, nil
+			}
 			return fmt.Sprintf("CAST(%s AS TIMESTAMP)", args[0]), true, nil
 		}
 		return "", false, fmt.Errorf("DATETIME: unexpected argument count %d", len(args))
@@ -3418,6 +3660,37 @@ func isNativeNumericKind(k googlesql.TypeKind) bool {
 		return true
 	}
 	return false
+}
+
+func isIntegerTypeKind(kind googlesql.TypeKind) bool {
+	switch kind {
+	case googlesql.TypeKindTypeInt32,
+		googlesql.TypeKindTypeInt64,
+		googlesql.TypeKindTypeUint32,
+		googlesql.TypeKindTypeUint64:
+		return true
+	}
+	return false
+}
+
+func tryNativeDateIntegerArithmetic(op, tok string, args []string, kinds []googlesql.TypeKind) (string, bool) {
+	if len(args) != 2 || (op != "add" && op != "subtract") {
+		return "", false
+	}
+	lhsKind, rhsKind := kindAt(kinds, 0), kindAt(kinds, 1)
+	if lhsKind == googlesql.TypeKindTypeDate && isIntegerTypeKind(rhsKind) {
+		return fmt.Sprintf(
+			"CAST((CAST(%s AS DATE) %s (CAST(%s AS BIGINT) * INTERVAL '1 day')) AS DATE)",
+			args[0], tok, args[1],
+		), true
+	}
+	if op == "add" && isIntegerTypeKind(lhsKind) && rhsKind == googlesql.TypeKindTypeDate {
+		return fmt.Sprintf(
+			"CAST((CAST(%s AS DATE) + (CAST(%s AS BIGINT) * INTERVAL '1 day')) AS DATE)",
+			args[1], args[0],
+		), true
+	}
+	return "", false
 }
 
 // argKinds returns the resolved TypeKind of each function argument, in
