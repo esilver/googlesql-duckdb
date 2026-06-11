@@ -2674,6 +2674,14 @@ func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, args []driv
 	if err != nil {
 		return nil, err
 	}
+	// A computed-subquery source (issue #17) formats as a bare
+	// `SELECT ...`; splicing that into `... FROM %s LEFT JOIN ...`
+	// hands the engine `FROM SELECT ...` — a Parser Error that also
+	// poisons the surrounding transaction. Table scans already format
+	// parenthesized; wrap everything else the same way.
+	if getInputPattern(sourceTable) == InputNeedsWrap {
+		sourceTable = fmt.Sprintf("(%s)", sourceTable)
+	}
 	expr, err := newNode(m1(node.MergeExpr())).FormatSQL(ctx)
 	if err != nil {
 		return nil, err
@@ -2701,28 +2709,63 @@ func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, args []driv
 		sourceColumn *googlesql.ResolvedColumn
 		targetColumn *googlesql.ResolvedColumn
 	)
-	if strings.Contains(sourceTable, m1(m1(colA.Column()).TableName())) {
+	// Classify the ON-clause columns by column-ID membership in the
+	// target TableScan's column list. The previous heuristic —
+	// strings.Contains(sourceTable, colA's TableName) — breaks for
+	// computed-subquery sources, whose formatted SQL contains no
+	// table reference at all (and whose literals can accidentally
+	// contain the target's name).
+	targetColumnIDs := map[int32]struct{}{}
+	for _, col := range m1(m1(node.TableScan()).ColumnList()) {
+		targetColumnIDs[m1(col.ColumnId())] = struct{}{}
+	}
+	if _, isTarget := targetColumnIDs[m1(m1(colA.Column()).ColumnId())]; isTarget {
+		targetColumn = m1(colA.Column())
+		sourceColumn = m1(colB.Column())
+	} else {
 		sourceColumn = m1(colA.Column())
 		targetColumn = m1(colB.Column())
-	} else {
-		sourceColumn = m1(colB.Column())
-		targetColumn = m1(colA.Column())
 	}
-	mergedTableSourceColumnName := fmt.Sprintf("`%s`", uniqueColumnName(ctx, sourceColumn))
-	mergedTableTargetColumnName := fmt.Sprintf("`%s`", uniqueColumnName(ctx, targetColumn))
+	// Source relation for the INSERT arms. A real table keeps the
+	// historical raw-table reference (its plain column names line up
+	// with the unuseColumnID formatting of the insert row); a
+	// computed-subquery source has no backing table, so re-format the
+	// scan without column IDs (plain output names) and parenthesize.
+	insertSourceTable := fmt.Sprintf("\"%s\"", m1(sourceColumn.TableName()))
+	if m1(m1(node.FromScan()).NodeKind()) != googlesql.ResolvedNodeKindResolvedTableScan {
+		plainSource, err := newNode(m1(node.FromScan())).FormatSQL(unuseColumnID(ctx))
+		if err != nil {
+			return nil, err
+		}
+		if getInputPattern(plainSource) == InputNeedsWrap {
+			plainSource = fmt.Sprintf("(%s)", plainSource)
+		}
+		insertSourceTable = plainSource
+	}
+	mergedTableSourceColumnName := fmt.Sprintf("\"%s\"", uniqueColumnName(ctx, sourceColumn))
+	mergedTableTargetColumnName := fmt.Sprintf("\"%s\"", uniqueColumnName(ctx, targetColumn))
 	mergedTableOutputColumns := []string{
 		mergedTableTargetColumnName,
 		mergedTableSourceColumnName,
 	}
+	// The merged table materializes every (source row, target row)
+	// pairing class in one scan: matched pairs, source-only rows
+	// (target side NULL) and target-only rows (source side NULL).
+	// The SQLite-era lowering emulated this with `src LEFT JOIN tgt
+	// UNION ALL tgt LEFT JOIN src`, but UNION ALL is positional: the
+	// second arm put target values under source-named columns, which
+	// made asymmetric matched UPDATEs (SET v = s.v) nondeterministic
+	// and broke NOT MATCHED BY SOURCE. A FULL OUTER JOIN keeps every
+	// value under its own column name.
 	var stmts []string
 	stmts = append(stmts, fmt.Sprintf(
-		"CREATE TABLE googlesqlite_merged_table AS SELECT DISTINCT * FROM (SELECT * FROM %[1]s LEFT JOIN %[2]s ON %[3]s UNION ALL SELECT * FROM %[2]s LEFT JOIN %[1]s ON %[3]s)",
+		"CREATE TABLE googlesqlite_merged_table AS SELECT DISTINCT * FROM (SELECT * FROM %[1]s FULL OUTER JOIN %[2]s ON %[3]s)",
 		sourceTable, targetTable, expr,
 	))
 
 	// exists target table and source table
 	matchedFromStmt := fmt.Sprintf(
-		"FROM googlesqlite_merged_table WHERE %[2]s = %[1]s AND %[3]s = %[1]s",
+		"FROM googlesqlite_merged_table WHERE %[2]s = \"%[1]s\" AND %[3]s = \"%[1]s\"",
 		m1(targetColumn.Name()),
 		mergedTableSourceColumnName,
 		mergedTableTargetColumnName,
@@ -2730,7 +2773,7 @@ func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, args []driv
 
 	// exists target table but not exists source table
 	notMatchedBySourceFromStmt := fmt.Sprintf(
-		"FROM googlesqlite_merged_table WHERE %[2]s = `%[1]s` AND %[3]s IS NULL",
+		"FROM googlesqlite_merged_table WHERE %[2]s = \"%[1]s\" AND %[3]s IS NULL",
 		m1(targetColumn.Name()),
 		mergedTableTargetColumnName,
 		mergedTableSourceColumnName,
@@ -2738,7 +2781,7 @@ func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, args []driv
 
 	// exists source table but not exists target table
 	notMatchedByTargetFromStmt := fmt.Sprintf(
-		"FROM googlesqlite_merged_table WHERE %[2]s = `%[1]s` AND %[3]s IS NULL",
+		"FROM googlesqlite_merged_table WHERE %[2]s = \"%[1]s\" AND %[3]s IS NULL",
 		m1(sourceColumn.Name()),
 		mergedTableSourceColumnName,
 		mergedTableTargetColumnName,
@@ -2762,18 +2805,18 @@ func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, args []driv
 		case googlesql.ResolvedMergeWhenEnums_ActionTypeInsert:
 			var columns []string
 			for _, col := range m1(when.InsertColumnList()) {
-				columns = append(columns, fmt.Sprintf("`%s`", m1(col.Name())))
+				columns = append(columns, fmt.Sprintf("\"%s\"", m1(col.Name())))
 			}
 			row, err := newNode(m1(when.InsertRow())).FormatSQL(unuseColumnID(ctx))
 			if err != nil {
 				return nil, err
 			}
 			stmts = append(stmts, fmt.Sprintf(
-				"INSERT INTO `%[1]s`(%[2]s) SELECT %[3]s FROM (SELECT * FROM `%[4]s` %[5]s)",
+				"INSERT INTO \"%[1]s\"(%[2]s) SELECT %[3]s FROM (SELECT * FROM %[4]s %[5]s)",
 				m1(targetColumn.TableName()),
 				strings.Join(columns, ","),
 				row,
-				m1(sourceColumn.TableName()),
+				insertSourceTable,
 				whereStmt,
 			))
 		case googlesql.ResolvedMergeWhenEnums_ActionTypeUpdate:
@@ -2786,14 +2829,14 @@ func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, args []driv
 				items = append(items, sql)
 			}
 			stmts = append(stmts, fmt.Sprintf(
-				"UPDATE `%s` SET %s %s",
+				"UPDATE \"%s\" SET %s %s",
 				m1(targetColumn.TableName()),
 				strings.Join(items, ","),
 				fromStmt,
 			))
 		case googlesql.ResolvedMergeWhenEnums_ActionTypeDelete:
 			stmts = append(stmts, fmt.Sprintf(
-				"DELETE FROM `%s` %s",
+				"DELETE FROM \"%s\" %s",
 				m1(targetColumn.TableName()),
 				whereStmt,
 			))

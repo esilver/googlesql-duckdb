@@ -17,3 +17,10 @@ import (
 // decimal text; Float64() collapses to float64 — both defined on the engine
 // type (converge/duckdb/decimal.go).
 type Decimal = convergeduckdb.Decimal
+
+// JSONValue is likewise an ALIAS for the engine's JSON-cell carrier. Since
+// the v0.3.3/v0.3.4 engine releases, JSON-alias RESULT columns scan as
+// convergeduckdb.JSONValue (raw JSON text, type-marked) instead of a plain
+// Go string; consumers above the duckdbgo façade (internal.DecodeValue and
+// the value-layer foreign-decoder hook) type-switch through this alias.
+type JSONValue = convergeduckdb.JSONValue

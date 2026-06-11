@@ -29,6 +29,15 @@ func DecodeValue(v any) (value.Value, error) {
 			return &value.NumericValue{Rat: r}, nil
 		}
 	}
+	// duckdb-go-pure >= v0.3.3 scans JSON-alias RESULT cells as
+	// duckdb.JSONValue (the raw JSON text, type-marked) instead of the
+	// parsed native value the v0.3.2-era driver delivered. Parse first
+	// (duckdb-go semantics), then decode the native form — an envelope
+	// string inside JSON quotes must arrive unquoted for the base64
+	// path, and JSON null becomes Go nil.
+	if jv, ok := v.(duckdb.JSONValue); ok {
+		return value.DecodeValue(duckdb.DecodeJSONNative(string(jv)))
+	}
 	return value.DecodeValue(v)
 }
 
@@ -52,5 +61,22 @@ func init() {
 			return nil, false
 		}
 		return &value.NumericValue{Rat: r}, true
+	})
+	// Same hook for duckdb.JSONValue, so JSON-alias cells reached through
+	// the recursion paths (LIST elements, STRUCT fields, UDF arguments
+	// that skip the duckdbgo jsonAwareExecutor normalization) parse to
+	// their native form instead of failing the string type-assert. A
+	// JSON null yields (nil, true): DecodeValue then reports the cell
+	// as SQL NULL, matching the v0.3.2-era driver's nil delivery.
+	value.RegisterForeignDecoder(func(v any) (value.Value, bool) {
+		jv, ok := v.(duckdb.JSONValue)
+		if !ok {
+			return nil, false
+		}
+		dv, err := value.DecodeValue(duckdb.DecodeJSONNative(string(jv)))
+		if err != nil {
+			return nil, false
+		}
+		return dv, true
 	})
 }

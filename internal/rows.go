@@ -16,6 +16,7 @@ import (
 	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/proto"
 
+	duckdb "github.com/goccy/googlesqlite/internal/duckdbgo"
 	"github.com/goccy/googlesqlite/internal/value"
 )
 
@@ -104,6 +105,15 @@ func (r *Rows) Next(dest []driver.Value) error {
 }
 
 func (r *Rows) assignValue(src any, dst reflect.Value, typ *Type) error {
+	// duckdb-go-pure >= v0.3.3 scans JSON-alias result cells as
+	// duckdb.JSONValue (the raw, type-marked JSON text) where the
+	// v0.3.2-era driver delivered the PARSED native value. Restore those
+	// semantics before decoding: an envelope string inside JSON quotes
+	// must arrive unquoted for DecodeValue's base64 path, and a JSON
+	// null must hit the nil early-return below.
+	if jv, ok := src.(duckdb.JSONValue); ok {
+		src = duckdb.DecodeJSONNative(string(jv))
+	}
 	if src == nil {
 		dst.Set(reflect.New(dst.Type()).Elem())
 		return nil

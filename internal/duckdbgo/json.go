@@ -24,6 +24,13 @@ import (
 // keeps the compat call sites readable.
 func jsonNative(s string) any { return convergeduckdb.DecodeJSONNative(s) }
 
+// DecodeJSONNative re-exports the engine's JSON-cell parser for consumers
+// above the façade: duckdb-go-pure >= v0.3.3 delivers JSON-alias RESULT
+// cells as JSONValue (raw, type-marked text) instead of the parsed native
+// value the v0.3.2-era driver produced, so the row/value decode seams
+// apply this themselves to restore the previous semantics.
+func DecodeJSONNative(s string) any { return convergeduckdb.DecodeJSONNative(s) }
+
 // jsonAwareExecutor wraps a RowExecutor so JSONValue arguments arrive parsed,
 // duckdb-go style, and the engine's ordered nested carriers (Struct/MapValue,
 // engine nested.go) arrive as the Go maps duckdb-go delivers (STRUCT ->
