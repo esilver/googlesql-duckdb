@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - "v*"
+      # Chain tags on pure-go-duckdb-backend are Go-module pins for the
+      # bigquery-emulator fork-replace, not releases. The branch has no
+      # tools/ goreleaser module and nothing to publish — the release +
+      # Pages machinery belongs to main's curated lineage.
+      - "!v*-pure-go"
 
 # The default token is read-only; each job widens it to exactly what it
 # needs — release upload plus provenance, or the Pages deployment.
