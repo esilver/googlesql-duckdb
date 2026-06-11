@@ -74,7 +74,10 @@ func (s *FunctionSpec) SQL() string {
 	}
 	retType, _ := s.Return.ToGoogleSQLType()
 	return fmt.Sprintf(
-		"CREATE FUNCTION \"%s\"(%s) RETURNS %v AS (%s)",
+		// Backtick-quote the name: GoogleSQL treats a double-quoted
+		// token as a string literal, so "name" fails to parse
+		// ("Unexpected string literal") on the wasm analyzer.
+		"CREATE FUNCTION `%s`(%s) RETURNS %v AS (%s)",
 		s.FuncName(),
 		strings.Join(args, ", "),
 		m1(retType.Kind()),
@@ -97,7 +100,9 @@ func (s *FunctionSpec) CallSQL(ctx context.Context, callNode *ResolvedBaseFuncti
 		}
 		funcName := strings.Join(s.NamePath, ".")
 		runtimeDefinedFunc := fmt.Sprintf(
-			"CREATE FUNCTION \"%s\"(%s) as (%s)",
+			// Backtick-quoted: a double-quoted name is a string
+			// literal to the GoogleSQL parser and fails analysis.
+			"CREATE FUNCTION `%s`(%s) as (%s)",
 			funcName,
 			strings.Join(definedArgs, ","),
 			s.Code,
@@ -280,12 +285,28 @@ func (s *TVFSpec) CallSQL(argValues []string, callOutputColumns []string) (strin
 		)
 	}
 	body := s.Body
-	for i, arg := range s.Args {
+	// Substitute longer argument names first so a parameter named `x`
+	// cannot clobber the `$x...` / `@x...` prefix of a sibling named
+	// `x2`, mirroring FunctionSpec.CallSQL.
+	order := make([]int, len(s.Args))
+	for i := range s.Args {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		return len(s.Args[order[a]].Name) > len(s.Args[order[b]].Name)
+	})
+	for _, i := range order {
 		if i >= len(argValues) {
-			break
+			continue
 		}
-		argRef := fmt.Sprintf("@%s", arg.Name)
-		body = strings.Replace(body, argRef, argValues[i], -1)
+		// Argument references reach the body under two sigils: the
+		// DuckDB-target ArgumentRefNode renders `$name`, the legacy
+		// SQLite target rendered `@name`. Substitute both; a leftover
+		// `$name` would otherwise be parsed by DuckDB as an unbound
+		// named parameter ("Expected N parameters, but none were
+		// supplied").
+		body = strings.ReplaceAll(body, fmt.Sprintf("@%s", s.Args[i].Name), argValues[i])
+		body = strings.ReplaceAll(body, fmt.Sprintf("$%s", s.Args[i].Name), argValues[i])
 	}
 	projections := make([]string, 0, len(s.OutputColumns))
 	for i, col := range s.OutputColumns {
