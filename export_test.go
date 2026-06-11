@@ -49,6 +49,16 @@ func ChangedCatalogFromResult(result sql.Result) (*ChangedCatalog, error) {
 	return googlesqliteResult.ChangedCatalog(), nil
 }
 
+// SetForceLegacyStorageForTest stamps tables created while enabled with
+// the LEGACY storage version (pre-native-storage cell conventions:
+// NUMERIC TEXT envelopes, BYTES envelope-ASCII blobs), so the
+// legacy-database compat test can build a faithful pre-migration
+// fixture through the current binary. Process-global; tests using it
+// must not run in parallel with other CREATE TABLE traffic.
+func SetForceLegacyStorageForTest(legacy bool) {
+	internal.SetForceLegacyStorageForTest(legacy)
+}
+
 // SetMaterializeCTE controls whether CTEs referenced more than once
 // are emitted with the SQLite MATERIALIZED hint.
 func (c *Conn) SetMaterializeCTE(enabled bool) { c.materializeCTE = enabled }
