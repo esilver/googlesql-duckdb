@@ -16,10 +16,25 @@ func EVAL_JAVASCRIPT(code string, retType *Type, argNames []string, args []value
 	for i := range args {
 		var v any
 		if args[i] != nil {
-			structV, ok := args[i].(*value.StructValue)
-			if ok {
-				v = structV.M
-			} else {
+			switch tv := args[i].(type) {
+			case *value.StructValue:
+				v = tv.M
+			case *value.NumericValue:
+				// A FLOAT64/NUMERIC argument can arrive as an exact
+				// decimal carrier (DuckDB types a literal like 2.0 as
+				// DECIMAL, which decodes to NumericValue). Its
+				// Interface() is the big.Rat text ("2/1"), which is
+				// useless inside JavaScript - hand goja a Number
+				// instead, matching how FloatValue arguments behave.
+				f, err := tv.ToFloat64()
+				if err != nil {
+					return nil, fmt.Errorf(
+						"failed to convert numeric argument %s to float64: %w",
+						argNames[i], err,
+					)
+				}
+				v = f
+			default:
 				v = args[i].Interface()
 			}
 		}

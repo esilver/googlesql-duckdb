@@ -24,6 +24,15 @@ const (
 	DuckDBResultDouble
 	// DuckDBResultBoolean covers BOOL-returning functions.
 	DuckDBResultBoolean
+	// DuckDBResultEnvelope declares VARCHAR like the default, but forces
+	// EVERY result - including the INT64 / FLOAT64 / BOOL primitives that
+	// EncodeValue would hand back as bare Go scalars - into the base64
+	// envelope string. It exists for polymorphic functions such as
+	// EVAL_JAVASCRIPT whose return type is chosen per call site, so a
+	// single registration cannot commit to a native BIGINT/DOUBLE/BOOLEAN
+	// result column. The row decoder (DecodeValue + CastValue) re-types
+	// the envelope against the statement's output column.
+	DuckDBResultEnvelope
 )
 
 // DuckDBUDFSpec describes one googlesqlite_<name> scalar UDF the DuckDB
@@ -82,6 +91,9 @@ var duckDBNormalResultKinds = map[string]DuckDBUDFResultKind{
 	"extract": DuckDBResultBigint,
 	// HLL_COUNT.EXTRACT returns the sketch's cardinality as an INT64.
 	"hll_count_extract": DuckDBResultBigint,
+	// EVAL_JAVASCRIPT's return type is declared per CREATE FUNCTION, so
+	// the bridge must envelope every result (see DuckDBResultEnvelope).
+	"eval_javascript": DuckDBResultEnvelope,
 }
 
 var duckDBVolatileUDFNames = map[string]struct{}{
@@ -284,6 +296,13 @@ var duckDBNormalUDFNames = append(append([]string{}, stringFamilyUDFNames...),
 	// operator cannot be lowered natively.
 	"is_true",
 	"is_false",
+	// JavaScript UDF evaluator (goja). FunctionSpec bodies for
+	// `LANGUAGE js` CREATE FUNCTIONs are hand-built calls to
+	// googlesqlite_eval_javascript(code, retType[, argNames, args...]).
+	// The pure-Go body has always lived in normalFuncs; the name was
+	// simply missing from this DuckDB registration list, so every JS UDF
+	// invocation failed at bind time with a Catalog Error.
+	"eval_javascript",
 )
 
 // StringFamilyUDFSpecs returns the DuckDB scalar UDF specs for the string
@@ -376,4 +395,40 @@ func CallNormalFunc(name string, safe bool, args ...any) (any, error) {
 		return nil, err
 	}
 	return EncodeValue(ret)
+}
+
+// CallNormalFuncEnvelope is CallNormalFunc for functions registered with
+// DuckDBResultEnvelope: the result is always re-encoded as the base64
+// envelope string (even INT64 / FLOAT64 / BOOL primitives) so the declared
+// VARCHAR result type holds for every per-call return type.
+func CallNormalFuncEnvelope(name string, safe bool, args ...any) (any, error) {
+	fn, ok := bindFuncForName(name)
+	if !ok {
+		return nil, fmt.Errorf("googlesqlite: no registered body for function %q", name)
+	}
+	values, err := value.ConvertArgs(args...)
+	if err != nil {
+		if safe {
+			return nil, nil
+		}
+		return nil, err
+	}
+	ret, err := fn(values...)
+	if err != nil {
+		if safe {
+			return nil, nil
+		}
+		return nil, err
+	}
+	encoded, isNull, err := value.EncodeValueString(ret)
+	if err != nil {
+		if safe {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if isNull {
+		return nil, nil
+	}
+	return encoded, nil
 }

@@ -776,11 +776,12 @@ func registerNormalFuncUDFs(conn *sql.Conn) error {
 		if err != nil {
 			return fmt.Errorf("googlesqlite: result type for %s: %w", spec.Name, err)
 		}
-		raising := &normalFuncUDF{name: spec.Name, safe: false, resultInfo: resultInfo, volatile: spec.Volatile}
+		envelope := spec.ResultKind == internal.DuckDBResultEnvelope
+		raising := &normalFuncUDF{name: spec.Name, safe: false, resultInfo: resultInfo, volatile: spec.Volatile, envelope: envelope}
 		if err := duckdb.RegisterScalarUDF(conn, "googlesqlite_"+spec.Name, raising); err != nil {
 			return fmt.Errorf("googlesqlite: register googlesqlite_%s: %w", spec.Name, err)
 		}
-		safe := &normalFuncUDF{name: spec.Name, safe: true, resultInfo: resultInfo, volatile: spec.Volatile}
+		safe := &normalFuncUDF{name: spec.Name, safe: true, resultInfo: resultInfo, volatile: spec.Volatile, envelope: envelope}
 		if err := duckdb.RegisterScalarUDF(conn, "googlesqlite_safe_"+spec.Name, safe); err != nil {
 			return fmt.Errorf("googlesqlite: register googlesqlite_safe_%s: %w", spec.Name, err)
 		}
@@ -801,6 +802,10 @@ type normalFuncUDF struct {
 	safe       bool
 	resultInfo duckdb.TypeInfo
 	volatile   bool
+	// envelope forces every result through the base64 envelope encoding
+	// (CallNormalFuncEnvelope) for functions whose return type varies per
+	// call site (DuckDBResultEnvelope, e.g. EVAL_JAVASCRIPT).
+	envelope bool
 }
 
 func (u *normalFuncUDF) Config() duckdb.ScalarFuncConfig {
@@ -816,13 +821,17 @@ func (u *normalFuncUDF) Config() duckdb.ScalarFuncConfig {
 func (u *normalFuncUDF) Executor() duckdb.ScalarFuncExecutor {
 	name := u.name
 	safe := u.safe
+	call := internal.CallNormalFunc
+	if u.envelope {
+		call = internal.CallNormalFuncEnvelope
+	}
 	return duckdb.ScalarFuncExecutor{
 		RowExecutor: func(values []driver.Value) (any, error) {
 			args := make([]any, len(values))
 			for i, v := range values {
 				args[i] = v
 			}
-			return internal.CallNormalFunc(name, safe, args...)
+			return call(name, safe, args...)
 		},
 	}
 }
