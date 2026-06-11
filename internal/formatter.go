@@ -5753,12 +5753,13 @@ func (n *AnalyticScanNode) FormatSQL(ctx context.Context) (string, error) {
 	if n.node == nil {
 		return "", nil
 	}
-	input, err := newNode(m1(n.node.InputScan())).FormatSQL(ctx)
+	inputScan := m1(n.node.InputScan())
+	input, err := newNode(inputScan).FormatSQL(ctx)
 	if err != nil {
 		return "", err
 	}
 	rowIDExpr := "ROW_NUMBER() OVER()"
-	if strings.Count(input, fmt.Sprintf("\"%s\"", setOperationOrdinalColumn)) == 1 {
+	if scanExposesSetOperationOrdinal(ctx, inputScan) {
 		rowIDExpr = fmt.Sprintf("ROW_NUMBER() OVER(ORDER BY \"%s\")", setOperationOrdinalColumn)
 	}
 	formattedInput, err := formatInput(input)
@@ -6270,7 +6271,7 @@ func (n *WithEntryNode) FormatSQL(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if strings.Contains(subquery, fmt.Sprintf("\"%s\"", setOperationOrdinalColumn)) {
+	if scanExposesSetOperationOrdinal(ctx, sub) {
 		if ordinals := cteSetOperationOrdinals(ctx); ordinals != nil {
 			ordinals[queryName] = true
 		}
@@ -6293,6 +6294,20 @@ func (n *WithEntryNode) FormatSQL(ctx context.Context) (string, error) {
 		return fmt.Sprintf("\"%s\"(%s) AS%s ( %s )", queryName, strings.Join(cols, ","), hint, subquery), nil
 	}
 	return fmt.Sprintf("\"%s\" AS%s ( %s )", queryName, hint, subquery), nil
+}
+
+func scanExposesSetOperationOrdinal(ctx context.Context, scan googlesql.ResolvedNode) bool {
+	if scan == nil {
+		return false
+	}
+	switch s := scan.(type) {
+	case *googlesql.ResolvedSetOperationScan:
+		return m1(s.OpType()) == googlesql.ResolvedSetOperationScanEnums_SetOperationTypeUnionAll
+	case *googlesql.ResolvedWithRefScan:
+		name, _ := s.WithQueryName()
+		return cteSetOperationOrdinals(ctx)[name]
+	}
+	return false
 }
 
 // cteMaterializeHint returns either " MATERIALIZED" (with a leading
