@@ -290,16 +290,19 @@ func (r *Rows) assignInterfaceValue(src value.Value, dst reflect.Value, typ *Typ
 		}
 		dst.Set(reflect.ValueOf(f64))
 	case googlesql.TypeKindTypeBytes:
-		// Native-storage migration: a BYTES column scans to the raw
-		// payload []byte (database/sql delivers it to Scan(&[]byte)
-		// unchanged, and to a string destination as the payload text),
-		// matching the native BLOB cell — not the legacy base64
-		// rendering ToString produced.
-		b, err := src.ToBytes()
+		// BYTES renders as its base64 text — BigQuery's wire form and
+		// the upstream googlesqlite driver contract. Storage is native
+		// BLOB (payload bytes) since the native-storage migration, but
+		// the SCAN contract stays base64: API-layer consumers
+		// (bigquery-emulator's convertValueToCell) stringify scalar
+		// cells via fmt.Sprint, which only yields the correct wire
+		// value for a base64 string, and the TestQuery corpus encodes
+		// the same expectation.
+		s, err := src.ToString()
 		if err != nil {
 			return err
 		}
-		dst.Set(reflect.ValueOf(b))
+		dst.Set(reflect.ValueOf(s))
 	case googlesql.TypeKindTypeString,
 		googlesql.TypeKindTypeNumeric,
 		googlesql.TypeKindTypeBignumeric,

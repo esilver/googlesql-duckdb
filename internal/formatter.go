@@ -4639,13 +4639,34 @@ func (n *ArrayScanNode) FormatSQL(ctx context.Context) (string, error) {
 		// If there is no join expression, use a CROSS JOIN. The single-array
 		// scan projects the element / offset aliases directly because there
 		// is no ON clause that needs them as real columns.
+		//
+		// DuckDB retarget: this comma join is a DEPENDENT (lateral) join —
+		// json_each's argument references the input relation's columns —
+		// and the engine's dependent-join flattening delivers each input
+		// row's elements in REVERSE array order (probed: `SELECT x, range
+		// FROM (SELECT 4 AS x), range(x)` yields 3,2,1,0). BigQuery's
+		// UNNEST surfaces elements in array order and the upstream SQLite
+		// lowering preserved it, so impose it deterministically: stamp
+		// each input row with an ordinal (row_number over the input's
+		// natural order), then order the cross product by (input ordinal,
+		// element offset). The helper ordinal is EXCLUDEd from the star
+		// expansion so downstream scans see exactly the columns they
+		// expect.
+		const inputOrdinal = `"$unnest_input_ordinal"`
+		wrappedInput := fmt.Sprintf(
+			"FROM (SELECT *, row_number() OVER () AS %s %s)",
+			inputOrdinal,
+			formattedInput,
+		)
 		arrayJoinExpr = fmt.Sprintf(", %s", array)
 
 		return fmt.Sprintf(
-			"SELECT *, %s %s %s",
+			"SELECT * EXCLUDE (%s), %s %s %s ORDER BY %s, json_each.key",
+			inputOrdinal,
 			strings.Join(columns, ","),
-			formattedInput,
+			wrappedInput,
 			arrayJoinExpr,
+			inputOrdinal,
 		), nil
 	}
 	return fmt.Sprintf(

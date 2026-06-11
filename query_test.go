@@ -3,6 +3,7 @@ package googlesqlite_test
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"math"
 	"os"
 	"reflect"
@@ -313,13 +314,15 @@ func TestParameterBindingTypes(t *testing.T) {
 	if !bo {
 		t.Errorf("b = false; want true")
 	}
-	// BYTES is delivered through `database/sql` as the raw payload
-	// []byte (the native-storage migration's contract: the BLOB cell
-	// holds the payload, and the scan hands it back unencoded —
-	// previously the driver rendered base64, the BigQuery wire form;
-	// API-layer encoders base64 it themselves via JSON marshaling).
-	if len(bs) != 3 || bs[0] != 1 || bs[1] != 2 || bs[2] != 3 {
-		t.Errorf("bs = %v; want [1 2 3]", bs)
+	// BYTES is delivered through `database/sql` as the base64 text of
+	// the payload — BigQuery's wire form and the upstream googlesqlite
+	// driver contract (the native-storage migration changed only the
+	// STORED cell to a payload BLOB, not the scan rendering; API-layer
+	// consumers like bigquery-emulator stringify scalar cells with
+	// fmt.Sprint and rely on receiving the base64 string). A []byte
+	// destination therefore receives the base64 text's bytes.
+	if want := base64.StdEncoding.EncodeToString([]byte{1, 2, 3}); string(bs) != want {
+		t.Errorf("bs = %q; want %q", bs, want)
 	}
 
 	// NULL parameter — bind nil and read back via NullString.

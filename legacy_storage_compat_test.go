@@ -15,9 +15,9 @@ package googlesqlite_test
 // forms (the same pure-Go encoder the v0.2.16 write path used).
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"os"
 	"testing"
 
@@ -83,8 +83,11 @@ func TestLegacyStorageCompat(t *testing.T) {
 		"SELECT b FROM legacy WHERE s = 'hello'").Scan(&got); err != nil {
 		t.Fatalf("legacy BYTES scan: %v", err)
 	}
-	if !bytes.Equal(got, []byte("abc")) {
-		t.Errorf("legacy BYTES round-trip: got %q want %q", got, "abc")
+	// The scan contract renders BYTES as the payload's base64 text
+	// (BigQuery's wire form), regardless of which cell convention —
+	// legacy envelope or native BLOB — holds it.
+	if want := base64.StdEncoding.EncodeToString([]byte("abc")); string(got) != want {
+		t.Errorf("legacy BYTES round-trip: got %q want %q", got, want)
 	}
 	wantInt64(t, db, "SELECT COUNT(*) FROM legacy", 3)
 
@@ -114,8 +117,8 @@ func TestLegacyStorageCompat(t *testing.T) {
 		"SELECT b FROM modern WHERE n = NUMERIC '4'").Scan(&modernBytes); err != nil {
 		t.Fatalf("modern BYTES scan: %v", err)
 	}
-	if !bytes.Equal(modernBytes, []byte("aa")) {
-		t.Errorf("modern BYTES round-trip: got %q want %q", modernBytes, "aa")
+	if want := base64.StdEncoding.EncodeToString([]byte("aa")); string(modernBytes) != want {
+		t.Errorf("modern BYTES round-trip: got %q want %q", modernBytes, want)
 	}
 
 	// Cross-table read: legacy and native NUMERIC compare by value in
