@@ -103,14 +103,6 @@ func seamBool(t *testing.T, db *sql.DB, query string) bool {
 	return got
 }
 
-// seamStringErr is seamString without the Fatalf: it returns the query
-// error so known-bug call sites can xfail (skip) instead of dying.
-func seamStringErr(db *sql.DB, query string) (string, error) {
-	var got string
-	err := db.QueryRowContext(context.Background(), query).Scan(&got)
-	return got, err
-}
-
 // seamAny scans into `any`, driving assignInterfaceValue for container
 // kinds (ARRAY scans to []any, STRUCT to positional []any).
 func seamAny(t *testing.T, db *sql.DB, query string) any {
@@ -201,24 +193,17 @@ func TestStorageSeam_Numeric(t *testing.T) {
 	if got := seamString(t, db, "SELECT c FROM t"); got != "3.14" {
 		t.Errorf("direct NUMERIC scan: got %q want %q", got, "3.14")
 	}
-	// Arithmetic on the stored column must stay NUMERIC.
-	//
-	// KNOWN BUG (caught by this suite, 2026-06-10, do not paper over):
-	// NUMERIC columns persist as VARCHAR at the engine level, so any
-	// arithmetic / comparison on the stored column dies with
-	//   Binder Error: No function matches '*(VARCHAR, STRING_LITERAL)'.
-	// Rendering round-trips fine (the asserts above); only computation
-	// on the stored column is broken. The skip below is an xfail: once
-	// the column persists as native DECIMAL the assertions take over.
-	got, err := seamStringErr(db, "SELECT CAST(c * 2 AS STRING) FROM t")
-	if err != nil {
-		t.Skipf("KNOWN BUG (storage seam): NUMERIC column persists as VARCHAR; "+
-			"arithmetic on the stored column fails: %v", err)
-	}
-	if got != "6.28" {
-		t.Errorf("got %q want %q\nsql: SELECT CAST(c * 2 AS STRING) FROM t", got, "6.28")
-	}
+	// Arithmetic / comparison on the stored column must stay NUMERIC and
+	// run engine-native. These were xfail skips while NUMERIC persisted
+	// as a VARCHAR envelope (arithmetic was a Binder Error, comparison
+	// ordered lexicographically); the native-storage migration stores
+	// the column as DECIMAL(38,9), so they assert.
+	wantString(t, db, "SELECT CAST(c * 2 AS STRING) FROM t", "6.28")
 	wantInt64(t, db, "SELECT COUNT(*) FROM t WHERE c > NUMERIC '3'", 1)
+	// ORDER BY / GROUP BY on the stored column order and group by VALUE.
+	seamExec(t, db, "INSERT INTO t (c) VALUES (NUMERIC '10'), (NUMERIC '2')")
+	wantString(t, db, "SELECT CAST(c AS STRING) FROM t ORDER BY c DESC LIMIT 1", "10")
+	wantInt64(t, db, "SELECT COUNT(*) FROM (SELECT c FROM t GROUP BY c)", 3)
 }
 
 func TestStorageSeam_String(t *testing.T) {
@@ -247,16 +232,12 @@ func TestStorageSeam_Bytes(t *testing.T) {
 		"SELECT c FROM t").Scan(&got); err != nil {
 		t.Fatalf("scan BYTES: %v", err)
 	}
-	// KNOWN BUG (caught by this suite, 2026-06-10, do not paper over):
-	// BYTES columns persist the legacy base64 {"header","body"} JSON
-	// carrier envelope instead of a native BLOB. The stored b'abc'
-	// reads back as the 44-char envelope string
-	// (base64 of {"header":"bytes","body":"YWJj"}), BYTE_LENGTH
-	// returns 44, and TO_HEX hex-dumps the envelope. The skip below is
-	// an xfail: once the column persists natively the assertions run.
+	// Native-storage migration: the BLOB cell holds the PAYLOAD bytes
+	// (this was an xfail skip while the cell held the value-layer
+	// envelope's ASCII — BYTE_LENGTH returned 44 and TO_HEX hex-dumped
+	// the envelope).
 	if !bytes.Equal(got, []byte("abc")) {
-		t.Skipf("KNOWN BUG (storage seam): BYTES column persists the JSON carrier "+
-			"envelope, not a native BLOB; round-trip got %q want %q", got, "abc")
+		t.Fatalf("stored BYTES round-trip: got %q want %q", got, "abc")
 	}
 	wantInt64(t, db, "SELECT BYTE_LENGTH(c) FROM t", 3)
 	wantString(t, db, "SELECT TO_HEX(c) FROM t", "616263")
@@ -721,15 +702,11 @@ func TestStorageSeam_AggregateBytes(t *testing.T) {
 		"INSERT INTO t (c) VALUES (b'bb'), (b'aa'), (NULL)",
 	)
 	wantInt64(t, db, "SELECT COUNT(c) FROM t", 2)
-	// MIN/MAX over BYTES order by the payload bytes in BigQuery; the
-	// stored envelope's base64 text does not preserve that order in
-	// general. Skip-as-xfail when broken (native BLOB storage — the
-	// issue #9 migration spec — flips these on).
-	got, err := seamStringErr(db, "SELECT CAST(MIN(c) AS STRING) FROM t")
-	if err != nil || got != "aa" {
-		t.Skipf("KNOWN BUG (storage seam): MIN/MAX over stored BYTES compares the "+
-			"envelope, not the payload (got %q, err %v)", got, err)
-	}
+	// MIN/MAX over BYTES order by the payload bytes in BigQuery — the
+	// native BLOB ordering since the native-storage migration (this was
+	// an xfail skip while the cells held envelope ASCII, whose base64
+	// text does not preserve payload order).
+	wantString(t, db, "SELECT CAST(MIN(c) AS STRING) FROM t", "aa")
 	wantString(t, db, "SELECT CAST(MAX(c) AS STRING) FROM t", "bb")
 }
 
