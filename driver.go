@@ -124,10 +124,17 @@ func init() {
 // through after stripping the leading "file:" scheme and any query string.
 func duckdbDSN(name string) string {
 	path, _ := dsnParts(name)
-	// Any in-memory variant -> DuckDB in-memory.
+	// Any in-memory variant -> DuckDB in-memory. The ncruces "memdb"
+	// VFS (the CLI's default DSN, file:/NAME?vfs=memdb) is a
+	// process-shared in-memory database keyed by its path; mapping it
+	// to a root-level on-disk file fails on DuckDB (errno 30). The
+	// DSN-keyed *sql.DB cache in newDBAndCatalog already shares one
+	// engine per full DSN string, which reproduces memdb's
+	// shared-by-name semantics on a DuckDB in-memory database.
 	if path == ":memory:" ||
 		strings.HasPrefix(name, "file::memory:") ||
-		strings.Contains(name, "mode=memory") {
+		strings.Contains(name, "mode=memory") ||
+		strings.Contains(name, "vfs=memdb") {
 		return ""
 	}
 	// On-disk: strip the file: scheme DuckDB does not parse, and drop the
