@@ -5305,11 +5305,15 @@ func (n *AggregateScanNode) FormatSQL(ctx context.Context) (string, error) {
 				stmts = append(stmts, fmt.Sprintf("SELECT %s FROM %s %s", formattedColumns, input, groupBy))
 			}
 		}
-		// DuckDB retarget: order the grouping-set UNION ALL output on the
-		// bare value-layer columns (no googlesqlite_collate on DuckDB).
+		// DuckDB requires ORDER BY expressions over UNION results to live
+		// outside the set operation when they are not plain output columns.
+		unionSQL := strings.Join(stmts, " UNION ALL ")
+		if len(groupByOrderColumns) == 0 {
+			return unionSQL, nil
+		}
 		return fmt.Sprintf(
-			"%s ORDER BY %s",
-			strings.Join(stmts, " UNION ALL "),
+			"SELECT * FROM (%s) ORDER BY %s",
+			unionSQL,
 			strings.Join(groupByOrderColumns, ","),
 		), nil
 	}
