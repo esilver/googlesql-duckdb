@@ -158,6 +158,16 @@ func GoogleSQLPlainString(v any) (any, error) {
 	}
 	s, ok := v.(string)
 	if !ok {
+		// Non-string operand (the UDF input is variadic-ANY since the
+		// native-storage migration): a native DECIMAL operand arrives
+		// as the exact Decimal carrier and renders its canonical plain
+		// decimal text; anything else decodable renders via ToString.
+		// Unrenderable operands pass through for the engine to coerce.
+		if decoded, err := DecodeValue(v); err == nil && decoded != nil {
+			if out, err := decoded.ToString(); err == nil {
+				return out, nil
+			}
+		}
 		return v, nil
 	}
 	decoded, err := DecodeValue(s)
@@ -194,6 +204,34 @@ func GoogleSQLStringEnvelope(v any) (any, error) {
 		return nil, err
 	}
 	return encoded, nil
+}
+
+// GoogleSQLToNativeBytes is the DuckDB-facing bridge for the
+// googlesqlite_to_native_bytes scalar UDF (BLOB result). The formatter
+// wraps BYTES-typed operands headed for native consumers — BLOB column
+// INSERT / UPDATE values, CTAS projections, comparisons, MIN/MAX — so
+// the engine always sees the PAYLOAD bytes (the native-storage cell
+// form). Native operands pass through: a stored payload BLOB arrives as
+// []byte and stays itself (the envelope sniff inside DecodeValue only
+// claims legacy envelope-ASCII blobs); a value-layer envelope (a
+// googlesqlite_* UDF result, a legacy-table cell) decodes to its
+// payload bytes. NULL stays NULL.
+func GoogleSQLToNativeBytes(v any) (any, error) {
+	if v == nil {
+		return nil, nil
+	}
+	decoded, err := DecodeValue(v)
+	if err != nil {
+		return nil, err
+	}
+	if decoded == nil {
+		return nil, nil
+	}
+	b, err := decoded.ToBytes()
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
 }
 
 var jsonFamilyMapOnce sync.Once

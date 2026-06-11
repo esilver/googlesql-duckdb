@@ -46,7 +46,38 @@ func registerDuckDBJSONUDFs(db *sql.DB) error {
 	if err := duckdb.RegisterScalarUDF(conn, "googlesqlite_string_envelope", &stringEnvelopeUDF{}); err != nil {
 		return fmt.Errorf("googlesqlite: register googlesqlite_string_envelope: %w", err)
 	}
+	if err := duckdb.RegisterScalarUDF(conn, "googlesqlite_to_native_bytes", &toNativeBytesUDF{}); err != nil {
+		return fmt.Errorf("googlesqlite: register googlesqlite_to_native_bytes: %w", err)
+	}
 	return nil
+}
+
+// toNativeBytesUDF adapts internal.GoogleSQLToNativeBytes to DuckDB's
+// scalar-UDF interface: variadic-ANY in (a payload BLOB passes through,
+// an envelope VARCHAR / legacy envelope-ASCII BLOB decodes to its
+// payload), BLOB out. The formatter wraps BYTES operands headed for
+// native consumers (column writes, CTAS projections, comparisons,
+// MIN/MAX) in it — the native-storage migration's BYTES normalizer.
+type toNativeBytesUDF struct{}
+
+func (*toNativeBytesUDF) Config() duckdb.ScalarFuncConfig {
+	any_, _ := duckdb.NewTypeInfo(duckdb.TYPE_ANY)
+	blob, _ := duckdb.NewTypeInfo(duckdb.TYPE_BLOB)
+	return duckdb.ScalarFuncConfig{
+		VariadicTypeInfo: any_,
+		ResultTypeInfo:   blob,
+	}
+}
+
+func (*toNativeBytesUDF) Executor() duckdb.ScalarFuncExecutor {
+	return duckdb.ScalarFuncExecutor{
+		RowExecutor: func(values []driver.Value) (any, error) {
+			if len(values) != 1 {
+				return nil, fmt.Errorf("googlesqlite_to_native_bytes: want 1 arg, got %d", len(values))
+			}
+			return internal.GoogleSQLToNativeBytes(values[0])
+		},
+	}
 }
 
 // stringEnvelopeUDF is googlesqlite_plain_string's inverse: VARCHAR ->
@@ -80,18 +111,25 @@ func (*stringEnvelopeUDF) Executor() duckdb.ScalarFuncExecutor {
 }
 
 // plainStringUDF adapts internal.GoogleSQLPlainString to DuckDB's
-// scalar-UDF interface: VARCHAR -> VARCHAR, unwrapping a value-layer
-// STRING envelope to its bare text (pass-through for anything else).
-// The formatter wraps the operand of native STRING -> temporal casts
-// in it so bound params / stored STRING cells (which carry the
-// envelope at runtime) survive DuckDB's date/time parser.
+// scalar-UDF interface: ANY -> VARCHAR, unwrapping a value-layer
+// STRING envelope to its bare text (canonical text rendering for
+// anything else). The formatter wraps the operand of native STRING ->
+// temporal casts in it so bound params / stored STRING cells (which
+// carry the envelope at runtime) survive DuckDB's date/time parser,
+// and the native-storage read forms use it as their envelope-decode
+// fallback arm. The input is variadic-ANY (not fixed VARCHAR) so the
+// call BINDS against every operand shape the read forms splice it
+// around — an envelope VARCHAR, a native DECIMAL(38,9) operand
+// (delivered as the exact Decimal carrier), or a JSON-typed UNNEST
+// element (delivered parsed, keeping envelope text unquoted).
 type plainStringUDF struct{}
 
 func (*plainStringUDF) Config() duckdb.ScalarFuncConfig {
+	any_, _ := duckdb.NewTypeInfo(duckdb.TYPE_ANY)
 	varchar, _ := duckdb.NewTypeInfo(duckdb.TYPE_VARCHAR)
 	return duckdb.ScalarFuncConfig{
-		InputTypeInfos: []duckdb.TypeInfo{varchar},
-		ResultTypeInfo: varchar,
+		VariadicTypeInfo: any_,
+		ResultTypeInfo:   varchar,
 	}
 }
 

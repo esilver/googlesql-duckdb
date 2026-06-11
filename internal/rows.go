@@ -279,8 +279,18 @@ func (r *Rows) assignInterfaceValue(src value.Value, dst reflect.Value, typ *Typ
 			return err
 		}
 		dst.Set(reflect.ValueOf(f64))
-	case googlesql.TypeKindTypeBytes,
-		googlesql.TypeKindTypeString,
+	case googlesql.TypeKindTypeBytes:
+		// Native-storage migration: a BYTES column scans to the raw
+		// payload []byte (database/sql delivers it to Scan(&[]byte)
+		// unchanged, and to a string destination as the payload text),
+		// matching the native BLOB cell — not the legacy base64
+		// rendering ToString produced.
+		b, err := src.ToBytes()
+		if err != nil {
+			return err
+		}
+		dst.Set(reflect.ValueOf(b))
+	case googlesql.TypeKindTypeString,
 		googlesql.TypeKindTypeNumeric,
 		googlesql.TypeKindTypeBignumeric,
 		googlesql.TypeKindTypeInterval,

@@ -713,27 +713,26 @@ var nativeBinaryAggregates = map[string]struct {
 // range — matching BigQuery's overflow-is-an-error semantics. SUM over
 // FLOAT64 keeps the DOUBLE path.
 //
-// NUMERIC / BIGNUMERIC arguments are the envelope-exactness case (issue
-// #9): the stored cell is the value-layer base64 envelope, which the
-// default CAST(arg AS DOUBLE) rejects outright ("Could not convert string
-// 'eyJoZWFkZXIi...' to DOUBLE") — and even if it parsed, BigQuery
-// SUM/AVG(NUMERIC) are NUMERIC-exact, not FLOAT64. Those arguments are
-// first unwrapped to their plain decimal text with
-// googlesqlite_plain_string and then cast to DECIMAL(38,9) (GoogleSQL
-// NUMERIC's exact shape): DuckDB's sum(DECIMAL(38,9)) accumulates exactly
-// and returns DECIMAL(38,9) (overflow raises, matching BigQuery), and
-// avg's DOUBLE result is narrowed back to DECIMAL(38,9) so the result
-// type stays NUMERIC. The statistical family (stddev/var/corr/...) is
-// FLOAT64-returning in BigQuery, so its NUMERIC arguments decode and then
-// take the family's usual DOUBLE cast. BIGNUMERIC exceeds DuckDB's
-// 38-digit DECIMAL ceiling, so it decodes to DOUBLE (approximate) rather
-// than failing on the envelope.
+// NUMERIC arguments are the exactness case (issue #9, completed by the
+// native-storage migration): BigQuery SUM/AVG(NUMERIC) are NUMERIC-exact,
+// not FLOAT64. Stored NUMERIC columns are native DECIMAL(38,9) cells, so
+// the reducer binds them directly through numericStorageReadSQL (which
+// also tolerates envelope-shaped operands — UDF results and legacy-table
+// columns — at zero per-row cost for native rows): DuckDB's
+// sum(DECIMAL(38,9)) accumulates exactly and returns DECIMAL(38,9)
+// (overflow raises, matching BigQuery), and avg's DOUBLE result is
+// narrowed back to DECIMAL(38,9) so the result type stays NUMERIC. The
+// statistical family (stddev/var/corr/...) is FLOAT64-returning in
+// BigQuery, so NUMERIC arguments take the family's usual DOUBLE cast.
+// BIGNUMERIC stays a value-layer envelope (it exceeds DuckDB's 38-digit
+// DECIMAL ceiling) and decodes to DOUBLE (approximate) via
+// googlesqlite_plain_string rather than failing on the envelope.
 //
 // MIN / MAX are not in nativeNumericAggregates (DuckDB's min/max bind any
-// type), but over a NUMERIC envelope column the bare emit compares the
-// base64 TEXT lexicographically — silently wrong ordering. They are
-// claimed here only for NUMERIC/BIGNUMERIC arguments, with the same
-// decode + DECIMAL(38,9) treatment.
+// type), but they are claimed for NUMERIC (native DECIMAL ordering),
+// BYTES (native payload-BLOB ordering), BIGNUMERIC (decode + DOUBLE) and
+// STRING (envelope unwrap + re-wrap) so the comparison runs over values,
+// not envelope text.
 func tryNativeNumericAggregate(funcName string, args []string, resultKind googlesql.TypeKind, kinds []googlesql.TypeKind) (string, []string, string, bool) {
 	argKind := kindAt(kinds, 0)
 	if m, ok := nativeNumericAggregates[funcName]; ok && len(args) == 1 {
@@ -741,16 +740,27 @@ func tryNativeNumericAggregate(funcName string, args []string, resultKind google
 		switch {
 		case funcName == "sum" && resultKind == googlesql.TypeKindTypeInt64:
 			castType, resultWrap = "BIGINT", "CAST(%s AS BIGINT)"
-		case isNumericEnvelopeKind(argKind):
-			decoded := fmt.Sprintf("googlesqlite_plain_string(%s)", args[0])
+		case argKind == googlesql.TypeKindTypeNumeric:
+			// Native-storage NUMERIC: the stored column is already
+			// DECIMAL(38,9), so the reducer binds it directly — the
+			// numericStorageReadSQL wrap costs nothing for native rows
+			// (TRY_CAST arm) and keeps envelope-shaped operands (UDF
+			// results, legacy tables) decoding instead of erroring.
+			native := numericStorageReadSQL(args[0])
 			switch {
 			case funcName == "sum" && resultKind == googlesql.TypeKindTypeNumeric:
-				return m.duckName, []string{fmt.Sprintf("CAST(%s AS DECIMAL(38,9))", decoded)}, "", true
+				return m.duckName, []string{native}, "", true
 			case funcName == "avg" && resultKind == googlesql.TypeKindTypeNumeric:
-				return m.duckName, []string{fmt.Sprintf("CAST(%s AS DECIMAL(38,9))", decoded)}, "CAST(%s AS DECIMAL(38,9))", true
+				return m.duckName, []string{native}, "CAST(%s AS DECIMAL(38,9))", true
 			default:
-				return m.duckName, []string{fmt.Sprintf("CAST(%s AS %s)", decoded, m.castType)}, "", true
+				return m.duckName, []string{fmt.Sprintf("CAST(%s AS %s)", native, m.castType)}, "", true
 			}
+		case isNumericEnvelopeKind(argKind):
+			// BIGNUMERIC stays a value-layer envelope (beyond DuckDB's
+			// 38-digit DECIMAL): decode to plain text, engine ops run
+			// over DOUBLE (documented approximation).
+			decoded := fmt.Sprintf("googlesqlite_plain_string(%s)", args[0])
+			return m.duckName, []string{fmt.Sprintf("CAST(%s AS %s)", decoded, m.castType)}, "", true
 		}
 		return m.duckName, []string{fmt.Sprintf("CAST(%s AS %s)", args[0], castType)}, resultWrap, true
 	}
@@ -758,7 +768,16 @@ func tryNativeNumericAggregate(funcName string, args []string, resultKind google
 		decoded := fmt.Sprintf("googlesqlite_plain_string(%s)", args[0])
 		switch {
 		case argKind == googlesql.TypeKindTypeNumeric:
-			return funcName, []string{fmt.Sprintf("CAST(%s AS DECIMAL(38,9))", decoded)}, "", true
+			// Native DECIMAL(38,9) storage: min/max order by value
+			// directly; the read wrap only decodes envelope-shaped
+			// operands (UDF results, legacy tables).
+			return funcName, []string{numericStorageReadSQL(args[0])}, "", true
+		case argKind == googlesql.TypeKindTypeBytes:
+			// Native payload-BLOB storage: BigQuery orders BYTES by
+			// payload bytes, which is exactly DuckDB's BLOB ordering.
+			// The read wrap unwraps envelope-shaped operands (UDF
+			// results, legacy tables) to payload bytes first.
+			return funcName, []string{bytesStorageReadSQL(args[0])}, "", true
 		case argKind == googlesql.TypeKindTypeBignumeric:
 			return funcName, []string{fmt.Sprintf("CAST(%s AS DOUBLE)", decoded)}, "", true
 		case argKind == googlesql.TypeKindTypeString:
@@ -773,12 +792,17 @@ func tryNativeNumericAggregate(funcName string, args []string, resultKind google
 		}
 	}
 	if m, ok := nativeBinaryAggregates[funcName]; ok && len(args) == 2 {
-		// The correlation / covariance family is FLOAT64-returning, but a
-		// NUMERIC operand still needs the envelope unwrapped before the
-		// DOUBLE cast can parse it (issue #9).
+		// The correlation / covariance family is FLOAT64-returning.
+		// NUMERIC operands are native DECIMAL since the storage
+		// migration (the read wrap tolerates envelope-shaped operands);
+		// BIGNUMERIC operands still need the envelope unwrapped before
+		// the DOUBLE cast can parse them (issue #9).
 		castArgs := make([]string, 2)
 		for i, a := range args {
-			if isNumericEnvelopeKind(kindAt(kinds, i)) {
+			switch {
+			case kindAt(kinds, i) == googlesql.TypeKindTypeNumeric:
+				a = numericStorageReadSQL(a)
+			case isNumericEnvelopeKind(kindAt(kinds, i)):
 				a = fmt.Sprintf("googlesqlite_plain_string(%s)", a)
 			}
 			castArgs[i] = fmt.Sprintf("CAST(%s AS %s)", a, m.castType)
@@ -788,13 +812,66 @@ func tryNativeNumericAggregate(funcName string, args []string, resultKind google
 	return "", nil, "", false
 }
 
-// isNumericEnvelopeKind reports whether kind is one of the GoogleSQL
-// arbitrary-precision numeric kinds whose stored column form is the
-// value-layer base64 envelope in a TEXT cell (storageTypeForKind maps
-// both to TEXT), so engine-native expressions over the raw column must
-// decode through googlesqlite_plain_string first.
+// isNumericEnvelopeKind reports whether kind is a GoogleSQL
+// arbitrary-precision numeric kind whose stored column form is the
+// value-layer base64 envelope in a TEXT cell, so engine-native
+// expressions over the raw column must decode through
+// googlesqlite_plain_string first. Since the native-storage migration
+// only BIGNUMERIC qualifies (it exceeds DuckDB's 38-digit DECIMAL);
+// NUMERIC is stored as a native DECIMAL(38,9) column and reads through
+// numericStorageReadSQL instead.
 func isNumericEnvelopeKind(kind googlesql.TypeKind) bool {
-	return kind == googlesql.TypeKindTypeNumeric || kind == googlesql.TypeKindTypeBignumeric
+	return kind == googlesql.TypeKindTypeBignumeric
+}
+
+// numericStorageReadSQL renders a NUMERIC-typed operand as a native
+// DECIMAL(38,9) the engine's operators / reducers bind directly.
+//
+// Since the native-storage migration a NUMERIC expression is native in
+// the common cases — a stored column (DECIMAL(38,9) cell), a literal
+// (CAST('d.ddd' AS DECIMAL(38,9))), a bound parameter (plain decimal
+// text), an operator result — but a googlesqlite_* UDF result (and a
+// legacy-table column, compat mode (b)) still carries the value-layer
+// base64 envelope as VARCHAR. TRY_CAST claims every native shape with
+// zero per-row UDF cost (an envelope never parses as a decimal); the
+// COALESCE arm only runs for the rows TRY_CAST rejects, decoding the
+// envelope to plain decimal text and re-casting. NULL stays NULL
+// through both arms. The operand SQL is spliced twice, so callers must
+// only pass deterministic expressions (column refs, literals, scalar
+// expressions) — every current call site does.
+func numericStorageReadSQL(expr string) string {
+	// The dual form splices the operand TWICE, which is only legal when
+	// the operand SQL carries no bound-parameter placeholders — a
+	// duplicated `?` / `$name` shifts every later positional binding
+	// ("Values were not provided for prepared statement parameters").
+	// Conservatively detect placeholders by character: `?` (also inside
+	// string literals — over-matching is safe) and `$` (named params;
+	// also matches computed-column identifiers like "$col1#1" —
+	// over-matching is safe). Such operands take the single-reference
+	// UDF form: googlesqlite_plain_string renders ANY operand shape to
+	// plain decimal text (a native parameter binds plain text anyway,
+	// so the UDF is pass-through there).
+	if strings.ContainsAny(expr, "?$") {
+		return fmt.Sprintf("CAST(googlesqlite_plain_string(%s) AS DECIMAL(38,9))", expr)
+	}
+	// The fallback arm passes the RAW operand to the variadic-ANY
+	// googlesqlite_plain_string (no inner VARCHAR cast): a JSON-typed
+	// UNNEST element must arrive as the parsed (unquoted) envelope text
+	// the UDF facade delivers, which an SQL-level CAST(... AS VARCHAR)
+	// would re-quote.
+	return fmt.Sprintf(
+		"COALESCE(TRY_CAST(%s AS DECIMAL(38,9)), CAST(googlesqlite_plain_string(%s) AS DECIMAL(38,9)))",
+		expr, expr,
+	)
+}
+
+// bytesStorageReadSQL renders a BYTES-typed operand as a native payload
+// BLOB. Stored columns (payload BLOB cells) and blob literals pass
+// through googlesqlite_to_native_bytes unchanged; a value-layer
+// envelope (a googlesqlite_* UDF result, a legacy-table cell) is
+// unwrapped to its payload bytes. Single evaluation of the operand.
+func bytesStorageReadSQL(expr string) string {
+	return fmt.Sprintf("googlesqlite_to_native_bytes(%s)", expr)
 }
 
 // tryNativeApproxAggregate rewrites the approximate-aggregate family to
@@ -935,7 +1012,28 @@ func tryNativeOperator(funcName string, args []string, kinds []googlesql.TypeKin
 				args[0], tok, args[1],
 			), true
 		}
-		return fmt.Sprintf("(%s %s %s)", args[0], tok, args[1]), true
+		// Native-storage NUMERIC / BYTES operands (ALL comparison
+		// operators, equality included): since the storage migration a
+		// stored NUMERIC column is a native DECIMAL(38,9) and a stored
+		// BYTES column a payload BLOB, while a googlesqlite_* UDF result
+		// (or a legacy-table cell, compat mode (b)) still carries the
+		// value-layer envelope VARCHAR — comparing the two raw forms
+		// either fails to bind or compares envelope text against native
+		// values. numericStorageReadSQL / bytesStorageReadSQL normalize
+		// both sides to the native form: pass-through for native
+		// operands (no per-row UDF on the TRY_CAST arm), envelope decode
+		// otherwise. Disjoint from the STRING/UUID branch above (kind
+		// checks never overlap).
+		lhs, rhs := args[0], args[1]
+		for i, a := range []*string{&lhs, &rhs} {
+			switch kindAt(kinds, i) {
+			case googlesql.TypeKindTypeNumeric:
+				*a = numericStorageReadSQL(*a)
+			case googlesql.TypeKindTypeBytes:
+				*a = bytesStorageReadSQL(*a)
+			}
+		}
+		return fmt.Sprintf("(%s %s %s)", lhs, tok, rhs), true
 	}
 
 	switch op {
@@ -965,6 +1063,20 @@ func tryNativeOperator(funcName string, args []string, kinds []googlesql.TypeKin
 		if len(args) != 2 {
 			return "", false
 		}
+		// NUMERIC / BIGNUMERIC division is NOT claimed natively: BigQuery
+		// `/` over NUMERIC returns NUMERIC computed exactly and ERRORS on
+		// a zero divisor, while the native float lowering below would
+		// compute in DOUBLE and yield Inf. Fall through to the
+		// googlesqlite_divide UDF — its operands arrive as exact carriers
+		// (the native DECIMAL(38,9) becomes a NumericValue via the
+		// foreign-decoder hook) and NumericValue.Div is exact rational
+		// arithmetic with the divide-by-zero error.
+		if kindAt(kinds, 0) == googlesql.TypeKindTypeNumeric ||
+			kindAt(kinds, 1) == googlesql.TypeKindTypeNumeric ||
+			isNumericEnvelopeKind(kindAt(kinds, 0)) ||
+			isNumericEnvelopeKind(kindAt(kinds, 1)) {
+			return "", false
+		}
 		// GoogleSQL $divide is FLOAT64 division. DuckDB `/` on integer
 		// operands is integer division, so force float semantics with a
 		// *1.0 lift on the numerator. In safe-eval / SAFE mode a zero
@@ -985,11 +1097,24 @@ func tryNativeOperator(funcName string, args []string, kinds []googlesql.TypeKin
 	case "in":
 		// $in operator form: first arg is the probe, the rest are the
 		// list literals. DuckDB IN is native. (The table/array IN
-		// subquery form never reaches here as a $in builtin.)
+		// subquery form never reaches here as a $in builtin.) The
+		// native-storage kinds take the same operand normalization as
+		// the comparison operators so probe and list compare by VALUE
+		// whichever of the native / envelope forms each side carries.
 		if len(args) < 2 {
 			return "", false
 		}
-		return fmt.Sprintf("(%s IN (%s))", args[0], strings.Join(args[1:], ", ")), true
+		inArgs := make([]string, len(args))
+		for i, a := range args {
+			switch kindAt(kinds, i) {
+			case googlesql.TypeKindTypeNumeric:
+				a = numericStorageReadSQL(a)
+			case googlesql.TypeKindTypeBytes:
+				a = bytesStorageReadSQL(a)
+			}
+			inArgs[i] = a
+		}
+		return fmt.Sprintf("(%s IN (%s))", inArgs[0], strings.Join(inArgs[1:], ", ")), true
 	case "bitwise_and", "bitwise_or", "bitwise_left_shift", "bitwise_right_shift":
 		// GoogleSQL bitwise &, |, <<, >> map to the identically spelled
 		// DuckDB infix operators. The operands must be integer-typed; a
@@ -2681,16 +2806,32 @@ func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName 
 				castType = "DOUBLE"
 			}
 			valueArgs[0] = fmt.Sprintf("CAST(%s AS %s)", valueArgs[0], castType)
+		} else if kindAt(kinds, 0) == googlesql.TypeKindTypeNumeric {
+			// Native-storage NUMERIC: a stored column is DECIMAL(38,9)
+			// and binds the window reducer directly; the read wrap only
+			// decodes envelope-shaped operands (UDF results, legacy
+			// tables) — issue #9's window path, completed natively.
+			valueArgs[0] = numericStorageReadSQL(valueArgs[0])
 		} else if isNumericEnvelopeKind(kindAt(kinds, 0)) {
-			// NUMERIC / BIGNUMERIC window operands carry the value-layer
-			// envelope (issue #9): unwrap to plain decimal text and run the
-			// window reducer over exact DECIMAL(38,9) (NUMERIC) or DOUBLE
-			// (BIGNUMERIC, which exceeds DuckDB's 38-digit DECIMAL).
-			target := "DECIMAL(38,9)"
-			if kindAt(kinds, 0) == googlesql.TypeKindTypeBignumeric {
-				target = "DOUBLE"
-			}
-			valueArgs[0] = fmt.Sprintf("CAST(googlesqlite_plain_string(%s) AS %s)", valueArgs[0], target)
+			// BIGNUMERIC window operands stay value-layer envelopes
+			// (beyond DuckDB's 38-digit DECIMAL): unwrap to plain text
+			// and run the window reducer over DOUBLE (approximate).
+			valueArgs[0] = fmt.Sprintf("CAST(googlesqlite_plain_string(%s) AS DOUBLE)", valueArgs[0])
+		}
+	}
+	// MIN / MAX in OVER context order by the raw operand: fine for the
+	// native scalar kinds, but a NUMERIC operand must order as DECIMAL
+	// (envelope-shaped operands would order lexicographically) and a
+	// BYTES operand by payload bytes — the same treatment the
+	// non-window aggregate path applies (issue #9's "window not" gap,
+	// closed by the native-storage migration).
+	if (sqliteName == "min" || sqliteName == "max") && len(valueArgs) >= 1 {
+		kinds := argKinds(m1(n.node.ResolvedFunctionCallBase.ArgumentList()))
+		switch kindAt(kinds, 0) {
+		case googlesql.TypeKindTypeNumeric:
+			valueArgs[0] = numericStorageReadSQL(valueArgs[0])
+		case googlesql.TypeKindTypeBytes:
+			valueArgs[0] = bytesStorageReadSQL(valueArgs[0])
 		}
 	}
 	// $count_star resolves with no value arguments; DuckDB's native
@@ -3219,6 +3360,12 @@ func kindAt(kinds []googlesql.TypeKind, i int) googlesql.TypeKind {
 func castOperandToKind(operand string, kind googlesql.TypeKind) string {
 	if castType, ok := valueLayerScalarCastType(kind); ok {
 		return fmt.Sprintf("CAST(%s AS %s)", operand, castType)
+	}
+	// Native-storage NUMERIC: arithmetic binds the stored DECIMAL(38,9)
+	// directly; the read wrap normalizes envelope-shaped operands (UDF
+	// results, legacy tables) instead of failing the binder.
+	if kind == googlesql.TypeKindTypeNumeric {
+		return numericStorageReadSQL(operand)
 	}
 	return operand
 }
@@ -5333,6 +5480,47 @@ func (n *InsertStmtNode) FormatSQL(ctx context.Context) (string, error) {
 		// Skip default substitution here — defaults still apply to
 		// the VALUES form, which covers the common case.
 		_ = defaults
+		// Native-storage seam (same as the VALUES form below): JSON /
+		// NUMERIC / BYTES target columns must receive their storage
+		// representation, but a projected googlesqlite_* UDF result is
+		// still an envelope VARCHAR. When any targeted column needs it,
+		// re-project the SELECT through a positional column-alias
+		// subquery (FROM (...) AS src(c0, c1, ...)) with the per-kind
+		// normalizers; native projections pass through them unchanged.
+		needsWrap := false
+		for _, col := range insertCols {
+			if t, err := col.Type(); err == nil && t != nil {
+				if k, err := t.Kind(); err == nil {
+					switch k {
+					case googlesql.TypeKindTypeJson, googlesql.TypeKindTypeNumeric, googlesql.TypeKindTypeBytes:
+						needsWrap = true
+					}
+				}
+			}
+		}
+		if needsWrap {
+			aliases := make([]string, len(insertCols))
+			projs := make([]string, len(insertCols))
+			for i, col := range insertCols {
+				alias := fmt.Sprintf(`"__gsx_ins_c%d"`, i)
+				aliases[i] = alias
+				projs[i] = alias
+				if t, err := col.Type(); err == nil && t != nil {
+					if k, err := t.Kind(); err == nil {
+						switch k {
+						case googlesql.TypeKindTypeJson:
+							projs[i] = fmt.Sprintf("googlesqlite_to_native_json(%s)", alias)
+						case googlesql.TypeKindTypeNumeric:
+							projs[i] = numericStorageReadSQL(alias)
+						case googlesql.TypeKindTypeBytes:
+							projs[i] = bytesStorageReadSQL(alias)
+						}
+					}
+				}
+			}
+			stmt = fmt.Sprintf("SELECT %s FROM (%s) AS __gsx_ins_src(%s)",
+				strings.Join(projs, ","), stmt, strings.Join(aliases, ","))
+		}
 		return fmt.Sprintf("INSERT INTO \"%s\" (%s) %s",
 			table,
 			strings.Join(columns[:len(insertCols)], ","),
@@ -5348,11 +5536,18 @@ func (n *InsertStmtNode) FormatSQL(ctx context.Context) (string, error) {
 	// value headed for a JSON column in googlesqlite_to_native_json,
 	// which unwraps the envelope to raw JSON text and passes already-
 	// native values (bound params) through untouched.
-	jsonCol := make([]bool, len(insertCols))
+	// The native-storage NUMERIC / BYTES columns need the analogous
+	// normalization (numericStorageReadSQL / bytesStorageReadSQL): a
+	// stored cell must be the native DECIMAL(38,9) / payload BLOB, but a
+	// googlesqlite_* UDF result still arrives as the envelope VARCHAR.
+	// Native value expressions (literals, params, operator results) pass
+	// through the wraps unchanged.
+	colKinds := make([]googlesql.TypeKind, len(insertCols))
 	for i, col := range insertCols {
+		colKinds[i] = googlesql.TypeKindTypeUnknown
 		if t, err := col.Type(); err == nil && t != nil {
-			if k, err := t.Kind(); err == nil && k == googlesql.TypeKindTypeJson {
-				jsonCol[i] = true
+			if k, err := t.Kind(); err == nil {
+				colKinds[i] = k
 			}
 		}
 	}
@@ -5365,8 +5560,15 @@ func (n *InsertStmtNode) FormatSQL(ctx context.Context) (string, error) {
 			if err != nil {
 				return "", err
 			}
-			if i < len(jsonCol) && jsonCol[i] && sql != "" {
-				sql = fmt.Sprintf("googlesqlite_to_native_json(%s)", sql)
+			if i < len(colKinds) && sql != "" {
+				switch colKinds[i] {
+				case googlesql.TypeKindTypeJson:
+					sql = fmt.Sprintf("googlesqlite_to_native_json(%s)", sql)
+				case googlesql.TypeKindTypeNumeric:
+					sql = numericStorageReadSQL(sql)
+				case googlesql.TypeKindTypeBytes:
+					sql = bytesStorageReadSQL(sql)
+				}
 			}
 			values = append(values, sql)
 		}
@@ -5448,14 +5650,23 @@ func (n *UpdateItemNode) FormatSQL(ctx context.Context) (string, error) {
 	} else if ok {
 		return rewritten, nil
 	}
-	// Same JSON seam as InsertStmtNode: a native JSON target column
-	// rejects the value-layer envelope that JSON-producing expressions
-	// emit, so unwrap to raw JSON text at assignment time. Applied only
-	// on the whole-column path — struct-field assignments (above) live
-	// inside envelope storage and must keep the envelope form.
+	// Same native-storage seam as InsertStmtNode: a native JSON /
+	// NUMERIC / BYTES target column rejects (or would mis-store) the
+	// value-layer envelope that googlesqlite_* UDF expressions emit, so
+	// normalize to the storage representation at assignment time —
+	// native value expressions pass through the wraps unchanged.
+	// Applied only on the whole-column path — struct-field assignments
+	// (above) live inside envelope storage and keep the envelope form.
 	if t, terr := targetNode.Type(); terr == nil && t != nil && setValue != "" {
-		if k, kerr := t.Kind(); kerr == nil && k == googlesql.TypeKindTypeJson {
-			setValue = fmt.Sprintf("googlesqlite_to_native_json(%s)", setValue)
+		if k, kerr := t.Kind(); kerr == nil {
+			switch k {
+			case googlesql.TypeKindTypeJson:
+				setValue = fmt.Sprintf("googlesqlite_to_native_json(%s)", setValue)
+			case googlesql.TypeKindTypeNumeric:
+				setValue = numericStorageReadSQL(setValue)
+			case googlesql.TypeKindTypeBytes:
+				setValue = bytesStorageReadSQL(setValue)
+			}
 		}
 	}
 	target, err := newNode(targetNode).FormatSQL(targetCtx)

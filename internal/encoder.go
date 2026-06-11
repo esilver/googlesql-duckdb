@@ -123,6 +123,28 @@ func literalFromValue(v value.Value) (string, error) {
 		// TIMESTAMPTZ. Normalize to UTC and pin the +00 offset so the
 		// instant round-trips regardless of DuckDB's session TimeZone.
 		return fmt.Sprintf("TIMESTAMPTZ '%s+00'", time.Time(vv).UTC().Format("2006-01-02 15:04:05.999999")), nil
+	case *value.NumericValue:
+		// Native-storage migration: NUMERIC literals are typed native
+		// DECIMAL(38,9) literals, matching the stored column type, so
+		// operators / reducers / INSERTs bind the value directly.
+		// BIGNUMERIC stays on the value-layer envelope below (it
+		// exceeds DuckDB's 38-digit DECIMAL).
+		if !vv.IsBigNumeric {
+			s, err := vv.ToString()
+			if err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("CAST('%s' AS DECIMAL(38,9))", s), nil
+		}
+	case value.BytesValue:
+		// Native-storage migration: BYTES literals are DuckDB blob
+		// literals carrying the payload bytes ('\xNN...'::BLOB),
+		// matching the payload-byte BLOB cells of stored columns.
+		var sb strings.Builder
+		for _, b := range []byte(vv) {
+			fmt.Fprintf(&sb, "\\x%02X", b)
+		}
+		return fmt.Sprintf("'%s'::BLOB", sb.String()), nil
 	}
 	layout, err := value.ValueLayoutFromValue(v)
 	if err != nil {
@@ -837,9 +859,10 @@ func encodeNamedValue(v driver.NamedValue, param *googlesql.ResolvedParameter) (
 // — the legacy base64 envelope fails DuckDB's VARCHAR->DATE/JSON cast
 // at bind time ("invalid date field format: eyJoZWFkZXIi...").
 // encodeParamValue mirrors literalFromValue's native shortcuts for
-// exactly those kinds; everything else (STRING, NUMERIC, ARRAY, STRUCT,
-// ...) keeps the envelope the TEXT-backed columns and googlesqlite_*
-// UDFs store and decode.
+// exactly those kinds (plus NUMERIC / BYTES since the native-storage
+// migration); everything else (STRING, BIGNUMERIC, ARRAY, STRUCT, ...)
+// keeps the envelope the TEXT-backed columns and googlesqlite_* UDFs
+// store and decode.
 func encodeValueAgainstParamType(v any, t googlesql.Googlesql_TypeNode) (any, error) {
 	if v == nil {
 		return nil, nil
@@ -868,9 +891,11 @@ func encodeValueAgainstParamType(v any, t googlesql.Googlesql_TypeNode) (any, er
 // text DuckDB casts into its native DATE / TIME / TIMESTAMP /
 // TIMESTAMPTZ columns (the same calendar/instant readings
 // literalFromValue pins for inline literals), JSON as the raw JSON
-// text a native JSON column accepts, and every other kind through
-// EncodeValue (bare Go scalars for INT64 / FLOAT64 / BOOL, the base64
-// value-layer envelope for STRING / NUMERIC / ARRAY / STRUCT / ...).
+// text a native JSON column accepts, NUMERIC as plain decimal text
+// (cast into the native DECIMAL(38,9)), BYTES as the raw payload
+// []byte (a native BLOB), and every other kind through EncodeValue
+// (bare Go scalars for INT64 / FLOAT64 / BOOL, the base64 value-layer
+// envelope for STRING / BIGNUMERIC / ARRAY / STRUCT / ...).
 func encodeParamValue(v value.Value) (any, error) {
 	switch vv := v.(type) {
 	case *value.SafeValue:
@@ -887,6 +912,20 @@ func encodeParamValue(v value.Value) (any, error) {
 		return time.Time(vv).UTC().Format("2006-01-02 15:04:05.999999+00"), nil
 	case value.JsonValue:
 		return string(vv), nil
+	case *value.NumericValue:
+		// Native-storage migration: a NUMERIC parameter binds as plain
+		// decimal text, which DuckDB casts into the native
+		// DECIMAL(38,9) storage / operand type (the same value reading
+		// literalFromValue pins for inline literals). BIGNUMERIC keeps
+		// the envelope (TEXT storage).
+		if !vv.IsBigNumeric {
+			return vv.ToString()
+		}
+	case value.BytesValue:
+		// Native-storage migration: a BYTES parameter binds as the raw
+		// payload []byte, which the driver delivers as a native BLOB —
+		// matching the payload-byte cells of stored BYTES columns.
+		return []byte(vv), nil
 	}
 	return EncodeValue(v)
 }
