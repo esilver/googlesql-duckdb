@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"fmt"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -2328,13 +2329,43 @@ func (c *Catalog) trimmedLastPath(path []string) []string {
 func (c *Catalog) addTVFSpec(spec *TVFSpec) error {
 	c.bumpAnalysisGeneration()
 	tvfName := spec.TVFName()
-	if _, exists := c.tvfMap[tvfName]; exists {
-		c.tvfMap[tvfName] = spec
-		return nil
+	if old, exists := c.tvfMap[tvfName]; exists {
+		tvfs := make([]*TVFSpec, 0, len(c.tvfs))
+		oldName := c.formatNamePath(old.NamePath)
+		replaced := false
+		for _, tvf := range c.tvfs {
+			if c.formatNamePath(tvf.NamePath) == oldName {
+				tvfs = append(tvfs, spec)
+				replaced = true
+				continue
+			}
+			tvfs = append(tvfs, tvf)
+		}
+		if !replaced {
+			tvfs = append(tvfs, spec)
+		}
+		if tvfSpecAnalyzerEquivalent(old, spec) {
+			c.tvfs = tvfs
+			c.tvfMap[tvfName] = spec
+			return nil
+		}
+		return c.resetCatalog(c.tables, c.functions, tvfs)
 	}
 	c.tvfs = append(c.tvfs, spec)
 	c.tvfMap[tvfName] = spec
+	if err := c.addTVFSpecRecursive(c.catalog, spec); err != nil {
+		return err
+	}
 	return nil
+}
+
+func tvfSpecAnalyzerEquivalent(a, b *TVFSpec) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return reflect.DeepEqual(a.NamePath, b.NamePath) &&
+		reflect.DeepEqual(a.Args, b.Args) &&
+		reflect.DeepEqual(a.OutputColumns, b.OutputColumns)
 }
 
 func (c *Catalog) addFunctionSpec(spec *FunctionSpec) error {
@@ -2846,7 +2877,6 @@ func (c *Catalog) copyTVFSpec(spec *TVFSpec, newNamePath []string) *TVFSpec {
 		Args:          spec.Args,
 		OutputColumns: spec.OutputColumns,
 		Body:          spec.Body,
-		RawBody:       spec.RawBody,
 	}
 }
 

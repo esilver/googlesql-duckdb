@@ -474,6 +474,40 @@ func TestW_TVF_Call(t *testing.T) {
 	}
 }
 
+func TestW_TVF_ReplaceShape(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	if _, err := db.ExecContext(ctx,
+		`CREATE TABLE FUNCTION swap(x INT64) AS (SELECT x AS y)`); err != nil {
+		t.Fatalf("CREATE TABLE FUNCTION swap: %v", err)
+	}
+	var initial int64
+	if err := db.QueryRowContext(ctx, `SELECT y FROM swap(7)`).Scan(&initial); err != nil {
+		t.Fatalf("scan initial swap: %v", err)
+	}
+	if initial != 7 {
+		t.Fatalf("initial swap got %d want 7", initial)
+	}
+
+	if _, err := db.ExecContext(ctx,
+		`CREATE OR REPLACE TABLE FUNCTION swap(x STRING) AS (SELECT x AS z)`); err != nil {
+		t.Fatalf("CREATE OR REPLACE TABLE FUNCTION swap: %v", err)
+	}
+	var replaced string
+	if err := db.QueryRowContext(ctx, `SELECT z FROM swap('ok')`).Scan(&replaced); err != nil {
+		t.Fatalf("scan replaced swap: %v", err)
+	}
+	if replaced != "ok" {
+		t.Fatalf("replaced swap got %q want ok", replaced)
+	}
+}
+
 // TestW_DeclareSetScript covers C3: DECLARE / SET produce
 // parse-level statements that the upstream analyzer rejects as
 // "Statement not supported". The driver intercepts them in a SQL

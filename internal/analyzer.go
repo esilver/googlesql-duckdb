@@ -1539,7 +1539,6 @@ func (a *Analyzer) Analyze(ctx context.Context, conn *Conn, query string, args [
 	for _, spec := range a.catalog.getTVFs(a.namePath) {
 		tvfMap[spec.TVFName()] = spec
 	}
-	query = applyUserTVFInlineRewrites(query, tvfMap)
 	// Analysis cache (see analysis_cache.go). System variables feed the
 	// formatter through context, so connections carrying them bypass
 	// the cache; everything else keys on the post-rewrite text plus
@@ -2371,11 +2370,10 @@ func (a *Analyzer) newQueryStmtAction(ctx context.Context, query string, args []
 }
 
 // newCreateTableFunctionStmtAction handles `CREATE TABLE FUNCTION`
-// DDL. The TVF body is captured into a TVFSpec, later call sites are
-// inlined before analyzer resolution, and the spec is persisted via
-// the standard catalog table.
-func (a *Analyzer) newCreateTableFunctionStmtAction(ctx context.Context, query string, _ []driver.NamedValue, node *googlesql.ResolvedCreateTableFunctionStmt) (*CreateTableFunctionStmtAction, error) {
-	spec, err := newTVFSpec(ctx, a.namePath, node, query)
+// DDL. The resolved TVF body is captured into a TVFSpec and persisted
+// via the standard catalog table.
+func (a *Analyzer) newCreateTableFunctionStmtAction(ctx context.Context, _ string, _ []driver.NamedValue, node *googlesql.ResolvedCreateTableFunctionStmt) (*CreateTableFunctionStmtAction, error) {
+	spec, err := newTVFSpec(ctx, a.namePath, node)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create TVF spec: %w", err)
 	}

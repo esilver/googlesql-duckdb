@@ -251,19 +251,17 @@ type ColumnSpec struct {
 	DefaultExpr string `json:"defaultExpr,omitempty"`
 }
 
-// TVFSpec captures a `CREATE TABLE FUNCTION` definition so the call
-// site (`ResolvedTVFScan`) can be inlined as a subquery at format
-// time. The body is the analyzed-and-formatted query of the TVF body
-// in the same canonical form used by `TableSpec.Query` for views: a
-// `SELECT col#id AS col, ... FROM (...)` envelope that exposes the
-// TVF's declared output column names.
+// TVFSpec captures a `CREATE TABLE FUNCTION` definition so the resolved
+// call site can be lowered as a subquery at format time. The body is the
+// analyzed-and-formatted query of the TVF body in the same canonical form
+// used by `TableSpec.Query` for views: a `SELECT col#id AS col, ... FROM (...)`
+// envelope that exposes the TVF's declared output column names.
 type TVFSpec struct {
 	IsTemp        bool            `json:"isTemp"`
 	NamePath      []string        `json:"namePath"`
 	Args          []*NameWithType `json:"args"`
 	OutputColumns []*ColumnSpec   `json:"outputColumns"`
 	Body          string          `json:"body"`
-	RawBody       string          `json:"rawBody,omitempty"`
 	UpdatedAt     time.Time       `json:"updatedAt"`
 	CreatedAt     time.Time       `json:"createdAt"`
 }
@@ -321,18 +319,6 @@ func (s *TVFSpec) CallSQL(argValues []string, callOutputColumns []string) (strin
 		strings.Join(projections, ", "),
 		body,
 	), nil
-}
-
-func (s *TVFSpec) CallGoogleSQL(argValues []string) string {
-	body := s.RawBody
-	replacements := map[string]string{}
-	for i, arg := range s.Args {
-		if i >= len(argValues) {
-			continue
-		}
-		replacements[strings.ToLower(arg.Name)] = argValues[i]
-	}
-	return "( " + replaceGoogleSQLIdentifiers(body, replacements) + " )"
 }
 
 type Type struct {
@@ -931,7 +917,7 @@ func newTableOptionsFromResolved(opts []*googlesql.ResolvedOption) []*tableOptio
 	return out
 }
 
-func newTVFSpec(ctx context.Context, namePath *NamePath, stmt *googlesql.ResolvedCreateTableFunctionStmt, query string) (*TVFSpec, error) {
+func newTVFSpec(ctx context.Context, namePath *NamePath, stmt *googlesql.ResolvedCreateTableFunctionStmt) (*TVFSpec, error) {
 	args := []*NameWithType{}
 	signature, _ := stmt.Signature()
 	for _, arg := range m1(signature.Arguments()) {
@@ -976,7 +962,6 @@ func newTVFSpec(ctx context.Context, namePath *NamePath, stmt *googlesql.Resolve
 		Args:          args,
 		OutputColumns: outputColumns,
 		Body:          body,
-		RawBody:       extractCreateTableFunctionBody(query),
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}, nil
