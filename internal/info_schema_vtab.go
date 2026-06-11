@@ -102,10 +102,15 @@ func (c *infoSchemaCursor) Filter(_ int, _ string, args ...sqlite3.Value) error 
 	if len(args) > 0 && args[0].Type() != sqlite3.NULL {
 		schema = args[0].Text()
 	}
-	c.table.catalog.mu.Lock()
-	rows := c.table.view.BuildRows(c.table.catalog, schema)
-	c.table.catalog.mu.Unlock()
-	c.rows = rows
+	// Deferred unlock inside a closure: BuildRows walks live catalog
+	// state, and a panic there (e.g. a nil-deref under cancellation
+	// churn, issue #18) must not orphan catalog.mu for every later
+	// analyze/sync in the process.
+	c.rows = func() []map[string]value.Value {
+		c.table.catalog.mu.Lock()
+		defer c.table.catalog.mu.Unlock()
+		return c.table.view.BuildRows(c.table.catalog, schema)
+	}()
 	return nil
 }
 

@@ -550,12 +550,50 @@ func recoverPanicAsError(e *error) {
 	if r == nil {
 		return
 	}
+	*e = panicAsError(r, *e)
+}
+
+// panicAsError formats a recovered panic value (plus the in-flight
+// error, if any) into the ordinary error the boundary returns. The
+// panic value is rendered with %v on purpose: the result must NEVER
+// satisfy errors.Is(err, driver.ErrBadConn) — a Raw callback or driver
+// entry point that surfaces ErrBadConn makes database/sql call
+// Conn.close synchronously, which deadlocks on closemu against an open
+// transaction's read lock (issue #20).
+func panicAsError(r any, prior error) error {
 	stack := debug.Stack()
-	if existing := *e; existing != nil {
-		*e = fmt.Errorf("googlesqlite: panic %v (prior error: %w)\n%s", r, existing, stack)
-	} else {
-		*e = fmt.Errorf("googlesqlite: panic %v\n%s", r, stack)
+	if prior != nil {
+		return fmt.Errorf("googlesqlite: panic %v (prior error: %w)\n%s", r, prior, stack)
 	}
+	return fmt.Errorf("googlesqlite: panic %v\n%s", r, stack)
+}
+
+// recoverPanicPoison is the Conn-bound recoverPanicAsError: the same
+// panic→error conversion, plus it marks the Conn dead so the pool
+// discards it (via IsValid / ResetSession) once the caller is done
+// with it.
+//
+// This is the issue #20 containment seam. A panic that escapes the
+// driver boundary while the caller holds an open transaction on the
+// same *sql.Conn is fatal upstream: stdlib Conn.Raw's deferred release
+// treats the panic as driver.ErrBadConn and synchronously calls
+// Conn.close, which needs the closemu WRITE lock — held as a read lock
+// by the open transaction until it ends, which it never can because
+// its rollback defer sits in a caller frame above the parked panic.
+// Permanent mid-unwind self-deadlock; every caller-held mutex is
+// orphaned (observed live as a wedged bigquery-emulator after one
+// analyzer bad_alloc, #19/#20). Recovering here returns a plain
+// non-ErrBadConn error instead: Raw skips the synchronous close, the
+// transaction unwinds through the caller's rollback defer, and the
+// poisoned Conn — whose analyzer/wasm state may be unusable after the
+// abort — is pruned at pool put-back/fetch instead.
+func (c *Conn) recoverPanicPoison(e *error) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	c.dead.Store(true)
+	*e = panicAsError(r, *e)
 }
 
 // rollbackDanglingTx clears a transaction the DuckDB engine may have
@@ -586,7 +624,7 @@ func (c *Conn) PrepareContext(ctx context.Context, query string) (s driver.Stmt,
 			c.rollbackDanglingTx()
 		}
 	}()
-	defer recoverPanicAsError(&e)
+	defer c.recoverPanicPoison(&e)
 	conn := internal.NewConnWithOptions(c.conn, c.tx, c.systemVars, c.scriptVars, c.materializeCTE)
 	actionFuncs, err := c.analyzer.Analyze(ctx, conn, query, nil)
 	if err != nil {
@@ -615,7 +653,7 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 			c.rollbackDanglingTx()
 		}
 	}()
-	defer recoverPanicAsError(&e)
+	defer c.recoverPanicPoison(&e)
 	conn := internal.NewConnWithOptions(c.conn, c.tx, c.systemVars, c.scriptVars, c.materializeCTE)
 	actionFuncs, err := c.analyzer.Analyze(ctx, conn, query, args)
 	if err != nil {
@@ -657,7 +695,7 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 			c.rollbackDanglingTx()
 		}
 	}()
-	defer recoverPanicAsError(&e)
+	defer c.recoverPanicPoison(&e)
 	conn := internal.NewConnWithOptions(c.conn, c.tx, c.systemVars, c.scriptVars, c.materializeCTE)
 	actionFuncs, err := c.analyzer.Analyze(ctx, conn, query, args)
 	if err != nil {

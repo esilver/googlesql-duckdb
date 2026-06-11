@@ -30,6 +30,8 @@ package googlesqlite
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
 
 	internal "github.com/goccy/googlesqlite/internal"
@@ -72,7 +74,17 @@ func SetBulkInsertUnsupportedHook(fn func(BulkInsertUnsupportedEvent)) {
 //
 // The batch is applied as one atomic statement: on error no rows are
 // inserted. If a transaction is open on the connection, the batch joins it.
-func (c *Conn) BulkInsert(ctx context.Context, tablePath []string, columns []string, rows [][]any) (int64, error) {
+//
+// A panic anywhere inside the bulk path (Catalog.Sync, the analyzer
+// wasm module, the engine Appender) is recovered here and returned as
+// a plain error, and the Conn is marked poisoned so the pool discards
+// it once the caller finishes. Callers reach this method inside
+// *sql.Conn.Raw callbacks (see the package-level BulkInsert and the
+// emulator wiring sketch above); letting a panic escape into stdlib
+// Raw while a transaction is open on the same connection self-deadlocks
+// the unwind permanently — issue #20 has the full mechanism.
+func (c *Conn) BulkInsert(ctx context.Context, tablePath []string, columns []string, rows [][]any) (n int64, err error) {
+	defer c.recoverPanicPoison(&err)
 	conn := internal.NewConnWithOptions(c.conn, c.tx, c.systemVars, c.scriptVars, c.materializeCTE)
 	return internal.BulkInsert(ctx, conn, c.catalog, tablePath, columns, rows)
 }
@@ -81,11 +93,27 @@ func (c *Conn) BulkInsert(ctx context.Context, tablePath []string, columns []str
 // callers holding a database/sql connection on the "googlesqlite" driver.
 func BulkInsert(ctx context.Context, conn *sql.Conn, tablePath []string, columns []string, rows [][]any) (int64, error) {
 	var n int64
-	err := conn.Raw(func(dc any) error {
+	err := conn.Raw(func(dc any) (cbErr error) {
 		gc, ok := dc.(*Conn)
 		if !ok {
 			return fmt.Errorf("googlesqlite: BulkInsert: driver connection is %T, not *googlesqlite.Conn", dc)
 		}
+		// Backstop for issue #20: nothing returned from (or panicking
+		// out of) a Raw callback may be driver.ErrBadConn. stdlib Raw
+		// reacts to both by synchronously calling Conn.close, which
+		// needs the closemu write lock — held as a read lock by any
+		// open transaction on this connection until that transaction
+		// ends, which it cannot while the unwind is parked here.
+		// Conn.BulkInsert already recovers panics below this frame;
+		// this defer pair keeps the invariant even if a future edit
+		// moves code outside that cover.
+		defer gc.recoverPanicPoison(&cbErr)
+		defer func() {
+			if cbErr != nil && errors.Is(cbErr, driver.ErrBadConn) {
+				gc.dead.Store(true)
+				cbErr = fmt.Errorf("googlesqlite: BulkInsert: connection poisoned (suppressed driver.ErrBadConn inside Conn.Raw to avoid the issue #20 close deadlock): %v", cbErr)
+			}
+		}()
 		var err error
 		n, err = gc.BulkInsert(ctx, tablePath, columns, rows)
 		return err

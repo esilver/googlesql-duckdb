@@ -187,6 +187,20 @@ func bulkColumnClassOf(kind googlesql.TypeKind, legacy bool) bulkColumnClass {
 // the table is dropped at the end of the call either way).
 var bulkStageSeq atomic.Uint64
 
+// bulkInsertEntryHookForTest, when non-nil, runs at BulkInsert entry,
+// before Catalog.Sync. Test-only seam: the issue #20 regression test
+// installs a panicking hook here to synthesize an analyzer-style abort
+// (bad_alloc surfacing as a Go panic) at the exact position the live
+// wedge panicked — inside internal.BulkInsert under a *sql.Conn.Raw
+// callback with an open transaction. Never set in production.
+var bulkInsertEntryHookForTest func()
+
+// SetBulkInsertEntryHookForTest installs (or, with nil, removes) the
+// BulkInsert entry hook. Exported from the internal package for the
+// driver package's boundary-containment tests only; not part of the
+// public googlesqlite API.
+func SetBulkInsertEntryHookForTest(fn func()) { bulkInsertEntryHookForTest = fn }
+
 // BulkInsert appends rows into the table at namePath through the engine's
 // Appender, bypassing per-row analyze/format/exec. columns names the targeted
 // table columns (a subset, in the caller's row order); rows carry one value
@@ -199,6 +213,9 @@ var bulkStageSeq atomic.Uint64
 // one INSERT..SELECT statement, which DuckDB applies atomically (all rows or
 // none). If a transaction is open on conn, the insert joins it.
 func BulkInsert(ctx context.Context, conn *Conn, catalog *Catalog, namePath []string, columns []string, rows [][]any) (int64, error) {
+	if h := bulkInsertEntryHookForTest; h != nil {
+		h()
+	}
 	if err := catalog.Sync(ctx, conn); err != nil {
 		return 0, fmt.Errorf("googlesqlite: bulk insert: catalog sync: %w", err)
 	}
