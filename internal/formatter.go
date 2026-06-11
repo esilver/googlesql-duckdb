@@ -642,13 +642,15 @@ func (n *FunctionCallNode) FormatSQL(ctx context.Context) (string, error) {
 // constructor from DuckDB's native range() list generator and keeps the
 // family on the engine's own namespace.
 var duckDBRangeFuncRemap = map[string]string{
-	"range":                "googlesqlite_range",
-	"range_start":          "googlesqlite_range_start",
-	"range_end":            "googlesqlite_range_end",
-	"range_contains":       "googlesqlite_range_contains",
-	"range_overlaps":       "googlesqlite_range_overlaps",
-	"range_intersect":      "googlesqlite_range_intersect",
-	"generate_range_array": "googlesqlite_generate_range_array",
+	"range":                    "googlesqlite_range",
+	"range_start":              "googlesqlite_range_start",
+	"range_end":                "googlesqlite_range_end",
+	"range_is_start_unbounded": "googlesqlite_range_is_start_unbounded",
+	"range_is_end_unbounded":   "googlesqlite_range_is_end_unbounded",
+	"range_contains":           "googlesqlite_range_contains",
+	"range_overlaps":           "googlesqlite_range_overlaps",
+	"range_intersect":          "googlesqlite_range_intersect",
+	"generate_range_array":     "googlesqlite_generate_range_array",
 }
 
 // duckDBExtractFuncRemap maps the bare GoogleSQL leaf name HLL_COUNT.EXTRACT
@@ -3065,6 +3067,13 @@ var nativeWindowFuncMap = map[string]string{
 	// END) OVER (...), the same rewrite the non-window aggregate path
 	// uses (COUNT never returns NULL, matching COUNTIF's 0-on-empty).
 	"countif": "countif",
+	// Boolean and bitwise aggregates: DuckDB exposes these as native
+	// aggregate functions, and any native aggregate can run with OVER.
+	"logical_and": "bool_and",
+	"logical_or":  "bool_or",
+	"bit_and":     "bit_and",
+	"bit_or":      "bit_or",
+	"bit_xor":     "bit_xor",
 	// Cumulative aggregates against native SQLite types. Encoded
 	// values would not survive these (SUM of base64 strings would
 	// fail), but parity tests exercise them on INT64/FLOAT64 where
@@ -3166,6 +3175,13 @@ func (n *AnalyticFunctionCallNode) FormatSQL(ctx context.Context) (string, error
 			return n.formatNative(ctx, "googlesqlite_window_"+rawName, orderColumns, true)
 		}
 	}
+	if rawName == "array_concat_agg" && !n.requiresPredecessorEmulation() {
+		inner, err := n.formatNative(ctx, "array_agg", orderColumns, false)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("googlesqlite_array_concat_agg_flatten(%s)", inner), nil
+	}
 	if native := nativeWindowFuncForName(rawName); native != "" && !n.requiresPredecessorEmulation() {
 		return n.formatNative(ctx, native, orderColumns, false)
 	}
@@ -3231,9 +3247,11 @@ func (n *AnalyticFunctionCallNode) FormatSQL(ctx context.Context) (string, error
 // DISTINCT modifier on functions whose plain native form is a SQLite
 // built-in (which doesn't accept DISTINCT in OVER).
 var distinctAwareNativeWindowFuncs = map[string]string{
-	"sum":   "googlesqlite_window_sum_distinct",
-	"count": "googlesqlite_window_count_distinct",
-	"avg":   "googlesqlite_window_avg_distinct",
+	"sum":         "googlesqlite_window_sum_distinct",
+	"count":       "googlesqlite_window_count_distinct",
+	"avg":         "googlesqlite_window_avg_distinct",
+	"logical_and": "bool_and",
+	"logical_or":  "bool_or",
 }
 
 // requiresPredecessorEmulation reports whether this analytic call
@@ -3274,6 +3292,8 @@ func (n *AnalyticFunctionCallNode) requiresPredecessorEmulation() bool {
 		// natively.
 		switch rawName {
 		case "sum", "count", "count_star", "avg", "min", "max",
+			"logical_or", "logical_and", "bit_or", "bit_and", "bit_xor",
+			"array_concat_agg",
 			"lag", "lead", "first_value", "last_value", "nth_value",
 			// DuckDB quantile_cont / quantile_disc ignore NULLs
 			// natively, which matches the GoogleSQL default IGNORE
@@ -3395,7 +3415,7 @@ func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName 
 	distinctKeyword := ""
 	if m1(n.node.Distinct()) && !includeOpts {
 		switch sqliteName {
-		case "sum", "avg", "count", "min", "max":
+		case "sum", "avg", "count", "min", "max", "bool_or", "bool_and":
 			distinctKeyword = "DISTINCT "
 		}
 	}
@@ -3738,6 +3758,9 @@ func (n *CastNode) tryNativeCast(ctx context.Context) (string, bool, error) {
 	}
 
 	if toKind == googlesql.TypeKindTypeString {
+		if isRangeBoundaryValueExpr(expr) {
+			return fmt.Sprintf("googlesqlite_plain_string(%s)", expr), true, nil
+		}
 		switch fromKind {
 		case googlesql.TypeKindTypeDatetime:
 			return fmt.Sprintf("strftime(%s, '%%Y-%%m-%%dT%%H:%%M:%%S')", expr), true, nil
@@ -3766,6 +3789,12 @@ func (n *CastNode) tryNativeCast(ctx context.Context) (string, bool, error) {
 		expr = fmt.Sprintf("googlesqlite_plain_string(%s)", expr)
 	}
 	return fmt.Sprintf("CAST(%s AS %s)", expr, duckType), true, nil
+}
+
+func isRangeBoundaryValueExpr(expr string) bool {
+	trimmed := strings.TrimSpace(expr)
+	return strings.HasPrefix(trimmed, "googlesqlite_range_start(") ||
+		strings.HasPrefix(trimmed, "googlesqlite_range_end(")
 }
 
 // duckDBTypeName maps a GoogleSQL temporal/primitive kind to the DuckDB

@@ -1531,6 +1531,15 @@ func (a *Analyzer) Analyze(ctx context.Context, conn *Conn, query string, args [
 	query = applySQLRewritePipeline(query, sqlRewritePipelinePreScriptVars)
 	query = applyScriptVariables(ctx, query, conn)
 	query = applySQLRewritePipeline(query, sqlRewritePipelinePostScriptVars)
+	funcMap := map[string]*FunctionSpec{}
+	for _, spec := range a.catalog.getFunctions(a.namePath) {
+		funcMap[spec.FuncName()] = spec
+	}
+	tvfMap := map[string]*TVFSpec{}
+	for _, spec := range a.catalog.getTVFs(a.namePath) {
+		tvfMap[spec.TVFName()] = spec
+	}
+	query = applyUserTVFInlineRewrites(query, tvfMap)
 	// Analysis cache (see analysis_cache.go). System variables feed the
 	// formatter through context, so connections carrying them bypass
 	// the cache; everything else keys on the post-rewrite text plus
@@ -1554,14 +1563,6 @@ func (a *Analyzer) Analyze(ctx context.Context, conn *Conn, query string, args [
 	parsed, err := a.parseScript(query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse statements: %w", err)
-	}
-	funcMap := map[string]*FunctionSpec{}
-	for _, spec := range a.catalog.getFunctions(a.namePath) {
-		funcMap[spec.FuncName()] = spec
-	}
-	tvfMap := map[string]*TVFSpec{}
-	for _, spec := range a.catalog.getTVFs(a.namePath) {
-		tvfMap[spec.TVFName()] = spec
 	}
 	actionFuncs := make([]stmtActionFunc, 0, len(parsed.stmts))
 	stmtArgsList, err := a.sliceArgsPerStatement(parsed, args)
@@ -2370,12 +2371,11 @@ func (a *Analyzer) newQueryStmtAction(ctx context.Context, query string, args []
 }
 
 // newCreateTableFunctionStmtAction handles `CREATE TABLE FUNCTION`
-// DDL. The TVF body is captured into a TVFSpec, the spec is
-// registered on the catalog so `SELECT * FROM <tvf>(...)` resolves at
-// the analyzer, and the spec is persisted via the standard catalog
-// table.
-func (a *Analyzer) newCreateTableFunctionStmtAction(ctx context.Context, _ string, _ []driver.NamedValue, node *googlesql.ResolvedCreateTableFunctionStmt) (*CreateTableFunctionStmtAction, error) {
-	spec, err := newTVFSpec(ctx, a.namePath, node)
+// DDL. The TVF body is captured into a TVFSpec, later call sites are
+// inlined before analyzer resolution, and the spec is persisted via
+// the standard catalog table.
+func (a *Analyzer) newCreateTableFunctionStmtAction(ctx context.Context, query string, _ []driver.NamedValue, node *googlesql.ResolvedCreateTableFunctionStmt) (*CreateTableFunctionStmtAction, error) {
+	spec, err := newTVFSpec(ctx, a.namePath, node, query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create TVF spec: %w", err)
 	}

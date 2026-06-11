@@ -2334,9 +2334,6 @@ func (c *Catalog) addTVFSpec(spec *TVFSpec) error {
 	}
 	c.tvfs = append(c.tvfs, spec)
 	c.tvfMap[tvfName] = spec
-	if err := c.addTVFSpecRecursive(c.catalog, spec); err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -2849,6 +2846,7 @@ func (c *Catalog) copyTVFSpec(spec *TVFSpec, newNamePath []string) *TVFSpec {
 		Args:          spec.Args,
 		OutputColumns: spec.OutputColumns,
 		Body:          spec.Body,
+		RawBody:       spec.RawBody,
 	}
 }
 

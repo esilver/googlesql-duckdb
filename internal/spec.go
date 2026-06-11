@@ -263,6 +263,7 @@ type TVFSpec struct {
 	Args          []*NameWithType `json:"args"`
 	OutputColumns []*ColumnSpec   `json:"outputColumns"`
 	Body          string          `json:"body"`
+	RawBody       string          `json:"rawBody,omitempty"`
 	UpdatedAt     time.Time       `json:"updatedAt"`
 	CreatedAt     time.Time       `json:"createdAt"`
 }
@@ -320,6 +321,18 @@ func (s *TVFSpec) CallSQL(argValues []string, callOutputColumns []string) (strin
 		strings.Join(projections, ", "),
 		body,
 	), nil
+}
+
+func (s *TVFSpec) CallGoogleSQL(argValues []string) string {
+	body := s.RawBody
+	replacements := map[string]string{}
+	for i, arg := range s.Args {
+		if i >= len(argValues) {
+			continue
+		}
+		replacements[strings.ToLower(arg.Name)] = argValues[i]
+	}
+	return "( " + replaceGoogleSQLIdentifiers(body, replacements) + " )"
 }
 
 type Type struct {
@@ -918,7 +931,7 @@ func newTableOptionsFromResolved(opts []*googlesql.ResolvedOption) []*tableOptio
 	return out
 }
 
-func newTVFSpec(ctx context.Context, namePath *NamePath, stmt *googlesql.ResolvedCreateTableFunctionStmt) (*TVFSpec, error) {
+func newTVFSpec(ctx context.Context, namePath *NamePath, stmt *googlesql.ResolvedCreateTableFunctionStmt, query string) (*TVFSpec, error) {
 	args := []*NameWithType{}
 	signature, _ := stmt.Signature()
 	for _, arg := range m1(signature.Arguments()) {
@@ -963,6 +976,7 @@ func newTVFSpec(ctx context.Context, namePath *NamePath, stmt *googlesql.Resolve
 		Args:          args,
 		OutputColumns: outputColumns,
 		Body:          body,
+		RawBody:       extractCreateTableFunctionBody(query),
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}, nil

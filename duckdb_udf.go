@@ -733,6 +733,8 @@ func registerRangeUDFs(conn *sql.Conn) error {
 		{"googlesqlite_range", &rangeUDF{bridge: internal.GoogleSQLRange, fixedArgs: 2}},
 		{"googlesqlite_range_start", &rangeUDF{bridge: internal.GoogleSQLRangeStart, fixedArgs: 1}},
 		{"googlesqlite_range_end", &rangeUDF{bridge: internal.GoogleSQLRangeEnd, fixedArgs: 1}},
+		{"googlesqlite_range_is_start_unbounded", &rangeUDF{bridge: internal.GoogleSQLRangeIsStartUnbounded, fixedArgs: 1, resultBool: true}},
+		{"googlesqlite_range_is_end_unbounded", &rangeUDF{bridge: internal.GoogleSQLRangeIsEndUnbounded, fixedArgs: 1, resultBool: true}},
 		{"googlesqlite_range_contains", &rangeUDF{bridge: internal.GoogleSQLRangeContains, fixedArgs: 2, resultBool: true}},
 		{"googlesqlite_range_overlaps", &rangeUDF{bridge: internal.GoogleSQLRangeOverlaps, fixedArgs: 2, resultBool: true}},
 		{"googlesqlite_range_intersect", &rangeUDF{bridge: internal.GoogleSQLRangeIntersect, fixedArgs: 2}},

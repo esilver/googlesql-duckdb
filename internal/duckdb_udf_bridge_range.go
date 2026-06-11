@@ -47,6 +47,18 @@ func GoogleSQLRangeEnd(args []any) (any, error) {
 	return rangeScalarBridge(rangefn.BindRangeEnd, args)
 }
 
+// GoogleSQLRangeIsStartUnbounded is the DuckDB bridge for
+// RANGE_IS_START_UNBOUNDED(range).
+func GoogleSQLRangeIsStartUnbounded(args []any) (any, error) {
+	return rangeScalarBridge(rangefn.BindRangeIsStartUnbounded, args)
+}
+
+// GoogleSQLRangeIsEndUnbounded is the DuckDB bridge for
+// RANGE_IS_END_UNBOUNDED(range).
+func GoogleSQLRangeIsEndUnbounded(args []any) (any, error) {
+	return rangeScalarBridge(rangefn.BindRangeIsEndUnbounded, args)
+}
+
 // GoogleSQLRangeContains is the DuckDB bridge for
 // RANGE_CONTAINS(outer, inner) and RANGE_CONTAINS(range, point).
 func GoogleSQLRangeContains(args []any) (any, error) {

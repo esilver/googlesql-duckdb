@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"os"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -142,6 +143,11 @@ func duckdbDSN(name string) string {
 	path = strings.TrimPrefix(path, "file:")
 	if i := strings.IndexByte(path, '?'); i >= 0 {
 		path = path[:i]
+	}
+	if path != "" {
+		if st, err := os.Stat(path); err == nil && st.Mode().IsRegular() && st.Size() == 0 {
+			_ = os.Remove(path)
+		}
 	}
 	return path
 }
