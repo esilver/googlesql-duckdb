@@ -279,8 +279,12 @@ func GoogleSQLArrayConcatAggFlatten(args ...any) (any, error) {
 		}
 	}
 	var concatenated []value.Value
-	for idx, elem := range list {
-		if limit >= 0 && int64(idx) >= limit {
+	// LIMIT counts retained input arrays only: NULL per-row arrays are
+	// ignored by ARRAY_CONCAT_AGG and must not consume LIMIT slots
+	// (mirrors GoogleSQLArrayAggFromNative's retained-only counting).
+	var retained int64
+	for _, elem := range list {
+		if limit >= 0 && retained >= limit {
 			break
 		}
 		v, err := value.DecodeValue(elem)
@@ -295,6 +299,7 @@ func GoogleSQLArrayConcatAggFlatten(args ...any) (any, error) {
 			return nil, err
 		}
 		concatenated = append(concatenated, arr.Values...)
+		retained++
 	}
 	out := &value.ArrayValue{Values: concatenated}
 	s, isNull, err := value.EncodeValueString(out)

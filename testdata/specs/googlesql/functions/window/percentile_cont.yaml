@@ -6,3 +6,8 @@ cases:
     expected:
       rows:
         - [2.0]
+  - desc: RESPECT NULLS treats NULL as minimum
+    sql: SELECT PERCENTILE_CONT(x, 0 RESPECT NULLS) OVER () FROM UNNEST([NULL, 1.0]) AS x LIMIT 1
+    expected:
+      rows:
+        - [null]

@@ -155,6 +155,20 @@ func withAggregateInputOrdinal(ctx context.Context) context.Context {
 	return context.WithValue(ctx, aggregateInputOrdinalKey{}, aggregateInputOrdinalColumn)
 }
 
+// withoutAggregateInputOrdinal clears an inherited agg-input-ordinal
+// key. The key is scoped to a single AggregateScan's own aggregate
+// list: a nested aggregate scan (a scalar subquery inside the outer
+// scan's input, or inside an aggregate argument) must not see the
+// outer scan's ordinal, or its marker aggregates would emit
+// googlesqlite_order_by("__gsx_agg_rn", ...) against a FROM clause
+// that never materializes that column.
+func withoutAggregateInputOrdinal(ctx context.Context) context.Context {
+	if aggregateInputOrdinalFromContext(ctx) == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, aggregateInputOrdinalKey{}, "")
+}
+
 func aggregateInputOrdinalFromContext(ctx context.Context) string {
 	v := ctx.Value(aggregateInputOrdinalKey{})
 	if v == nil {
@@ -2480,8 +2494,17 @@ func (n *FunctionCallNode) tryFormatExtract(_ context.Context, funcName string, 
 		), true, nil
 	case "ISOYEAR":
 		return fmt.Sprintf("CAST(date_part('isoyear', CAST(%s AS DATE)) AS BIGINT)", args[0]), true, nil
-	case "WEEK":
-		return duckDBSundayWeekNumberSQL(args[0], 0), true, nil
+	}
+	// WEEK and WEEK(<WEEKDAY>) — the analyzer spells the latter
+	// WEEK_MONDAY .. WEEK_SATURDAY. DuckDB's date_part has no
+	// week_<weekday> specifier (it would raise a Conversion Error), so
+	// every week part lowers through the anchored week-number rewrite:
+	// weekPartOffset resolves the anchor weekday's offset from Sunday
+	// (WEEK and WEEK(SUNDAY) -> 0). ISOWEEK never reaches this lookup —
+	// it returned above with ISO year-boundary anchoring, which differs
+	// from WEEK(MONDAY)'s Jan-1 anchoring.
+	if offset, ok := weekPartOffset(body); ok {
+		return duckDBSundayWeekNumberSQL(args[0], offset), true, nil
 	}
 	return fmt.Sprintf("date_part(%s, %s)", sqlStringLiteral(p), args[0]), true, nil
 }
@@ -3619,7 +3642,19 @@ func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName 
 	distinctKeyword := ""
 	if m1(n.node.Distinct()) && !includeOpts {
 		switch sqliteName {
-		case "sum", "avg", "count", "min", "max", "bool_or", "bool_and":
+		case "sum", "avg", "count", "min", "max", "bool_or", "bool_and",
+			// ARRAY_AGG(DISTINCT x) / STRING_AGG(DISTINCT s) in OVER
+			// context: the engine implements DISTINCT for windowed
+			// list/string aggregates natively, and dedupe over the
+			// (injective) value-layer operand equals dedupe over the
+			// GoogleSQL value. Without this the analytic array_agg /
+			// string_agg branches would silently drop the modifier and
+			// keep duplicates. BigQuery rejects in-call ORDER BY / LIMIT
+			// when OVER is present, so only the DISTINCT and
+			// null-handling modifiers must survive — null handling stays
+			// on the existing wrappers (googlesqlite_array_agg_from_native
+			// / plain string_agg), unchanged from the non-DISTINCT path.
+			"array_agg", "string_agg":
 			distinctKeyword = "DISTINCT "
 		}
 	}
@@ -5354,12 +5389,21 @@ func (n *AggregateScanNode) FormatSQL(ctx context.Context) (string, error) {
 		return "", nil
 	}
 	needsInputOrdinal := aggregateScanNeedsInputOrdinal(n.node)
+	// The agg-input-ordinal key is scoped to THIS scan's aggregate
+	// list: clear any inherited key first (this scan may itself be
+	// nested under another aggregate scan's input or argument), then
+	// set this scan's own key only if its aggregates need one. The
+	// input scan is always formatted without the key — the ordinal
+	// column is materialized by the wrap around `input` below, not by
+	// anything inside it.
+	ctx = withoutAggregateInputOrdinal(ctx)
+	aggCtx := ctx
 	if needsInputOrdinal {
-		ctx = withAggregateInputOrdinal(ctx)
+		aggCtx = withAggregateInputOrdinal(ctx)
 	}
 	for _, agg := range m1(n.node.AggregateList()) {
 		// assign sql to column ref map
-		if _, err := newNode(agg).FormatSQL(ctx); err != nil {
+		if _, err := newNode(agg).FormatSQL(aggCtx); err != nil {
 			return "", err
 		}
 	}
