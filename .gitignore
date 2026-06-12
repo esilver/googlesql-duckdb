@@ -35,6 +35,9 @@ go.work.sum
 
 # Build output
 /bin/
+.gocache/
+.golangci-cache/
+.gomodcache/
 
 # GoReleaser build output (`make release`, `make release/check`).
 /dist/

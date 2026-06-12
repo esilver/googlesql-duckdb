@@ -65,10 +65,10 @@ func TestDecodeValueNativeTime(t *testing.T) {
 	// BETWEEN over any temporal column stays exact regardless of which
 	// kind the inference picked for each operand.
 	t.Run("cross_kind_comparison_exact", func(t *testing.T) {
-		lo, _ := value.DecodeValue(date)                                       // DateValue
-		hi, _ := value.DecodeValue(date.Add(13 * time.Hour))                   // DatetimeValue
-		mid, _ := value.DecodeValue(date.Add(12*time.Hour + 34*time.Minute))   // DatetimeValue
-		out, _ := value.DecodeValue(date.Add(14 * time.Hour))                  // DatetimeValue
+		lo, _ := value.DecodeValue(date)                                     // DateValue
+		hi, _ := value.DecodeValue(date.Add(13 * time.Hour))                 // DatetimeValue
+		mid, _ := value.DecodeValue(date.Add(12*time.Hour + 34*time.Minute)) // DatetimeValue
+		out, _ := value.DecodeValue(date.Add(14 * time.Hour))                // DatetimeValue
 		if got, err := mid.GTE(lo); err != nil || !got {
 			t.Fatalf("mid >= lo: got %v err %v, want true", got, err)
 		}

@@ -1,7 +1,7 @@
 # Running the BigQuery-dialect CLI on pure-Go DuckDB (no cgo)
 
 `cmd/googlesqlite` is an interactive GoogleSQL/BigQuery REPL (in the spirit of
-`sqlite3` / `spanner-cli`). On this branch it runs on the **pure-Go DuckDB**
+`sqlite3` / `spanner-cli`). In this fork it runs on the **pure-Go DuckDB**
 engine — `CGO_ENABLED=0`, no libduckdb, no C toolchain at runtime.
 
 ## Build once, run forever
@@ -16,7 +16,7 @@ Prerequisites: **none beyond Go** — the engine is the fetchable module
 see REPRODUCE-PURE-GO.md).
 
 ```sh
-cd googlesqlite     # this repo, branch pure-go-duckdb-backend
+cd googlesqlite
 CGO_ENABLED=0 go build -o gsx ./cmd/googlesqlite
 ```
 

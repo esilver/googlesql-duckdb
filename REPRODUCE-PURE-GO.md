@@ -1,6 +1,6 @@
 # Running the DuckDB backend with NO cgo (pure-Go DuckDB via wasm2go)
 
-This branch can execute GoogleSQL/BigQuery queries with **`CGO_ENABLED=0`** by
+This fork can execute GoogleSQL/BigQuery queries with **`CGO_ENABLED=0`** by
 swapping the native-`libduckdb` backend (`github.com/duckdb/duckdb-go/v2`) for a
 **pure-Go DuckDB v1.5.3** transpiled by [`ncruces/wasm2go`](https://github.com/ncruces/wasm2go).
 The BigQuery dialect (GoogleSQL analysis + the `googlesqlite_*` UDFs) is unchanged —
@@ -17,7 +17,7 @@ the transpiled engine committed under `internal/duckdbcore`). This repo
 checkouts, no generated files**.
 
 ```sh
-git clone -b pure-go-duckdb-backend https://github.com/esilver/googlesqlite
+git clone https://github.com/esilver/googlesqlite
 cd googlesqlite
 
 # Run the emulator with NO cgo (no build flags required):

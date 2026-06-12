@@ -45,7 +45,7 @@ documented behavior as cases.
   search indexes) and `objectref` (GCS object references) - these need external Google
   services and cannot run in an in-process engine. Plus 8 spec-status-gated
   documentation-only cases the suite itself does not require.
-- **This is the cgo build** (links native libduckdb - fast). This branch also
+- **This is the cgo build** (links native libduckdb - fast). This fork also
   ships a *pure-Go, no-cgo* DuckDB backend (`github.com/esilver/duckdb-go-pure`,
   a wasm2go transpile) that now **exceeds** this document's number — 986/994
   with zero failures — at a runtime cost (slower than native cgo). See
@@ -65,7 +65,7 @@ These steps take a clean macOS machine to a working build + that conformance num
 ## 1. Clone
 
 ```sh
-git clone -b duckdb-backend https://github.com/esilver/googlesqlite.git
+git clone https://github.com/esilver/googlesqlite.git
 cd googlesqlite
 ```
 

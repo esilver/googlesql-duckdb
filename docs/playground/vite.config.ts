@@ -43,7 +43,7 @@ function rawGzPlugin(): Plugin {
   }
 }
 
-// The site is published under https://goccy.github.io/googlesqlite/,
+// The site is published under https://esilver.github.io/googlesqlite/,
 // so every asset URL is prefixed with /googlesqlite/. The dev server
 // serves under the same base, i.e. http://localhost:5173/googlesqlite/.
 export default defineConfig({

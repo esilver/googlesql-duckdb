@@ -1,20 +1,21 @@
 # GoogleSQLite
 
-> **This branch (`pure-go-duckdb-backend`)** runs GoogleSQL on the pure-Go
-> DuckDB engine (`github.com/esilver/duckdb-go-pure`), not SQLite — 986/994
-> conformance with zero failures, `CGO_ENABLED=0`, no build flags. See
-> [REPRODUCE-PURE-GO.md](REPRODUCE-PURE-GO.md) and [CLI-PURE-GO.md](CLI-PURE-GO.md).
-
-GoogleSQLite is a Go project that runs GoogleSQL — the SQL dialect
-used by BigQuery and Cloud Spanner — on top of a SQLite backend. It is
-exposed as a `database/sql` driver, so any `database/sql` consumer gets
+This fork runs GoogleSQL — the SQL dialect used by BigQuery and Cloud
+Spanner — on the pure-Go DuckDB engine
+[`github.com/esilver/duckdb-go-pure`](https://github.com/esilver/duckdb-go-pure).
+It is exposed as a `database/sql` driver, so any `database/sql` consumer gets
 a local GoogleSQL execution engine with no external services to run.
+
+The pure-Go DuckDB backend reaches 986/994 conformance specs with zero
+failures, builds with `CGO_ENABLED=0`, and does not require build flags. See
+[REPRODUCE-PURE-GO.md](REPRODUCE-PURE-GO.md) and
+[CLI-PURE-GO.md](CLI-PURE-GO.md).
 
 GoogleSQL parsing and analysis is provided by
 [`goccy/go-googlesql`](https://github.com/goccy/go-googlesql), and query
 execution runs on
-[`ncruces/go-sqlite3`](https://github.com/ncruces/go-sqlite3). Both are
-implemented in pure Go, so GoogleSQLite is pure Go as well — no cgo is
+[`duckdb-go-pure`](https://github.com/esilver/duckdb-go-pure). Both the
+analysis layer and execution backend are implemented in pure Go, so no cgo is
 required.
 
 Because GoogleSQL is the dialect behind BigQuery and Cloud Spanner,
@@ -40,25 +41,24 @@ rows, err := db.Query(`SELECT FORMAT('%t', DATE '2026-05-14') AS today`)
 // ...
 ```
 
-The driver registers under `googlesqlite`. DSN is the underlying
-SQLite path (`:memory:`, a file path, or
-`file:foo.db?cache=shared`).
+The driver registers under `googlesqlite`. The DSN is the underlying DuckDB
+database path (`:memory:` or a file path).
 
 ## Playground
 
 Try GoogleSQLite in your browser, with nothing to install:
 
-**<https://goccy.github.io/googlesqlite/>**
+**<https://esilver.github.io/googlesqlite/>**
 
 The Playground is the whole engine — GoogleSQL parsing, analysis, and
-the SQLite backend — compiled to WebAssembly and run entirely
+the pure-Go DuckDB backend — compiled to WebAssembly and run entirely
 client-side. Highlights:
 
 - **No server, no install.** Every query is parsed, analyzed, and
   executed inside the browser tab; nothing is sent anywhere.
 - **Responsive UI.** The engine runs in a Web Worker, so editing and
   running queries never blocks the page.
-- **Persistent database.** The SQLite database lives in the Origin
+- **Persistent database.** The DuckDB database lives in the Origin
   Private File System (OPFS), so your tables and data survive page
   reloads with no explicit save step.
 - **A real SQL editor**, with query history and result export.
@@ -126,4 +126,3 @@ BigQuery locally brings many benefits to development and can
 significantly cut development costs. Could you return a small part of
 those savings to me? I believe doing so leads to a better future for
 both me and your company.
-

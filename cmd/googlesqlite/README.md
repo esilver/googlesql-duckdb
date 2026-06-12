@@ -1,18 +1,18 @@
 # googlesqlite CLI
 
 `googlesqlite` is an interactive console for running GoogleSQL queries
-against the googlesqlite engine — on this branch
-(`pure-go-duckdb-backend`) that is the pure-Go DuckDB backend — in the
+against the googlesqlite engine — in this fork that is the pure-Go DuckDB
+backend — in the
 spirit of the `sqlite3` and `spanner-cli` REPLs. See `CLI-PURE-GO.md`
-at the repository root for the branch-specific build and usage guide.
+at the repository root for the pure-Go build and usage guide.
 
 The same program also builds for `js/wasm` and powers the browser
 Playground.
 
 ## Install
 
-Build from a checkout of this branch (`go install ...@latest` would
-fetch the upstream SQLite-backed binary, not this backend):
+Build from this checkout (`go install ...@latest` may fetch a different
+upstream backend):
 
 ```console
 $ make build        # native binary -> bin/googlesqlite

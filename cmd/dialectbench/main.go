@@ -143,8 +143,16 @@ func main() {
 	if cpuPath == "" {
 		cpuPath = "/tmp/dialectbench.cpu"
 	}
-	prof, _ := os.Create(cpuPath)
-	pprof.StartCPUProfile(prof)
+	prof, err := os.Create(cpuPath)
+	if err != nil {
+		fmt.Printf("cpu profile create err: %v\n", err)
+		os.Exit(1)
+	}
+	if err := pprof.StartCPUProfile(prof); err != nil {
+		fmt.Printf("cpu profile start err: %v\n", err)
+		_ = prof.Close()
+		os.Exit(1)
+	}
 
 	if on["B"] {
 		phase("B file,one-tx,dialect", fileDB, true, rows, "INSERT `t` (`id`,`grp`,`val`) VALUES (?,?,?)")
@@ -163,9 +171,17 @@ func main() {
 	if memPath == "" {
 		memPath = "/tmp/dialectbench.mem"
 	}
-	mf, _ := os.Create(memPath)
+	mf, err := os.Create(memPath)
+	if err != nil {
+		fmt.Printf("mem profile create err: %v\n", err)
+		os.Exit(1)
+	}
 	runtime.GC()
-	pprof.Lookup("allocs").WriteTo(mf, 0)
+	if err := pprof.Lookup("allocs").WriteTo(mf, 0); err != nil {
+		fmt.Printf("mem profile write err: %v\n", err)
+		_ = mf.Close()
+		os.Exit(1)
+	}
 	mf.Close()
 
 	var n int64
