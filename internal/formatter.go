@@ -4003,6 +4003,9 @@ func (n *CastNode) tryNativeCast(ctx context.Context) (string, bool, error) {
 		if isRangeBoundaryValueExpr(expr) {
 			return fmt.Sprintf("googlesqlite_plain_string(%s)", expr), true, nil
 		}
+		if isMysqlStrToDateValueExpr(expr) {
+			return fmt.Sprintf("googlesqlite_unnest_temporal(%s, 'timestamp')", expr), true, nil
+		}
 		switch fromKind {
 		case googlesql.TypeKindTypeDatetime:
 			return fmt.Sprintf("strftime(%s, '%%Y-%%m-%%dT%%H:%%M:%%S')", expr), true, nil
@@ -4019,6 +4022,11 @@ func (n *CastNode) tryNativeCast(ctx context.Context) (string, bool, error) {
 	duckType, ok := duckDBTypeName(toKind)
 	if !ok {
 		return "", false, nil
+	}
+	if isMysqlStrToDateValueExpr(expr) {
+		if kindName, ok := temporalCastKindName(toKind); ok {
+			return fmt.Sprintf("CAST(googlesqlite_unnest_temporal(%s, '%s') AS %s)", expr, kindName, duckType), true, nil
+		}
 	}
 	// STRING -> temporal: a STRING-typed operand whose value is only
 	// known at execution time (a bound parameter, a stored STRING
@@ -4037,6 +4045,26 @@ func isRangeBoundaryValueExpr(expr string) bool {
 	trimmed := strings.TrimSpace(expr)
 	return strings.HasPrefix(trimmed, "googlesqlite_range_start(") ||
 		strings.HasPrefix(trimmed, "googlesqlite_range_end(")
+}
+
+func isMysqlStrToDateValueExpr(expr string) bool {
+	trimmed := strings.TrimSpace(expr)
+	return strings.HasPrefix(trimmed, "googlesqlite_mysql_str_to_date(") ||
+		strings.HasPrefix(trimmed, "googlesqlite_safe_mysql_str_to_date(")
+}
+
+func temporalCastKindName(kind googlesql.TypeKind) (string, bool) {
+	switch kind {
+	case googlesql.TypeKindTypeDate:
+		return "date", true
+	case googlesql.TypeKindTypeTime:
+		return "time", true
+	case googlesql.TypeKindTypeDatetime:
+		return "datetime", true
+	case googlesql.TypeKindTypeTimestamp:
+		return "timestamp", true
+	}
+	return "", false
 }
 
 // duckDBTypeName maps a GoogleSQL temporal/primitive kind to the DuckDB
