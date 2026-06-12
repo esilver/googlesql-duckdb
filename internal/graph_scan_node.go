@@ -103,6 +103,8 @@ type graphElementContext struct {
 type graphPathInfo struct {
 	NodeAliases []string
 	EdgeAliases []string
+	NodeIDExprs []string
+	EdgeIDExprs []string
 }
 
 type graphCtxKey struct{}
@@ -242,6 +244,8 @@ func (n *GraphPathScanNode) FormatSQL(ctx context.Context) (string, error) {
 	var pendingEdgeOrientation googlesql.ResolvedGraphEdgeScanEnums_EdgeOrientation
 	pathNodeAliases := []string{}
 	pathEdgeAliases := []string{}
+	pathNodeIDExprs := []string{}
+	pathEdgeIDExprs := []string{}
 	for i, in := range inputs {
 		switch sub := in.(type) {
 		case *googlesql.ResolvedGraphNodeScan:
@@ -272,6 +276,7 @@ func (n *GraphPathScanNode) FormatSQL(ctx context.Context) (string, error) {
 			prevNodeAlias = alias
 			prevNodeMeta = meta
 			pathNodeAliases = append(pathNodeAliases, alias)
+			pathNodeIDExprs = append(pathNodeIDExprs, graphElementIDExpr(meta, alias))
 		case *googlesql.ResolvedGraphEdgeScan:
 			edgeSQL, edgeAlias, edgeMeta, edgeOrient, err := formatEdgeScan(ctx, sub)
 			if err != nil {
@@ -286,6 +291,7 @@ func (n *GraphPathScanNode) FormatSQL(ctx context.Context) (string, error) {
 			pendingEdgeMeta = edgeMeta
 			pendingEdgeOrientation = edgeOrient
 			pathEdgeAliases = append(pathEdgeAliases, edgeAlias)
+			pathEdgeIDExprs = append(pathEdgeIDExprs, graphElementIDExpr(edgeMeta, edgeAlias))
 		default:
 			return "", fmt.Errorf("unsupported graph path element %T", sub)
 		}
@@ -301,6 +307,8 @@ func (n *GraphPathScanNode) FormatSQL(ctx context.Context) (string, error) {
 				gc.pathInfo[id] = &graphPathInfo{
 					NodeAliases: pathNodeAliases,
 					EdgeAliases: pathEdgeAliases,
+					NodeIDExprs: pathNodeIDExprs,
+					EdgeIDExprs: pathEdgeIDExprs,
 				}
 			}
 		}
@@ -484,19 +492,19 @@ func formatPathScalarFunc(ctx context.Context, name string, n *googlesql.Resolve
 		}
 		return "(" + strings.Join(parts, " AND ") + ")", true, nil
 	case "nodes", "path_nodes":
-		return graphElementIDArrayLiteral(pi.NodeAliases), true, nil
+		return graphElementIDArrayLiteral(pi.NodeIDExprs), true, nil
 	case "edges", "path_edges":
-		return graphElementIDArrayLiteral(pi.EdgeAliases), true, nil
+		return graphElementIDArrayLiteral(pi.EdgeIDExprs), true, nil
 	case "path_first":
-		if len(pi.NodeAliases) == 0 {
+		if len(pi.NodeIDExprs) == 0 {
 			return "NULL", true, nil
 		}
-		return fmt.Sprintf("CAST(%s.rowid AS STRING)", dq(pi.NodeAliases[0])), true, nil
+		return pi.NodeIDExprs[0], true, nil
 	case "path_last":
-		if len(pi.NodeAliases) == 0 {
+		if len(pi.NodeIDExprs) == 0 {
 			return "NULL", true, nil
 		}
-		return fmt.Sprintf("CAST(%s.rowid AS STRING)", dq(pi.NodeAliases[len(pi.NodeAliases)-1])), true, nil
+		return pi.NodeIDExprs[len(pi.NodeIDExprs)-1], true, nil
 	}
 	return "", false, nil
 }
@@ -508,18 +516,36 @@ func must0[T any](v T, _ error) T { return v }
 
 // graphElementIDArrayLiteral builds a SQL expression that
 // produces an ARRAY<STRING> of ELEMENT_ID-shaped values for the
-// given alias list. Uses the `googlesqlite_make_array` runtime
-// UDF so the rowids can be looked up at execution time and
-// returned as a single ARRAY value.
-func graphElementIDArrayLiteral(aliases []string) string {
-	if len(aliases) == 0 {
+// given expression list. Uses the `googlesqlite_make_array`
+// runtime UDF so row-dependent values can be looked up at
+// execution time and returned as a single ARRAY value.
+func graphElementIDArrayLiteral(exprs []string) string {
+	if len(exprs) == 0 {
 		return "googlesqlite_make_array()"
 	}
-	parts := make([]string, 0, len(aliases))
-	for _, a := range aliases {
-		parts = append(parts, fmt.Sprintf("CAST(%s.rowid AS STRING)", dq(a)))
+	return "googlesqlite_make_array(" + strings.Join(exprs, ", ") + ")"
+}
+
+func graphElementIDExpr(meta *graphElementMetadata, alias string) string {
+	return fmt.Sprintf("CAST(%s AS STRING)", graphElementKeyExpr(meta, alias))
+}
+
+func graphElementKeyExpr(meta *graphElementMetadata, alias string) string {
+	if meta != nil {
+		switch len(meta.KeyCols) {
+		case 0:
+			// fall through
+		case 1:
+			return fmt.Sprintf("%s.%s", dq(alias), dq(meta.KeyCols[0]))
+		default:
+			parts := make([]string, 0, len(meta.KeyCols))
+			for _, col := range meta.KeyCols {
+				parts = append(parts, fmt.Sprintf("COALESCE(CAST(%s.%s AS STRING), '')", dq(alias), dq(col)))
+			}
+			return "(" + strings.Join(parts, " || '|' || ") + ")"
+		}
 	}
-	return "googlesqlite_make_array(" + strings.Join(parts, ", ") + ")"
+	return fmt.Sprintf("%s.rowid", dq(alias))
 }
 
 // nextGraphAliasID returns a per-query monotonic alias suffix so
@@ -811,12 +837,12 @@ func parseMeasureSQL(s string) (kind, inner string, err error) {
 	return kind, inner, nil
 }
 
-// keySQLForElement projects a row-unique key for the underlying
-// SQLite table behind a graph element. SQLite's `rowid` is the
-// simplest such key — it's the integer primary key alias unique
-// per row, exactly what the AGG locking-key dedup needs.
-func keySQLForElement(_ googlesql.GraphElementTableNode, alias string) (string, error) {
-	return fmt.Sprintf("%s.rowid", dq(alias)), nil
+// keySQLForElement projects the graph element's declared key
+// when available. The AGG locking-key dedup needs a row-unique
+// scalar; rowid remains a compatibility fallback for metadata
+// gaps.
+func keySQLForElement(elem googlesql.GraphElementTableNode, alias string) (string, error) {
+	return graphElementKeyExpr(graphElementMetadataFor(elem), alias), nil
 }
 
 // tryFormatGraphElementFunc lowers the Spanner graph-element
@@ -905,7 +931,7 @@ func tryFormatGraphElementFunc(ctx context.Context, n *googlesql.ResolvedFunctio
 	case "labels":
 		return graphStringArrayLiteral(meta.Labels), true, nil
 	case "element_id":
-		return fmt.Sprintf("CAST(%s.rowid AS STRING)", dq(alias)), true, nil
+		return graphElementIDExpr(meta, alias), true, nil
 	case "element_definition_name":
 		lit, _ := literalFromValue(value.StringValue(meta.Name))
 		return lit, true, nil

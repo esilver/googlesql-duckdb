@@ -1369,6 +1369,20 @@ var nativeScalarFuncMap = map[string]string{
 func tryNativeScalarFunc(funcName string, args []string) (string, bool) {
 	bare := strings.TrimPrefix(funcName, "googlesqlite_safe_")
 	bare = strings.TrimPrefix(bare, "googlesqlite_")
+	switch bare {
+	case "mysql_now", "mysql_current_timestamp", "mysql_localtime", "mysql_localtimestamp", "mysql_sysdate", "mysql_utc_timestamp":
+		if len(args) == 0 {
+			return "now()", true
+		}
+	case "mysql_curdate", "mysql_current_date", "mysql_utc_date":
+		if len(args) == 0 {
+			return "current_date", true
+		}
+	case "mysql_str_to_date":
+		if len(args) == 2 {
+			return fmt.Sprintf("strptime(googlesqlite_plain_string(%s), googlesqlite_plain_string(%s))", args[0], args[1]), true
+		}
+	}
 	if native, ok := nativeScalarFuncMap[bare]; ok {
 		return fmt.Sprintf("%s(%s)", native, strings.Join(args, ",")), true
 	}
@@ -3873,6 +3887,9 @@ func (n *CastNode) tryNativeCast(ctx context.Context) (string, bool, error) {
 			if err != nil {
 				return "", false, err
 			}
+			if isArrayElementValueLayerExpr(expr) {
+				expr = fmt.Sprintf("googlesqlite_plain_string(%s)", expr)
+			}
 			target := "DOUBLE"
 			if toKind == googlesql.TypeKindTypeFloat {
 				target = "FLOAT"
@@ -4068,6 +4085,14 @@ func isNativeNumericKind(k googlesql.TypeKind) bool {
 	return false
 }
 
+func isArrayElementValueLayerExpr(expr string) bool {
+	trimmed := strings.TrimSpace(expr)
+	return strings.HasPrefix(trimmed, "googlesqlite_array_at_offset(") ||
+		strings.HasPrefix(trimmed, "googlesqlite_safe_array_at_offset(") ||
+		strings.HasPrefix(trimmed, "googlesqlite_array_at_ordinal(") ||
+		strings.HasPrefix(trimmed, "googlesqlite_safe_array_at_ordinal(")
+}
+
 func isIntegerTypeKind(kind googlesql.TypeKind) bool {
 	switch kind {
 	case googlesql.TypeKindTypeInt32,
@@ -4148,6 +4173,9 @@ func kindAt(kinds []googlesql.TypeKind, i int) googlesql.TypeKind {
 // is idempotent, so applying it to an already-native operand is harmless.
 func castOperandToKind(operand string, kind googlesql.TypeKind) string {
 	if castType, ok := valueLayerScalarCastType(kind); ok {
+		if isArrayElementValueLayerExpr(operand) {
+			operand = fmt.Sprintf("googlesqlite_plain_string(%s)", operand)
+		}
 		return fmt.Sprintf("CAST(%s AS %s)", operand, castType)
 	}
 	// Native-storage NUMERIC: arithmetic binds the stored DECIMAL(38,9)
