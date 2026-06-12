@@ -1,5 +1,10 @@
 # Reproduce on another Mac - cgo DuckDB-backed BigQuery engine
 
+> Historical note: this document describes the older native-libduckdb/cgo
+> backend used as a baseline during the DuckDB port. The maintained branch now
+> defaults to the pure-Go DuckDB backend; the cgo path is not covered by CI and
+> may require adapter work before it builds against current dependencies.
+
 ## What this repo is
 
 A **local BigQuery emulator backed by DuckDB** - run BigQuery GoogleSQL (dbt models,

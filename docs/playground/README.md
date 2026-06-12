@@ -14,7 +14,7 @@ client-side, powered by `googlesqlite` compiled to WebAssembly.
 ## Prerequisites
 
 - Go (the version pinned in the repository `go.mod`)
-- Node.js 20+ and npm
+- Node.js 26 and npm for the wasm build path
 
 ## Run locally
 

@@ -4,8 +4,9 @@ This fork can execute GoogleSQL/BigQuery queries with **`CGO_ENABLED=0`** by
 swapping the native-`libduckdb` backend (`github.com/duckdb/duckdb-go/v2`) for a
 **pure-Go DuckDB v1.5.3** transpiled by [`ncruces/wasm2go`](https://github.com/ncruces/wasm2go).
 The BigQuery dialect (GoogleSQL analysis + the `googlesqlite_*` UDFs) is unchanged —
-only the DuckDB *execution backend* changes. `CGO_ENABLED=1` still builds the
-original native path, untouched.
+only the DuckDB *execution backend* changes. The current maintained path is the
+pure-Go backend; the older native cgo backend is historical and is not exercised
+by CI on this branch.
 
 ## Setup — ONE clone, zero replaces
 
@@ -55,8 +56,8 @@ afterwards.)
   `duckdb-go/v2` API subset the emulator consumes (`Driver`, `Decimal`,
   `Type`/`TypeInfo`, `RegisterScalarUDF`, `RegisterTableUDF`, …) backed by the
   pure-Go engine. Call sites are unchanged apart from the import path.
-- The single cgo translation unit `duckdb_aggregate_udf.go` is build-tagged
-  `//go:build cgo`; `duckdb_aggregate_udf_purego.go` (`//go:build !cgo`) is the
+- The historical cgo translation unit `duckdb_aggregate_udf.go` is build-tagged
+  `//go:build duckdb_cgo`; `duckdb_aggregate_udf_purego.go` is the
   pure-Go port of the same bridge: all 32 aggregate specs (KLL, HLL, ANY_VALUE
   HAVING, googlesqlite_agg, ST_*_AGG, st_clusterdbscan, tf_idf, and both
   differential-privacy families) register as arity bands of ANY-parameter
