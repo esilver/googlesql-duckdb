@@ -408,6 +408,13 @@ func duckdbAggSpecs() []aggSpec {
 		{name: "approx_top_count", minParams: 2, maxParams: 5, newAgg: approx.BindApproxTopCount()},
 		{name: "approx_top_sum", minParams: 3, maxParams: 6, newAgg: approx.BindApproxTopSum()},
 
+		// ARRAY_AGG(DISTINCT ...) cannot use DuckDB's native DISTINCT aggregate
+		// when the formatter also supplies the hidden first-seen ordinal for
+		// BigQuery output order: DuckDB requires every ORDER BY expression to
+		// appear in the DISTINCT argument list. Route that shape through the
+		// existing GoogleSQL aggregate body under a non-conflicting name.
+		{name: "googlesqlite_array_agg", minParams: 1, maxParams: 8, newAgg: aggregate.BindArrayAgg()},
+
 		// ANY_VALUE(value HAVING { MAX | MIN } key): the formatter lowers
 		// the HAVING modifier to having_any_value(value, key, 'MAX'|'MIN'),
 		// always emitting exactly three arguments. The aggregate buffers

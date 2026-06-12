@@ -620,6 +620,8 @@ var normalFuncs = []*funcInfo{
 	// aggregate option funcs
 	{Name: "distinct", BindFunc: bindDistinct},
 	{Name: "ignore_nulls", BindFunc: bindIgnoreNulls},
+	{Name: "limit", BindFunc: bindLimit},
+	{Name: "order_by", BindFunc: bindOrderBy},
 
 	// window option funcs
 	{Name: "window_rowid", BindFunc: bindWindowRowID},

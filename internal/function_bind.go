@@ -178,6 +178,28 @@ func bindIgnoreNulls(args ...value.Value) (value.Value, error) {
 	return helper.IGNORE_NULLS()
 }
 
+func bindLimit(args ...value.Value) (value.Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("LIMIT: invalid number of arguments: got %d, want 1", len(args))
+	}
+	limit, err := args[0].ToInt64()
+	if err != nil {
+		return nil, err
+	}
+	return helper.LIMIT(limit)
+}
+
+func bindOrderBy(args ...value.Value) (value.Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("ORDER_BY: invalid number of arguments: got %d, want 2", len(args))
+	}
+	isAsc, err := args[1].ToBool()
+	if err != nil {
+		return nil, err
+	}
+	return helper.ORDER_BY(args[0], isAsc)
+}
+
 var bindWindowRowID = helper.Scalar1(func(v value.Value) (value.Value, error) {
 	a0, err := v.ToInt64()
 	if err != nil {

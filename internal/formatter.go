@@ -142,6 +142,7 @@ func formatInput(input string) (string, error) {
 type aggregateInputOrdinalKey struct{}
 
 const aggregateInputOrdinalColumn = "__gsx_agg_rn"
+const leftJoinOrdinalColumn = "__gsx_left_join_rn"
 
 func withAggregateInputOrdinal(ctx context.Context) context.Context {
 	return context.WithValue(ctx, aggregateInputOrdinalKey{}, aggregateInputOrdinalColumn)
@@ -2984,7 +2985,12 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 		args = castArgs
 		resultWrap = rw
 	}
-	if usesDuckDBAggregateOptionMarkers(funcName) {
+	useMarkerAggregate := usesDuckDBAggregateOptionMarkers(funcName)
+	if funcName == "array_agg" && m1(n.node.Distinct()) {
+		funcName = "googlesqlite_array_agg"
+		useMarkerAggregate = true
+	}
+	if useMarkerAggregate {
 		var opts []string
 		for _, item := range m1(n.node.OrderByItemList()) {
 			columnRef := m1(item.ColumnRef())
@@ -2993,6 +2999,11 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 				opts = append(opts, fmt.Sprintf("googlesqlite_order_by(\"%s\", false)", colName))
 			} else {
 				opts = append(opts, fmt.Sprintf("googlesqlite_order_by(\"%s\", true)", colName))
+			}
+		}
+		if len(opts) == 0 {
+			if ordinal := aggregateInputOrdinalFromContext(ctx); ordinal != "" {
+				opts = append(opts, fmt.Sprintf("googlesqlite_order_by(\"%s\", true)", ordinal))
 			}
 		}
 		if m1(n.node.Distinct()) {
@@ -4682,6 +4693,9 @@ func (n *SubqueryExprNode) FormatSQL(ctx context.Context) (string, error) {
 }
 
 func formatSingleValueSubquery(ctx context.Context, subquery googlesql.ResolvedScanNode, sql string) (string, error) {
+	if !strings.Contains(sql, fmt.Sprintf("\"%s\"", setOperationOrdinalColumn)) {
+		return sql, nil
+	}
 	subCols := m1(subquery.MutableColumnList())
 	if len(subCols) == 0 {
 		return "", fmt.Errorf("failed to find computed column names for value subquery")
@@ -4768,7 +4782,7 @@ func (n *JoinScanNode) FormatSQL(ctx context.Context) (string, error) {
 	case googlesql.ResolvedJoinScanEnums_JoinTypeInner:
 		return fmt.Sprintf("%s JOIN %s ON %s", left, right, joinExpr), nil
 	case googlesql.ResolvedJoinScanEnums_JoinTypeLeft:
-		return fmt.Sprintf("%s LEFT JOIN %s ON %s", left, right, joinExpr), nil
+		return formatLeftJoinPreservingLeftOrder(ctx, n.node, left, right, joinExpr)
 	case googlesql.ResolvedJoinScanEnums_JoinTypeRight:
 		return fmt.Sprintf("%s RIGHT JOIN %s ON %s", left, right, joinExpr), nil
 	case googlesql.ResolvedJoinScanEnums_JoinTypeFull:
@@ -4793,6 +4807,33 @@ func (n *JoinScanNode) FormatSQL(ctx context.Context) (string, error) {
 		return fmt.Sprintf("%s FULL OUTER JOIN %s ON %s", left, right, joinExpr), nil
 	}
 	return "", fmt.Errorf("unexpected join type %d", m1(n.node.JoinType()))
+}
+
+func formatLeftJoinPreservingLeftOrder(ctx context.Context, join *googlesql.ResolvedJoinScan, left, right, joinExpr string) (string, error) {
+	formattedLeft, err := formatInput(left)
+	if err != nil {
+		return "", err
+	}
+	leftAlias := "__gsx_left_join_l"
+	leftWithOrdinal := fmt.Sprintf(
+		"(SELECT *, row_number() OVER () AS \"%s\" %s) AS \"%s\"",
+		leftJoinOrdinalColumn,
+		formattedLeft,
+		leftAlias,
+	)
+	columns := []string{}
+	for _, col := range m1(join.ColumnList()) {
+		columns = append(columns, fmt.Sprintf("\"%s\"", uniqueColumnName(ctx, col)))
+	}
+	return fmt.Sprintf(
+		"(SELECT %s FROM %s LEFT JOIN %s ON %s ORDER BY \"%s\".\"%s\")",
+		strings.Join(columns, ","),
+		leftWithOrdinal,
+		right,
+		joinExpr,
+		leftAlias,
+		leftJoinOrdinalColumn,
+	), nil
 }
 
 // tryFormatFullOuterOffsetZip retargets the FULL OUTER JOIN that ARRAY_ZIP's

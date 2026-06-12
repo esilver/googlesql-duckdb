@@ -290,9 +290,12 @@ var duckDBNormalUDFNames = append(append([]string{}, stringFamilyUDFNames...),
 	// ISERROR / NULLIFERROR safe-eval wraps.
 	"divide",
 	// Aggregate option marker helpers emitted by aggregate/window formatting
-	// when DISTINCT / IGNORE NULLS must be represented as value-layer options.
+	// when DISTINCT / IGNORE NULLS / LIMIT / ORDER BY must be represented as
+	// value-layer options.
 	"distinct",
 	"ignore_nulls",
+	"limit",
+	"order_by",
 	// Boolean predicate helpers emitted for IS TRUE / IS FALSE when the
 	// operator cannot be lowered natively.
 	"is_true",
