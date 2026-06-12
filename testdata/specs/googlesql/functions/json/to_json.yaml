@@ -6,3 +6,37 @@ cases:
     expected:
       rows:
         - ['42']
+  - desc: TO_JSON of a DATE quotes the temporal
+    sql: SELECT TO_JSON_STRING(TO_JSON(DATE '2024-02-29'))
+    expected:
+      rows:
+        - ['"2024-02-29"']
+  # Wrapped in a STRUCT so the TIMESTAMP reaches the UDF through the
+  # value envelope; a bare TIMESTAMP arg decodes from DuckDB's native
+  # timestamp without its zone marker (pre-existing divergence, same
+  # for TO_JSON_STRING — see to_json_string.yaml).
+  - desc: TO_JSON of a TIMESTAMP quotes the temporal
+    sql: SELECT TO_JSON_STRING(TO_JSON(STRUCT(TIMESTAMP '2024-02-29 12:34:56+00' AS ts)))
+    expected:
+      rows:
+        - ['{"ts":"2024-02-29T12:34:56Z"}']
+  - desc: TO_JSON of a DATETIME quotes the temporal
+    sql: SELECT TO_JSON_STRING(TO_JSON(DATETIME '2024-02-29 12:34:56'))
+    expected:
+      rows:
+        - ['"2024-02-29T12:34:56"']
+  - desc: TO_JSON of a TIME quotes the temporal
+    sql: SELECT TO_JSON_STRING(TO_JSON(TIME '12:34:56'))
+    expected:
+      rows:
+        - ['"12:34:56"']
+  - desc: TO_JSON of an array of dates
+    sql: SELECT TO_JSON_STRING(TO_JSON([DATE '2024-03-01', DATE '2024-03-02']))
+    expected:
+      rows:
+        - ['["2024-03-01","2024-03-02"]']
+  - desc: TO_JSON of a struct with a date field
+    sql: SELECT TO_JSON_STRING(TO_JSON(STRUCT(DATE '2024-02-29' AS d, 7 AS n)))
+    expected:
+      rows:
+        - ['{"d":"2024-02-29","n":7}']

@@ -16,6 +16,7 @@ import (
 	googlesql "github.com/goccy/go-googlesql"
 	"github.com/goccy/go-json"
 
+	jsonfn "github.com/goccy/googlesqlite/internal/functions/json"
 	"github.com/goccy/googlesqlite/internal/value"
 )
 
@@ -756,7 +757,11 @@ func castValueWithKind(kind googlesql.TypeKind, t googlesql.Googlesql_TypeNode, 
 		}
 		return &value.NumericValue{Rat: r, IsBigNumeric: true}, nil
 	case googlesql.TypeKindTypeJson:
-		j, err := v.ToJSON()
+		// Use the shared JSON-literal renderer so temporal values
+		// (including ones nested in arrays/structs) become quoted JSON
+		// strings; bare ToJSON leaves them as invalid tokens like
+		// 2024-02-29. Non-temporal values keep their ToJSON behavior.
+		j, err := jsonfn.ToJSONLiteral(v)
 		if err != nil {
 			return nil, err
 		}

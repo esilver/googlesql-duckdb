@@ -788,6 +788,75 @@ func TestBindToJsonStringTemporalValues(t *testing.T) {
 	}
 }
 
+// TestBindToJsonTemporalValues guards TO_JSON's temporal quoting: it
+// must produce the same JSON literals as TO_JSON_STRING (df68e31 fixed
+// TO_JSON_STRING only, leaving TO_JSON emitting bare 2024-02-29 — an
+// invalid JSON token).
+func TestBindToJsonTemporalValues(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		desc string
+		in   value.Value
+		want string
+	}{
+		{
+			desc: "DATE",
+			in:   value.DateValue(time.Date(2024, 2, 29, 0, 0, 0, 0, time.UTC)),
+			want: `"2024-02-29"`,
+		},
+		{
+			desc: "TIME",
+			in:   value.TimeValue(time.Date(0, 1, 1, 12, 34, 56, 0, time.UTC)),
+			want: `"12:34:56"`,
+		},
+		{
+			desc: "DATETIME",
+			in:   value.DatetimeValue(time.Date(2024, 2, 29, 12, 34, 56, 0, time.UTC)),
+			want: `"2024-02-29T12:34:56"`,
+		},
+		{
+			desc: "TIMESTAMP",
+			in:   value.TimestampValue(time.Date(2024, 2, 29, 12, 34, 56, 0, time.UTC)),
+			want: `"2024-02-29T12:34:56Z"`,
+		},
+		{
+			desc: "array of dates",
+			in: &value.ArrayValue{Values: []value.Value{
+				value.DateValue(time.Date(2024, 3, 1, 0, 0, 0, 0, time.UTC)),
+				nil,
+			}},
+			want: `["2024-03-01",null]`,
+		},
+		{
+			desc: "struct with date field",
+			in: &value.StructValue{
+				Keys: []string{"d", "n"},
+				Values: []value.Value{
+					value.DateValue(time.Date(2024, 2, 29, 0, 0, 0, 0, time.UTC)),
+					value.IntValue(7),
+				},
+			},
+			want: `{"d":"2024-02-29","n":7}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			got, err := BindToJson(tc.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			jv, ok := got.(value.JsonValue)
+			if !ok {
+				t.Fatalf("expected JsonValue, got %T", got)
+			}
+			if string(jv) != tc.want {
+				t.Fatalf("TO_JSON = %s, want %s", string(jv), tc.want)
+			}
+		})
+	}
+}
+
 func TestBindJsonSubscript(t *testing.T) {
 	t.Parallel()
 
