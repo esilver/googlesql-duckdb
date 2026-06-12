@@ -9,21 +9,27 @@ func applyExtractAtTimeZoneRewrite(query string) string {
 	if !containsCaseInsensitive(query, "EXTRACT") || !containsCaseInsensitive(query, "TIME ZONE") {
 		return query
 	}
+	var out strings.Builder
 	for {
 		start, end, args, ok := findFunctionCall(query, "EXTRACT")
 		if !ok {
-			return query
+			out.WriteString(query)
+			return out.String()
 		}
+		out.WriteString(query[:start])
 		replacement, changed := rewriteExtractAtTimeZoneCall(args)
-		if !changed {
-			next := query[end:]
-			if !containsCaseInsensitive(next, "EXTRACT") || !containsCaseInsensitive(next, "TIME ZONE") {
-				return query
-			}
-			query = query[:end] + applyExtractAtTimeZoneRewrite(next)
-			return query
+		if changed {
+			out.WriteString(replacement)
+			query = query[end:]
+			continue
 		}
-		query = query[:start] + replacement + query[end:]
+
+		open := end - len(args) - 2
+		rewrittenArgs := applyExtractAtTimeZoneRewrite(args)
+		out.WriteString(query[start : open+1])
+		out.WriteString(rewrittenArgs)
+		out.WriteByte(')')
+		query = query[end:]
 	}
 }
 

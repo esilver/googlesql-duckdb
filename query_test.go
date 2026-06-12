@@ -7563,10 +7563,11 @@ WITH Input AS (SELECT TIMESTAMP("2008-12-25 05:30:00+00") AS timestamp_value)
 SELECT
   EXTRACT(DAY FROM timestamp_value AT TIME ZONE "UTC"),
   EXTRACT(DAY FROM timestamp_value AT TIME ZONE "America/Los_Angeles"),
-  EXTRACT(DATE FROM timestamp_value)
+  EXTRACT(DATE FROM timestamp_value),
+  EXTRACT(YEAR FROM EXTRACT(DATE FROM TIMESTAMP("2009-01-01 05:30:00+00") AT TIME ZONE "America/Los_Angeles"))
 FROM Input`,
 			expectedRows: [][]any{
-				{int64(25), int64(24), "2008-12-25"},
+				{int64(25), int64(24), "2008-12-25", int64(2008)},
 			},
 		},
 

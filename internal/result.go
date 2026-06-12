@@ -1,6 +1,9 @@
 package internal
 
-import "database/sql/driver"
+import (
+	"database/sql/driver"
+	"strings"
+)
 
 type Result struct {
 	conn   *Conn
@@ -16,15 +19,7 @@ func (r *Result) LastInsertId() (int64, error) {
 		return 0, nil
 	}
 	id, err := r.result.LastInsertId()
-	if err != nil {
-		// The DuckDB driver does not support LastInsertId (there is no
-		// rowid concept). BigQuery has no last-insert-id either, and the
-		// legacy SQLite backend returned an implementation-defined value.
-		// Degrade to 0 instead of erroring so database/sql callers that
-		// probe the Result keep working.
-		return 0, nil
-	}
-	return id, nil
+	return normalizeLastInsertID(id, err)
 }
 
 func (r *Result) RowsAffected() (int64, error) {
@@ -47,12 +42,32 @@ type execResult struct {
 
 func (r *execResult) LastInsertId() (int64, error) {
 	id, err := r.result.LastInsertId()
-	if err != nil {
-		return 0, nil
-	}
-	return id, nil
+	return normalizeLastInsertID(id, err)
 }
 
 func (r *execResult) RowsAffected() (int64, error) {
 	return r.result.RowsAffected()
+}
+
+func normalizeLastInsertID(id int64, err error) (int64, error) {
+	if err == nil {
+		return id, nil
+	}
+	// The DuckDB driver does not support LastInsertId (there is no rowid
+	// concept). BigQuery has no last-insert-id either, and the legacy SQLite
+	// backend returned an implementation-defined value. Degrade only that
+	// unsupported surface to 0; other driver errors should remain visible.
+	if isUnsupportedLastInsertIDError(err) {
+		return 0, nil
+	}
+	return 0, err
+}
+
+func isUnsupportedLastInsertIDError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "lastinsertid is not supported") ||
+		strings.Contains(msg, "last insert id is not supported")
 }
