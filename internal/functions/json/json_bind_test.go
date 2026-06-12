@@ -3,6 +3,7 @@ package json
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/goccy/googlesqlite/internal/value"
 )
@@ -759,6 +760,31 @@ func TestBindToJsonString(t *testing.T) {
 
 	if _, err := BindToJsonString(); err == nil {
 		t.Fatal("expected arg count error")
+	}
+}
+
+func TestBindToJsonStringTemporalValues(t *testing.T) {
+	t.Parallel()
+
+	got, err := BindToJsonString(&value.StructValue{
+		Keys: []string{"d", "t", "dt", "ts", "arr"},
+		Values: []value.Value{
+			value.DateValue(time.Date(2024, 2, 29, 0, 0, 0, 0, time.UTC)),
+			value.TimeValue(time.Date(0, 1, 1, 12, 34, 56, 0, time.UTC)),
+			value.DatetimeValue(time.Date(2024, 2, 29, 12, 34, 56, 0, time.UTC)),
+			value.TimestampValue(time.Date(2024, 2, 29, 12, 34, 56, 0, time.UTC)),
+			&value.ArrayValue{Values: []value.Value{
+				value.DateValue(time.Date(2024, 3, 1, 0, 0, 0, 0, time.UTC)),
+				nil,
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"d":"2024-02-29","t":"12:34:56","dt":"2024-02-29T12:34:56","ts":"2024-02-29T12:34:56Z","arr":["2024-03-01",null]}`
+	if mustString(t, got) != want {
+		t.Fatalf("got  %s\nwant %s", mustString(t, got), want)
 	}
 }
 
