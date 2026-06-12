@@ -1378,11 +1378,14 @@ func tryNativeScalarFunc(funcName string, args []string) (string, bool) {
 		if len(args) == 0 {
 			return "current_date", true
 		}
-	case "mysql_str_to_date":
-		if len(args) == 2 {
-			return fmt.Sprintf("strptime(googlesqlite_plain_string(%s), googlesqlite_plain_string(%s))", args[0], args[1]), true
-		}
 	}
+	// NOTE: mysql_str_to_date must NOT lower to DuckDB strptime with the
+	// MySQL format string verbatim: the specifiers diverge (MySQL
+	// %i=minutes vs strptime %i unsupported, %M=month-name vs strptime
+	// %M=minutes, %s=seconds vs strptime %s=epoch), and MySQL returns
+	// NULL on parse failure while strptime errors. It falls through to
+	// the registered mysql_str_to_date UDF (spanner.BindStrToDate),
+	// which translates the MySQL format and NULLs on failure.
 	if native, ok := nativeScalarFuncMap[bare]; ok {
 		return fmt.Sprintf("%s(%s)", native, strings.Join(args, ",")), true
 	}
