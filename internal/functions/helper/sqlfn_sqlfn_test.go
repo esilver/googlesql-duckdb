@@ -438,6 +438,34 @@ func TestSortAggregatedValues_Ascending(t *testing.T) {
 	}
 }
 
+func TestSortAggregatedValues_NullOrder(t *testing.T) {
+	t.Parallel()
+
+	nullsLast := false
+	values := []*helper.OrderedValue{
+		{OrderBy: []*helper.OrderBy{{Value: nil, IsAsc: true, NullsFirst: &nullsLast}}, Value: value.IntValue(10)},
+		{OrderBy: []*helper.OrderBy{{Value: value.IntValue(1), IsAsc: true, NullsFirst: &nullsLast}}, Value: value.IntValue(20)},
+	}
+	got := helper.SortAggregatedValues(values, &helper.Option{
+		OrderBy: []*helper.OrderBy{{IsAsc: true, NullsFirst: &nullsLast}},
+	})
+	if v, _ := got[0].Value.ToInt64(); v != 20 {
+		t.Fatalf("NULLS LAST sorted first value = %d; want 20", v)
+	}
+
+	nullsFirst := true
+	values = []*helper.OrderedValue{
+		{OrderBy: []*helper.OrderBy{{Value: value.IntValue(1), IsAsc: false, NullsFirst: &nullsFirst}}, Value: value.IntValue(20)},
+		{OrderBy: []*helper.OrderBy{{Value: nil, IsAsc: false, NullsFirst: &nullsFirst}}, Value: value.IntValue(10)},
+	}
+	got = helper.SortAggregatedValues(values, &helper.Option{
+		OrderBy: []*helper.OrderBy{{IsAsc: false, NullsFirst: &nullsFirst}},
+	})
+	if v, _ := got[0].Value.ToInt64(); v != 10 {
+		t.Fatalf("DESC NULLS FIRST sorted first value = %d; want 10", v)
+	}
+}
+
 func TestSortAggregatedValues_NoOrderBy(t *testing.T) {
 	t.Parallel()
 

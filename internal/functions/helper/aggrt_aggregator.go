@@ -110,11 +110,18 @@ func SortAggregatedValues(values []*OrderedValue, opt *Option) []*OrderedValue {
 			iV := values[i].OrderBy[orderBy].Value
 			jV := values[j].OrderBy[orderBy].Value
 			isAsc := values[0].OrderBy[orderBy].IsAsc
+			nullsFirst := isAsc
+			if values[0].OrderBy[orderBy].NullsFirst != nil {
+				nullsFirst = *values[0].OrderBy[orderBy].NullsFirst
+			}
+			if iV == nil && jV == nil {
+				continue
+			}
 			if iV == nil {
-				return isAsc
+				return nullsFirst
 			}
 			if jV == nil {
-				return !isAsc
+				return !nullsFirst
 			}
 			isEqual, _ := iV.EQ(jV)
 			if isEqual {

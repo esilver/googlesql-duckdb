@@ -190,14 +190,21 @@ func bindLimit(args ...value.Value) (value.Value, error) {
 }
 
 func bindOrderBy(args ...value.Value) (value.Value, error) {
-	if len(args) != 2 {
-		return nil, fmt.Errorf("ORDER_BY: invalid number of arguments: got %d, want 2", len(args))
+	if len(args) != 2 && len(args) != 3 {
+		return nil, fmt.Errorf("ORDER_BY: invalid number of arguments: got %d, want 2 or 3", len(args))
 	}
 	isAsc, err := args[1].ToBool()
 	if err != nil {
 		return nil, err
 	}
-	return helper.ORDER_BY(args[0], isAsc)
+	if len(args) == 2 {
+		return helper.ORDER_BY(args[0], isAsc)
+	}
+	nullsFirst, err := args[2].ToBool()
+	if err != nil {
+		return nil, err
+	}
+	return helper.ORDER_BY(args[0], isAsc, nullsFirst)
 }
 
 var bindWindowRowID = helper.Scalar1(func(v value.Value) (value.Value, error) {

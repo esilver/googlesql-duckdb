@@ -92,14 +92,16 @@ func IGNORE_NULLS() (value.Value, error) {
 // its over-the-wire form by UnmarshalJSON below using the canonical
 // value codec.
 type OrderBy struct {
-	Value value.Value `json:"value"`
-	IsAsc bool        `json:"isAsc"`
+	Value      value.Value `json:"value"`
+	IsAsc      bool        `json:"isAsc"`
+	NullsFirst *bool       `json:"nullsFirst,omitempty"`
 }
 
 func (a *OrderBy) UnmarshalJSON(b []byte) error {
 	var v struct {
-		Value any  `json:"value"`
-		IsAsc bool `json:"isAsc"`
+		Value      any   `json:"value"`
+		IsAsc      bool  `json:"isAsc"`
+		NullsFirst *bool `json:"nullsFirst"`
 	}
 	if err := json.Unmarshal(b, &v); err != nil {
 		return err
@@ -110,15 +112,21 @@ func (a *OrderBy) UnmarshalJSON(b []byte) error {
 	}
 	a.Value = val
 	a.IsAsc = v.IsAsc
+	a.NullsFirst = v.NullsFirst
 	return nil
 }
 
-func ORDER_BY(v value.Value, isAsc bool) (value.Value, error) {
+func ORDER_BY(v value.Value, isAsc bool, nullsFirst ...bool) (value.Value, error) {
+	var nullsFirstPtr *bool
+	if len(nullsFirst) > 0 {
+		nullsFirstPtr = &nullsFirst[0]
+	}
 	b, _ := json.Marshal(&FuncOption{
 		Type: OptionOrderBy,
 		Value: &OrderBy{
-			Value: v,
-			IsAsc: isAsc,
+			Value:      v,
+			IsAsc:      isAsc,
+			NullsFirst: nullsFirstPtr,
 		},
 	})
 	return value.StringValue(string(b)), nil

@@ -3045,15 +3045,17 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 		for _, item := range m1(n.node.OrderByItemList()) {
 			columnRef := m1(item.ColumnRef())
 			colName := uniqueColumnName(ctx, m1(columnRef.Column()))
-			if m1(item.IsDescending()) {
-				opts = append(opts, fmt.Sprintf("googlesqlite_order_by(\"%s\", false)", colName))
-			} else {
-				opts = append(opts, fmt.Sprintf("googlesqlite_order_by(\"%s\", true)", colName))
-			}
+			isDesc := m1(item.IsDescending())
+			opts = append(opts, fmt.Sprintf(
+				"googlesqlite_order_by(\"%s\", %t, %t)",
+				colName,
+				!isDesc,
+				orderByNullsFirst(isDesc, m1(item.NullOrder())),
+			))
 		}
 		if len(opts) == 0 {
 			if ordinal := aggregateInputOrdinalFromContext(ctx); ordinal != "" {
-				opts = append(opts, fmt.Sprintf("googlesqlite_order_by(\"%s\", true)", ordinal))
+				opts = append(opts, fmt.Sprintf("googlesqlite_order_by(\"%s\", true, true)", ordinal))
 			}
 		}
 		if m1(n.node.Distinct()) {
@@ -3087,11 +3089,12 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 	for _, item := range m1(n.node.OrderByItemList()) {
 		columnRef := m1(item.ColumnRef())
 		colName := uniqueColumnName(ctx, m1(columnRef.Column()))
-		if m1(item.IsDescending()) {
-			orderByItems = append(orderByItems, fmt.Sprintf("\"%s\" DESC NULLS LAST", colName))
-		} else {
-			orderByItems = append(orderByItems, fmt.Sprintf("\"%s\" NULLS FIRST", colName))
+		isDesc := m1(item.IsDescending())
+		direction := ""
+		if isDesc {
+			direction = " DESC"
 		}
+		orderByItems = append(orderByItems, fmt.Sprintf("\"%s\"%s%s", colName, direction, nullOrderSQL(isDesc, m1(item.NullOrder()))))
 	}
 	if len(orderByItems) == 0 {
 		if ordinal := aggregateInputOrdinalFromContext(ctx); ordinal != "" {
@@ -3207,6 +3210,9 @@ func tryNativeArrayAggStructTopN(ctx context.Context, funcName string, node *goo
 	}
 	orderByItems := m1(node.OrderByItemList())
 	if len(orderByItems) != 1 || m1(node.Limit()) == nil {
+		return "", false, nil
+	}
+	if m1(orderByItems[0].NullOrder()) != googlesql.ResolvedOrderByItemEnums_NullOrderModeOrderUnspecified {
 		return "", false, nil
 	}
 	if mod := m1(node.NullHandlingModifier()); mod == googlesql.ResolvedNonScalarFunctionCallBaseEnums_NullHandlingModifierIgnoreNulls {
@@ -5406,10 +5412,27 @@ func orderExprForColumn(col *googlesql.ResolvedColumn, formattedName string) str
 }
 
 func defaultNullOrderSQL(desc bool) string {
-	if desc {
-		return " NULLS LAST"
+	return nullOrderSQL(desc, googlesql.ResolvedOrderByItemEnums_NullOrderModeOrderUnspecified)
+}
+
+func nullOrderSQL(desc bool, mode googlesql.ResolvedOrderByItemEnums_NullOrderMode) string {
+	if orderByNullsFirst(desc, mode) {
+		return " NULLS FIRST"
 	}
-	return " NULLS FIRST"
+	return " NULLS LAST"
+}
+
+func orderByNullsFirst(desc bool, mode googlesql.ResolvedOrderByItemEnums_NullOrderMode) bool {
+	switch mode {
+	case googlesql.ResolvedOrderByItemEnums_NullOrderModeNullsFirst:
+		return true
+	case googlesql.ResolvedOrderByItemEnums_NullOrderModeNullsLast:
+		return false
+	}
+	if desc {
+		return false
+	}
+	return true
 }
 
 func (n *AggregateScanNode) FormatSQL(ctx context.Context) (string, error) {
