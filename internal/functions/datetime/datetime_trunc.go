@@ -14,15 +14,15 @@ func DATETIME_TRUNC(t time.Time, part string) (value.Value, error) {
 	case "MICROSECOND":
 		return value.DatetimeValue(t), nil
 	case "MILLISECOND":
-		sec := time.Duration(t.Second()) - time.Duration(t.Second())/time.Microsecond
+		nsec := (t.Nanosecond() / int(time.Millisecond)) * int(time.Millisecond)
 		return value.DatetimeValue(time.Date(
 			t.Year(),
 			t.Month(),
 			t.Day(),
 			t.Hour(),
 			t.Minute(),
-			int(sec),
-			0,
+			t.Second(),
+			nsec,
 			t.Location(),
 		)), nil
 	case "SECOND":

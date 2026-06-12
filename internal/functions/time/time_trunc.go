@@ -13,15 +13,15 @@ func TIME_TRUNC(t time.Time, part string) (value.Value, error) {
 	case "MICROSECOND":
 		return value.TimeValue(t), nil
 	case "MILLISECOND":
-		sec := time.Duration(t.Second()) - time.Duration(t.Second())/time.Microsecond
+		nsec := (t.Nanosecond() / int(time.Millisecond)) * int(time.Millisecond)
 		return value.TimeValue(time.Date(
 			t.Year(),
 			t.Month(),
 			t.Day(),
 			t.Hour(),
 			t.Minute(),
-			int(sec),
-			0,
+			t.Second(),
+			nsec,
 			t.Location(),
 		)), nil
 	case "SECOND":

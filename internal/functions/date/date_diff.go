@@ -10,8 +10,8 @@ import (
 )
 
 func DATE_DIFF(a, b time.Time, part string) (value.Value, error) {
-	yearISOA, weekA := a.ISOWeek()
-	yearISOB, weekB := b.ISOWeek()
+	yearISOA, _ := a.ISOWeek()
+	yearISOB, _ := b.ISOWeek()
 
 	if strings.HasPrefix(part, "WEEK") {
 		boundary, ok := helper.WeekPartToOffset[part]
@@ -69,7 +69,9 @@ func DATE_DIFF(a, b time.Time, part string) (value.Value, error) {
 		bDay := time.Date(b.Year(), b.Month(), b.Day(), 0, 0, 0, 0, b.Location())
 		return value.IntValue(int64(aDay.Sub(bDay) / (24 * time.Hour))), nil
 	case "ISOWEEK":
-		return value.IntValue((a.Year()-b.Year())*48 + weekA - weekB), nil
+		aWeek := isoWeekStart(a)
+		bWeek := isoWeekStart(b)
+		return value.IntValue((aWeek.Unix() - bWeek.Unix()) / int64(7*24*time.Hour/time.Second)), nil
 	case "MONTH":
 		return value.IntValue((a.Year()*12 + int(a.Month())) - (b.Year()*12 + int(b.Month()))), nil
 	case "QUARTER":
@@ -85,6 +87,14 @@ func DATE_DIFF(a, b time.Time, part string) (value.Value, error) {
 		return value.IntValue(yearISOA - yearISOB), nil
 	}
 	return nil, fmt.Errorf("unexpected part value %s", part)
+}
+
+func isoWeekStart(t time.Time) time.Time {
+	walk := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
+	for walk.Weekday() != time.Monday {
+		walk = walk.AddDate(0, 0, -1)
+	}
+	return walk
 }
 
 var BindDateDiff = helper.Scalar3(func(a, b, c value.Value) (value.Value, error) {

@@ -35,7 +35,11 @@ func DATE_ADD(t time.Time, v int64, part string) (value.Value, error) {
 		}
 		return value.DateValue(helper.AddYear(t, n)), nil
 	case "QUARTER":
-		return value.DateValue(helper.AddMonth(t, 3)), nil
+		n, err := helper.SafeInt(v)
+		if err != nil {
+			return nil, err
+		}
+		return value.DateValue(helper.AddMonth(t, 3*n)), nil
 	}
 	return nil, fmt.Errorf("unexpected part value %s", part)
 }
