@@ -8,7 +8,7 @@ import (
 	"github.com/goccy/googlesqlite/internal/value"
 )
 
-// This file backs the BigQuery / ZetaSQL differential-privacy
+// This file backs the BigQuery / GoogleSQL differential-privacy
 // aggregates on both engine backends. The analyzer's
 // RewriteAnonymization stage lowers a SELECT WITH ANONYMIZATION /
 // WITH DIFFERENTIAL_PRIVACY query into a two-level plan: an inner
@@ -98,7 +98,7 @@ type dpArgs struct {
 
 // clamp restricts x to [lo, hi] when bounds were supplied; otherwise it
 // returns x unchanged (an absent CLAMP / contribution_bounds means no
-// clamping, matching ZetaSQL where the bound is then implicit).
+// clamping, matching GoogleSQL where the bound is then implicit).
 func (a dpArgs) clamp(x float64) float64 {
 	if !a.hasBounds {
 		return x

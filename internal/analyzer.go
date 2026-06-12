@@ -2222,7 +2222,7 @@ func reshapeArgToType(v any, t googlesql.Googlesql_TypeNode) any {
 }
 
 // reshapeArgToTypeWithKind is reshapeArgToType with the column type's
-// Kind pre-resolved. Type.Kind() is a wasm round-trip into the ZetaSQL
+// Kind pre-resolved. Type.Kind() is a wasm round-trip into the GoogleSQL
 // analyzer module; DMLStmt caches the per-column kinds at prepare time
 // so the per-exec reshape pass costs no analyzer calls for the common
 // scalar columns (which are not reshape candidates at all).

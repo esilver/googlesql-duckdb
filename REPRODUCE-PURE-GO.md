@@ -3,7 +3,7 @@
 This branch can execute GoogleSQL/BigQuery queries with **`CGO_ENABLED=0`** by
 swapping the native-`libduckdb` backend (`github.com/duckdb/duckdb-go/v2`) for a
 **pure-Go DuckDB v1.5.3** transpiled by [`ncruces/wasm2go`](https://github.com/ncruces/wasm2go).
-The BigQuery dialect (ZetaSQL analysis + the `googlesqlite_*` UDFs) is unchanged —
+The BigQuery dialect (GoogleSQL analysis + the `googlesqlite_*` UDFs) is unchanged —
 only the DuckDB *execution backend* changes. `CGO_ENABLED=1` still builds the
 original native path, untouched.
 

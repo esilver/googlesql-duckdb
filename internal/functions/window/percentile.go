@@ -116,7 +116,7 @@ func (a *percentileContWindow) Done() (any, error) {
 	hi := int(math.Ceil(pos))
 	// Under RESPECT NULLS activeSorted places NULLs (nil values) at the
 	// front: BigQuery treats NULL as the minimum value. The reference
-	// semantics (ZetaSQL percentile evaluator; BigQuery doc example
+	// semantics (GoogleSQL percentile evaluator; BigQuery doc example
 	// PERCENTILE_CONT over [0, 3, NULL, 1, 2]) are:
 	//   - the position falls on / between NULLs -> NULL
 	//     (p=0 over the example yields NULL);

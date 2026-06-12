@@ -9,14 +9,14 @@ SQL fidelity than a SQLite-based emulator gives.
 It is a fork of **[goccy/googlesqlite](https://github.com/goccy/googlesqlite)**, the
 GoogleSQL engine behind
 [goccy/bigquery-emulator](https://github.com/goccy/bigquery-emulator). Upstream, that
-engine parses + analyzes BigQuery's GoogleSQL with ZetaSQL and then executes against
+engine parses + analyzes BigQuery's GoogleSQL and then executes against
 a **SQLite** backend - but SQLite's semantics diverge from BigQuery in many places
 (types, functions, NULL handling), which caps how much real BigQuery SQL it can run
 faithfully.
 
 **What we changed:** retarget the backend from SQLite to **DuckDB**, whose SQL
 semantics are much closer to BigQuery (and which is fast - vectorized, native). The
-ZetaSQL parse/analyze stays; the engine's *formatter* lowers the analyzed query to
+GoogleSQL parse/analyze stays; the engine's *formatter* lowers the analyzed query to
 **DuckDB** SQL instead of SQLite, and BigQuery's builtin functions are registered as
 **DuckDB UDFs**.
 
@@ -24,7 +24,7 @@ ZetaSQL parse/analyze stays; the engine's *formatter* lowers the analyzed query 
 
 ```
 BigQuery GoogleSQL
-  -> ZetaSQL parse + analyze            (go-googlesql; unchanged from upstream)
+  -> GoogleSQL parse + analyze         (go-googlesql; unchanged from upstream)
   -> resolved AST
   -> formatter lowers the AST to DuckDB SQL          (this fork's core work)
   -> BigQuery builtins registered as DuckDB UDFs     (scalar / aggregate / table, cgo)
@@ -147,6 +147,6 @@ step 3-4 is the simplest proof the engine works end to end.)
   verified path here.
 - **Conformance is commit-pinned:** the authoritative number for this commit is
   **972/994**. Re-measure after any change.
-- **Architecture/history:** the engine lowers ZetaSQL-analyzed AST to DuckDB SQL + registers BigQuery
+- **Architecture/history:** the engine lowers GoogleSQL-analyzed AST to DuckDB SQL + registers BigQuery
   builtins as DuckDB scalar / aggregate (via the C `duckdb_create_aggregate_function`
   binding) / table UDFs.

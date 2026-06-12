@@ -553,7 +553,7 @@ func CastValue(t googlesql.Googlesql_TypeNode, v value.Value) (value.Value, erro
 }
 
 // castValueWithKind is CastValue with the type's Kind already resolved.
-// Type.Kind() is a wasm round-trip into the ZetaSQL analyzer module, so
+// Type.Kind() is a wasm round-trip into the GoogleSQL analyzer module, so
 // per-exec hot paths (prepared-statement arg encoding) resolve the kind
 // once at prepare time and call this variant; CastValue keeps the
 // resolve-on-every-call behavior for the remaining callers.

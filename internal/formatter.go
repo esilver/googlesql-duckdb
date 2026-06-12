@@ -6689,7 +6689,7 @@ func (n *AnalyticScanNode) FormatSQL(ctx context.Context) (string, error) {
 	}
 	// Trailing output ORDER BY: the legacy SQLite engine evaluated window
 	// functions by sorting rows on (partition keys, order keys) and emitted
-	// them in that order, and the test corpus (zetasqlite heritage) asserts
+	// them in that order, and the legacy test corpus asserts
 	// that order. DuckDB's window operator gives no output-order guarantee,
 	// so reproduce it explicitly: sort by the last function group's
 	// partition + order keys (value-layer aware via sortSQL, BigQuery null
