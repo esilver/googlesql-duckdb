@@ -45,13 +45,12 @@ jobs:
           # GoReleaser derives the changelog from the commit history.
           fetch-depth: 0
 
-      # GoReleaser cross-compiles the CLI here; the latest stable Go
-      # builds the published binaries and also satisfies tools/go.mod,
-      # which `go tool` resolves GoReleaser against.
+      # GoReleaser cross-compiles the CLI here; tools/go.mod pins the
+      # Go toolchain used to resolve and run GoReleaser.
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: stable
+          go-version-file: tools/go.mod
 
       - name: Download the Playground engine
         uses: actions/download-artifact@v4

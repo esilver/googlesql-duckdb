@@ -1,6 +1,6 @@
 module github.com/goccy/googlesqlite
 
-go 1.25.6
+go 1.26.2
 
 require (
 	cloud.google.com/go/bigquery v1.76.0

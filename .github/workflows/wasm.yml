@@ -27,11 +27,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # The engine is built with the latest stable Go.
+      # The engine is built with the module-pinned Go toolchain.
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: stable
+          go-version-file: go.mod
           cache-dependency-path: go.sum
 
       - name: Build the js/wasm engine
