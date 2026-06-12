@@ -2562,6 +2562,175 @@ func TestArrayAggOrderByLimit(t *testing.T) {
 	}
 }
 
+func TestArrayAggOrderByLimitSplitKeepsFullInputAggregates(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:?_test=array_agg_order_by_limit_split")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	var total int64
+	var top string
+	if err := db.QueryRowContext(ctx, `
+SELECT
+  SUM(score) AS total_score,
+  FORMAT("%T", ARRAY_AGG(STRUCT(id AS id, score AS score) ORDER BY score DESC LIMIT 2)) AS top_two
+FROM UNNEST([
+  STRUCT(1 AS id, 10 AS score),
+  STRUCT(2 AS id, 30 AS score),
+  STRUCT(3 AS id, 20 AS score)
+])`).Scan(&total, &top); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if total != 60 {
+		t.Fatalf("SUM(score) = %d; want full-input total 60", total)
+	}
+	if !strings.Contains(top, "30") || !strings.Contains(top, "20") || strings.Contains(top, "10") {
+		t.Fatalf("top-two ARRAY_AGG = %q; want scores 30 and 20 only", top)
+	}
+}
+
+func TestArrayAggOrderByLimitScalarMultipleKeys(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:?_test=array_agg_order_by_limit_scalar_multi_key")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	var got string
+	if err := db.QueryRowContext(ctx, `
+SELECT FORMAT("%T", ARRAY_AGG(id ORDER BY score DESC, id ASC LIMIT 3))
+FROM UNNEST([
+  STRUCT(3 AS id, 20 AS score),
+  STRUCT(1 AS id, 30 AS score),
+  STRUCT(2 AS id, 30 AS score),
+  STRUCT(4 AS id, 10 AS score)
+])`).Scan(&got); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if !strings.Contains(got, "1") || !strings.Contains(got, "2") || !strings.Contains(got, "3") || strings.Contains(got, "4") {
+		t.Fatalf("ARRAY_AGG scalar multi-key top-N = %q; want [1, 2, 3]", got)
+	}
+}
+
+func TestArrayAggOrderByLimitSplitWithGroupBy(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:?_test=array_agg_order_by_limit_split_group_by")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	rows, err := db.QueryContext(ctx, `
+SELECT
+  grp,
+  SUM(score) AS total_score,
+  FORMAT("%T", ARRAY_AGG(STRUCT(id AS id, score AS score) ORDER BY score DESC LIMIT 2)) AS top_two
+FROM UNNEST([
+  STRUCT("a" AS grp, 1 AS id, 10 AS score),
+  STRUCT("a" AS grp, 2 AS id, 30 AS score),
+  STRUCT("a" AS grp, 3 AS id, 20 AS score),
+  STRUCT("b" AS grp, 4 AS id, 7 AS score),
+  STRUCT("b" AS grp, 5 AS id, 9 AS score)
+])
+GROUP BY grp
+ORDER BY grp`)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	defer rows.Close()
+
+	var got []struct {
+		grp   string
+		total int64
+		top   string
+	}
+	for rows.Next() {
+		var row struct {
+			grp   string
+			total int64
+			top   string
+		}
+		if err := rows.Scan(&row.grp, &row.total, &row.top); err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		got = append(got, row)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d groups; want 2: %#v", len(got), got)
+	}
+	if got[0].grp != "a" || got[0].total != 60 || !strings.Contains(got[0].top, "30") || !strings.Contains(got[0].top, "20") || strings.Contains(got[0].top, "10") {
+		t.Fatalf("group a = %#v; want total 60 and top scores 30,20", got[0])
+	}
+	if got[1].grp != "b" || got[1].total != 16 || !strings.Contains(got[1].top, "9") || !strings.Contains(got[1].top, "7") {
+		t.Fatalf("group b = %#v; want total 16 and top scores 9,7", got[1])
+	}
+}
+
+func TestArrayAggOrderByLimitZeroReturnsNull(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:?_test=array_agg_order_by_limit_zero")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	var got sql.NullString
+	if err := db.QueryRowContext(ctx, `
+SELECT FORMAT("%T", ARRAY_AGG(id ORDER BY score DESC LIMIT 0))
+FROM UNNEST([
+  STRUCT(1 AS id, 10 AS score),
+  STRUCT(2 AS id, 30 AS score)
+])`).Scan(&got); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if got.Valid {
+		t.Fatalf("ARRAY_AGG LIMIT 0 = %q; want NULL", got.String)
+	}
+}
+
+func TestArrayAggOrderByLimitNullElementHandling(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:?_test=array_agg_order_by_limit_null_element")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	var got string
+	if err := db.QueryRowContext(ctx, `
+SELECT FORMAT("%T", ARRAY_AGG(id ORDER BY score DESC LIMIT 1))
+FROM UNNEST([
+  STRUCT(CAST(NULL AS INT64) AS id, 10 AS score),
+  STRUCT(2 AS id, 30 AS score)
+])`).Scan(&got); err != nil {
+		t.Fatalf("NULL outside top-N should not error: %v", err)
+	}
+	if !strings.Contains(got, "2") {
+		t.Fatalf("ARRAY_AGG with NULL outside top-N = %q; want [2]", got)
+	}
+
+	err = db.QueryRowContext(ctx, `
+SELECT FORMAT("%T", ARRAY_AGG(id ORDER BY score DESC LIMIT 1))
+FROM UNNEST([
+  STRUCT(CAST(NULL AS INT64) AS id, 30 AS score),
+  STRUCT(2 AS id, 10 AS score)
+])`).Scan(&got)
+	if err == nil || !strings.Contains(err.Error(), "ARRAY_AGG") {
+		t.Fatalf("NULL selected into top-N error = %v; want ARRAY_AGG error", err)
+	}
+}
+
 // ---- from tests/parity/query_test.go ----
 
 func TestQuery(t *testing.T) {
@@ -3216,6 +3385,18 @@ FROM Items`,
 			query: `SELECT ARRAY_AGG(x LIMIT 5) AS array_agg FROM UNNEST([2, 1, -2, 3, -2, 1, 2]) AS x`,
 			expectedRows: [][]any{{
 				[]any{int64(2), int64(1), int64(-2), int64(3), int64(-2)},
+			}},
+		},
+		{
+			name: "array_agg struct order by limit",
+			query: `
+SELECT ARRAY_AGG(STRUCT(x AS id, y AS score) ORDER BY y DESC LIMIT 2)
+FROM UNNEST([STRUCT(1 AS x, 10 AS y), STRUCT(2, 30), STRUCT(3, 20), STRUCT(4, 40)])`,
+			expectedRows: [][]any{{
+				[]any{
+					[]any{int64(4), int64(40)},
+					[]any{int64(2), int64(30)},
+				},
 			}},
 		},
 		{

@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"runtime/debug"
 	"strings"
@@ -120,11 +121,18 @@ func init() {
 // duckdbDSN translates a googlesqlite-style DSN into one DuckDB accepts.
 // SQLite URI forms (file::memory:?cache=shared, :memory:?<opts>) and the
 // engine's per-open `_googlesqlite_id` freshness suffix are SQLite-only;
-// DuckDB rejects unknown options, so any in-memory variant collapses to
-// DuckDB's bare in-memory database (""). A plain on-disk path is passed
-// through after stripping the leading "file:" scheme and any query string.
+// DuckDB rejects unknown options, so any in-memory variant collapses to a
+// DuckDB in-memory DSN. A plain on-disk path is passed through after stripping
+// the leading "file:" scheme and SQLite-only query params. DuckDB-native
+// allowlisted params are preserved.
 func duckdbDSN(name string) string {
-	path, _ := dsnParts(name)
+	path, query := dsnParts(name)
+	if query == "" {
+		if i := strings.IndexByte(path, '?'); i >= 0 {
+			query = path[i+1:]
+		}
+	}
+	duckParams := duckDBQueryParams(query)
 	// Any in-memory variant -> DuckDB in-memory. The ncruces "memdb"
 	// VFS (the CLI's default DSN, file:/NAME?vfs=memdb) is a
 	// process-shared in-memory database keyed by its path; mapping it
@@ -136,10 +144,13 @@ func duckdbDSN(name string) string {
 		strings.HasPrefix(name, "file::memory:") ||
 		strings.Contains(name, "mode=memory") ||
 		strings.Contains(name, "vfs=memdb") {
+		if duckParams != "" {
+			return ":memory:?" + duckParams
+		}
 		return ""
 	}
-	// On-disk: strip the file: scheme DuckDB does not parse, and drop the
-	// SQLite query string (cache=shared etc).
+	// On-disk: strip the file: scheme DuckDB does not parse, and drop
+	// SQLite-only query params (cache=shared etc).
 	path = strings.TrimPrefix(path, "file:")
 	if i := strings.IndexByte(path, '?'); i >= 0 {
 		path = path[:i]
@@ -149,7 +160,26 @@ func duckdbDSN(name string) string {
 			_ = os.Remove(path)
 		}
 	}
+	if duckParams != "" {
+		return path + "?" + duckParams
+	}
 	return path
+}
+
+func duckDBQueryParams(query string) string {
+	values, err := url.ParseQuery(query)
+	if err != nil {
+		return ""
+	}
+	out := url.Values{}
+	for _, key := range []string{"max_memory", "memory_limit"} {
+		for _, value := range values[key] {
+			if value != "" {
+				out.Add(key, value)
+			}
+		}
+	}
+	return out.Encode()
 }
 
 // internalDuckDBDriver runs formatter-emitted SQL on duckdb-go. The

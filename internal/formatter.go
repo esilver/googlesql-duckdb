@@ -2975,6 +2975,9 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 	if funcName == "min_by" && len(args) == 2 {
 		return fmt.Sprintf("arg_min(%s,%s)", args[0], args[1]), nil
 	}
+	if sql, ok, err := tryNativeArrayAggStructTopN(ctx, funcName, n.node, args); ok || err != nil {
+		return sql, err
+	}
 	// DuckDB retarget: numeric / statistical / bitwise / logical
 	// aggregates resolve to their bare catalog name here (the SQLite
 	// aggregateFuncMap is never populated on this target), but DuckDB's
@@ -3153,6 +3156,49 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 var nativeAggregateFuncMap = map[string]string{
 	"logical_and": "bool_and",
 	"logical_or":  "bool_or",
+}
+
+func tryNativeArrayAggStructTopN(ctx context.Context, funcName string, node *googlesql.ResolvedAggregateFunctionCall, args []string) (string, bool, error) {
+	if node == nil || (funcName != "array_agg" && funcName != "googlesqlite_array_agg") {
+		return "", false, nil
+	}
+	if len(args) != 1 || m1(node.Distinct()) {
+		return "", false, nil
+	}
+	callArgs := m1(node.ResolvedFunctionCallBase.ArgumentList())
+	if len(callArgs) != 1 {
+		return "", false, nil
+	}
+	if _, ok := callArgs[0].(*googlesql.ResolvedMakeStruct); !ok {
+		return "", false, nil
+	}
+	orderByItems := m1(node.OrderByItemList())
+	if len(orderByItems) != 1 || m1(node.Limit()) == nil {
+		return "", false, nil
+	}
+	if mod := m1(node.NullHandlingModifier()); mod == googlesql.ResolvedNonScalarFunctionCallBaseEnums_NullHandlingModifierIgnoreNulls {
+		return "", false, nil
+	}
+	columnRef := m1(orderByItems[0].ColumnRef())
+	if columnRef == nil {
+		return "", false, nil
+	}
+	limitValue, err := newNode(m1(node.Limit())).FormatSQL(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	colName := uniqueColumnName(ctx, m1(columnRef.Column()))
+	topNFunc := "arg_min"
+	if m1(orderByItems[0].IsDescending()) {
+		topNFunc = "arg_max"
+	}
+	return fmt.Sprintf(
+		"googlesqlite_array_from_native(%s(%s,\"%s\",%s))",
+		topNFunc,
+		args[0],
+		colName,
+		limitValue,
+	), true, nil
 }
 
 // nativeWindowFuncMap maps GoogleSQL window function names that have a
@@ -5294,8 +5340,14 @@ func (n *AggregateScanNode) FormatSQL(ctx context.Context) (string, error) {
 	}
 	groupByColumns := []string{}
 	groupByOrderColumns := []string{}
+	groupByInputColumns := []string{}
 	groupByColumnMap := map[string]struct{}{}
 	for _, col := range m1(n.node.GroupByList()) {
+		if expr, err := col.Expr(); err == nil && expr != nil {
+			if sql, err := newNode(expr).FormatSQL(ctx); err == nil && sql != "" {
+				groupByInputColumns = append(groupByInputColumns, sql)
+			}
+		}
 		if _, err := newNode(col).FormatSQL(ctx); err != nil {
 			return "", err
 		}
@@ -5305,6 +5357,9 @@ func (n *AggregateScanNode) FormatSQL(ctx context.Context) (string, error) {
 		groupByColumns = append(groupByColumns, formattedCol)
 		groupByOrderColumns = append(groupByOrderColumns, orderExprForColumn(resolvedCol, formattedCol)+defaultNullOrderSQL(false))
 		groupByColumnMap[colName] = struct{}{}
+	}
+	if len(groupByInputColumns) != len(groupByColumns) {
+		groupByInputColumns = append([]string{}, groupByColumns...)
 	}
 	columns := []string{}
 	columnMap := columnRefMap(ctx)
@@ -5410,6 +5465,9 @@ func (n *AggregateScanNode) FormatSQL(ctx context.Context) (string, error) {
 			strings.Join(groupByOrderColumns, ","),
 		), nil
 	}
+	if sql, ok, err := tryFormatAggregateScanArrayAggTopN(ctx, n.node, input, columns, columnNames, groupByColumns, groupByInputColumns); ok || err != nil {
+		return sql, err
+	}
 	var groupBy string
 	if len(groupByColumns) > 0 {
 		// DuckDB retarget (PATH B): the predecessor wrapped each GROUP BY
@@ -5442,6 +5500,585 @@ func (n *AggregateScanNode) FormatSQL(ctx context.Context) (string, error) {
 		return fmt.Sprintf("SELECT %s FROM %s %s%s", formattedColumns, input, groupBy, orderBy), nil
 	}
 	return "", fmt.Errorf("unexpected input pattern: %s", input)
+}
+
+type arrayAggTopNPlan struct {
+	outputName   string
+	valueSQL     string
+	nullCheckSQL string
+	orderBy      []string
+	limitSQL     string
+}
+
+type arrayAggTopNRewritePlan struct {
+	helperColumn  string
+	elementColumn string
+	limitSQL      string
+	orderBy       []arrayAggTopNRewriteOrder
+	valueExpr     googlesql.ResolvedExprNode
+	fieldByColumn map[string]int
+}
+
+type arrayAggTopNRewriteOrder struct {
+	fieldIndex int
+	descending bool
+	nullOrder  googlesql.ResolvedOrderByItemEnums_NullOrderMode
+}
+
+type arrayAggRewriterScanInfo struct {
+	helperColumn  string
+	elementColumn string
+	fieldByColumn map[string]int
+}
+
+func tryFormatAggregateScanArrayAggTopN(ctx context.Context, scan *googlesql.ResolvedAggregateScan, input string, columns, columnNames, groupByColumns, groupByInputColumns []string) (string, bool, error) {
+	plans, err := arrayAggTopNPlans(ctx, scan)
+	if err != nil || len(plans) == 0 {
+		return "", len(plans) != 0, err
+	}
+	planByOutput := map[string]*arrayAggTopNPlan{}
+	for i := range plans {
+		planByOutput[plans[i].outputName] = &plans[i]
+	}
+
+	var baseColumns []string
+	for idx, colName := range columnNames {
+		if _, isTopN := planByOutput[colName]; isTopN {
+			continue
+		}
+		baseColumns = append(baseColumns, columns[idx])
+	}
+	if len(baseColumns) == 0 {
+		baseColumns = append(baseColumns, "1 AS \"__gsx_base_row\"")
+	}
+
+	inputSQL, err := aggregateScanInputSelect(input)
+	if err != nil {
+		return "", false, err
+	}
+	inputName := "__gsx_agg_input"
+	baseName := "__gsx_agg_base"
+	baseSQL := aggregateScanBaseSQL(inputName, baseColumns, groupByColumns)
+
+	joinSQL := ""
+	for idx, plan := range plans {
+		topName := fmt.Sprintf("__gsx_agg_topn_%d", idx)
+		topSQL := aggregateScanTopNSQL(inputName, plan, groupByColumns, groupByInputColumns)
+		if len(groupByColumns) == 0 {
+			joinSQL += fmt.Sprintf(" CROSS JOIN (%s) AS %s", topSQL, topName)
+			continue
+		}
+		var predicates []string
+		for _, groupCol := range groupByColumns {
+			predicates = append(predicates, fmt.Sprintf("%s.%s IS NOT DISTINCT FROM %s.%s", baseName, groupCol, topName, groupCol))
+		}
+		joinSQL += fmt.Sprintf(" LEFT JOIN (%s) AS %s ON %s", topSQL, topName, strings.Join(predicates, " AND "))
+	}
+
+	var finalColumns []string
+	for _, colName := range columnNames {
+		if plan, isTopN := planByOutput[colName]; isTopN {
+			topIdx := 0
+			for i := range plans {
+				if plans[i].outputName == plan.outputName {
+					topIdx = i
+					break
+				}
+			}
+			finalColumns = append(finalColumns, fmt.Sprintf("__gsx_agg_topn_%d.\"%s\" AS \"%s\"", topIdx, colName, colName))
+			continue
+		}
+		finalColumns = append(finalColumns, fmt.Sprintf("%s.\"%s\" AS \"%s\"", baseName, colName, colName))
+	}
+
+	return fmt.Sprintf(
+		"WITH %s AS (%s) SELECT %s FROM (%s) AS %s%s",
+		inputName,
+		inputSQL,
+		strings.Join(finalColumns, ","),
+		baseSQL,
+		baseName,
+		joinSQL,
+	), true, nil
+}
+
+func aggregateScanInputSelect(input string) (string, error) {
+	if strings.TrimSpace(input) == "" {
+		return "SELECT 1 AS \"__gsx_single_row\"", nil
+	}
+	formattedInput, err := formatInput(input)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("SELECT * %s", formattedInput), nil
+}
+
+func aggregateScanBaseSQL(inputName string, baseColumns, groupByColumns []string) string {
+	var groupBy string
+	if len(groupByColumns) > 0 {
+		groupBy = fmt.Sprintf(" GROUP BY %s", strings.Join(groupByColumns, ","))
+	} else if len(baseColumns) == 1 && baseColumns[0] == "1 AS \"__gsx_base_row\"" {
+		return "SELECT 1 AS \"__gsx_base_row\""
+	}
+	return fmt.Sprintf("SELECT %s FROM %s%s", strings.Join(baseColumns, ","), inputName, groupBy)
+}
+
+func aggregateScanTopNSQL(inputName string, plan arrayAggTopNPlan, groupByColumns, groupByInputColumns []string) string {
+	if len(groupByInputColumns) != len(groupByColumns) {
+		groupByInputColumns = groupByColumns
+	}
+	var partitionBy string
+	if len(groupByInputColumns) > 0 {
+		partitionBy = fmt.Sprintf("PARTITION BY %s ", strings.Join(groupByInputColumns, ","))
+	}
+	ranked := fmt.Sprintf(
+		"SELECT *, ROW_NUMBER() OVER (%sORDER BY %s) AS \"__gsx_topn_rank\" FROM %s",
+		partitionBy,
+		strings.Join(plan.orderBy, ","),
+		inputName,
+	)
+	var groupCols string
+	var groupBy string
+	if len(groupByColumns) > 0 {
+		var projectedGroupCols []string
+		for i, col := range groupByColumns {
+			projectedGroupCols = append(projectedGroupCols, fmt.Sprintf("%s AS %s", groupByInputColumns[i], col))
+		}
+		groupCols = strings.Join(projectedGroupCols, ",") + ","
+		groupBy = " GROUP BY " + strings.Join(groupByInputColumns, ",")
+	}
+	selected := fmt.Sprintf("\"__gsx_topn_rank\" <= %s", plan.limitSQL)
+	arrayExpr := fmt.Sprintf(
+		"array_agg(%s ORDER BY \"__gsx_topn_rank\") FILTER (WHERE %s)",
+		plan.valueSQL,
+		selected,
+	)
+	nullCheckSQL := plan.nullCheckSQL
+	if strings.TrimSpace(nullCheckSQL) == "" {
+		nullCheckSQL = plan.valueSQL
+	}
+	return fmt.Sprintf(
+		"SELECT %sCASE WHEN count(*) = 0 THEN NULL WHEN count(*) FILTER (WHERE %s AND (%s) IS NULL) > 0 THEN error('ARRAY_AGG: input value must be not null') ELSE googlesqlite_array_from_native(COALESCE(%s, [])) END AS \"%s\" FROM (%s)%s",
+		groupCols,
+		selected,
+		nullCheckSQL,
+		arrayExpr,
+		plan.outputName,
+		ranked,
+		groupBy,
+	)
+}
+
+func arrayAggTopNPlans(ctx context.Context, scan *googlesql.ResolvedAggregateScan) ([]arrayAggTopNPlan, error) {
+	var plans []arrayAggTopNPlan
+	rewritePlans := arrayAggTopNRewriteFromContext(ctx)
+	for _, agg := range m1(scan.AggregateList()) {
+		if rewritePlans != nil {
+			plan, ok, err := arrayAggTopNPlanFromRewrite(ctx, agg, rewritePlans)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				plans = append(plans, plan)
+				continue
+			}
+		}
+		plan, ok, err := arrayAggTopNPlanFromComputedColumn(ctx, agg)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			plans = append(plans, plan)
+		}
+	}
+	return plans, nil
+}
+
+func arrayAggTopNPlanFromRewrite(ctx context.Context, agg googlesql.ResolvedComputedColumnBaseNode, rewritePlans map[string]arrayAggTopNRewritePlan) (arrayAggTopNPlan, bool, error) {
+	computed, ok := agg.(resolvedComputedColumnLike)
+	if !ok {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	col, err := computed.Column()
+	if err != nil || col == nil {
+		return arrayAggTopNPlan{}, false, err
+	}
+	outputName := uniqueColumnName(ctx, col)
+	rewritePlan, ok := rewritePlans[outputName]
+	if !ok {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	expr, err := computed.Expr()
+	if err != nil || expr == nil {
+		return arrayAggTopNPlan{}, false, err
+	}
+	call, ok := expr.(*googlesql.ResolvedAggregateFunctionCall)
+	if !ok {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	funcName, args, err := getFuncNameAndArgs(ctx, call.ResolvedFunctionCallBase, false)
+	if err != nil {
+		return arrayAggTopNPlan{}, false, err
+	}
+	if funcName != "array_agg" && funcName != "googlesqlite_array_agg" {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	if len(args) != 1 || m1(call.Distinct()) {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	callArgs := m1(call.ResolvedFunctionCallBase.ArgumentList())
+	if len(callArgs) != 1 {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	makeStruct, ok := callArgs[0].(*googlesql.ResolvedMakeStruct)
+	if !ok {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	fields := m1(makeStruct.FieldList())
+	nullCheckSQL := args[0]
+	if rewritePlan.valueExpr != nil {
+		if _, isStructValue := rewritePlan.valueExpr.(*googlesql.ResolvedMakeStruct); !isStructValue {
+			columnMap := map[string]string{}
+			for colName, fieldIndex := range rewritePlan.fieldByColumn {
+				if fieldIndex < 0 || fieldIndex >= len(fields) {
+					continue
+				}
+				fieldSQL, err := newNode(fields[fieldIndex]).FormatSQL(ctx)
+				if err != nil {
+					return arrayAggTopNPlan{}, false, err
+				}
+				columnMap[colName] = fieldSQL
+			}
+			if rewritePlan.elementColumn != "" {
+				columnMap[rewritePlan.elementColumn] = args[0]
+			}
+			if len(columnMap) > 0 {
+				valueCtx := withColumnRefMap(ctx, columnMap)
+				valueSQL, err := newNode(rewritePlan.valueExpr).FormatSQL(valueCtx)
+				if err != nil {
+					return arrayAggTopNPlan{}, false, err
+				}
+				if strings.TrimSpace(valueSQL) != "" {
+					nullCheckSQL = valueSQL
+				}
+			}
+		}
+	}
+	var orderBy []string
+	for _, item := range rewritePlan.orderBy {
+		if item.fieldIndex < 0 || item.fieldIndex >= len(fields) {
+			return arrayAggTopNPlan{}, false, nil
+		}
+		fieldSQL, err := newNode(fields[item.fieldIndex]).FormatSQL(ctx)
+		if err != nil {
+			return arrayAggTopNPlan{}, false, err
+		}
+		orderBy = append(orderBy, aggregateTopNOrderByExpr(fieldSQL, item.descending, item.nullOrder)...)
+	}
+	if len(orderBy) == 0 {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	return arrayAggTopNPlan{
+		outputName:   outputName,
+		valueSQL:     args[0],
+		nullCheckSQL: nullCheckSQL,
+		orderBy:      orderBy,
+		limitSQL:     rewritePlan.limitSQL,
+	}, true, nil
+}
+
+type resolvedComputedColumnLike interface {
+	Column() (*googlesql.ResolvedColumn, error)
+	Expr() (googlesql.ResolvedExprNode, error)
+}
+
+func arrayAggTopNPlanFromComputedColumn(ctx context.Context, agg googlesql.ResolvedComputedColumnBaseNode) (arrayAggTopNPlan, bool, error) {
+	computed, ok := agg.(resolvedComputedColumnLike)
+	if !ok {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	expr, err := computed.Expr()
+	if err != nil || expr == nil {
+		return arrayAggTopNPlan{}, false, err
+	}
+	call, ok := expr.(*googlesql.ResolvedAggregateFunctionCall)
+	if !ok {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	funcName, args, err := getFuncNameAndArgs(ctx, call.ResolvedFunctionCallBase, false)
+	if err != nil {
+		return arrayAggTopNPlan{}, false, err
+	}
+	if funcName != "array_agg" && funcName != "googlesqlite_array_agg" {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	if len(args) != 1 || m1(call.Limit()) == nil || len(m1(call.OrderByItemList())) == 0 {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	if m1(call.Distinct()) {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	if mod := m1(call.NullHandlingModifier()); mod == googlesql.ResolvedNonScalarFunctionCallBaseEnums_NullHandlingModifierIgnoreNulls {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	limitSQL, err := newNode(m1(call.Limit())).FormatSQL(ctx)
+	if err != nil {
+		return arrayAggTopNPlan{}, false, err
+	}
+	var orderBy []string
+	for _, item := range m1(call.OrderByItemList()) {
+		orderBy = append(orderBy, aggregateTopNOrderByItem(ctx, item)...)
+	}
+	if len(orderBy) == 0 {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	col, err := computed.Column()
+	if err != nil || col == nil {
+		return arrayAggTopNPlan{}, false, err
+	}
+	return arrayAggTopNPlan{
+		outputName:   uniqueColumnName(ctx, col),
+		valueSQL:     args[0],
+		nullCheckSQL: args[0],
+		orderBy:      orderBy,
+		limitSQL:     limitSQL,
+	}, true, nil
+}
+
+func aggregateTopNOrderByItem(ctx context.Context, item *googlesql.ResolvedOrderByItem) []string {
+	columnRef := m1(item.ColumnRef())
+	if columnRef == nil {
+		return nil
+	}
+	colName := uniqueColumnName(ctx, m1(columnRef.Column()))
+	return aggregateTopNOrderByExpr(fmt.Sprintf("\"%s\"", colName), m1(item.IsDescending()), m1(item.NullOrder()))
+}
+
+func aggregateTopNOrderByExpr(expr string, descending bool, nullOrder googlesql.ResolvedOrderByItemEnums_NullOrderMode) []string {
+	var orderBy []string
+	switch nullOrder {
+	case googlesql.ResolvedOrderByItemEnums_NullOrderModeNullsFirst:
+		orderBy = append(orderBy, fmt.Sprintf("(%s IS NOT NULL)", expr))
+	case googlesql.ResolvedOrderByItemEnums_NullOrderModeNullsLast:
+		orderBy = append(orderBy, fmt.Sprintf("(%s IS NULL)", expr))
+	}
+	if descending {
+		orderBy = append(orderBy, fmt.Sprintf("%s DESC", expr))
+	} else {
+		orderBy = append(orderBy, expr)
+	}
+	return orderBy
+}
+
+func arrayAggTopNRewritePlansFromProject(ctx context.Context, project *googlesql.ResolvedProjectScan) (map[string]arrayAggTopNRewritePlan, error) {
+	plans := map[string]arrayAggTopNRewritePlan{}
+	for _, col := range m1(project.ExprList()) {
+		expr, err := col.Expr()
+		if err != nil || expr == nil {
+			return nil, err
+		}
+		plan, ok, err := arrayAggTopNRewritePlanFromExpr(ctx, expr)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			plans[plan.helperColumn] = plan
+		}
+	}
+	if len(plans) == 0 {
+		return nil, nil
+	}
+	return plans, nil
+}
+
+func arrayAggTopNRewritePlanFromExpr(ctx context.Context, expr googlesql.ResolvedExprNode) (arrayAggTopNRewritePlan, bool, error) {
+	subquery, ok, err := findArraySubqueryExpr(expr)
+	if err != nil || !ok {
+		return arrayAggTopNRewritePlan{}, false, err
+	}
+	return arrayAggTopNRewritePlanFromArraySubquery(ctx, subquery)
+}
+
+func findArraySubqueryExpr(node googlesql.ResolvedNode) (*googlesql.ResolvedSubqueryExpr, bool, error) {
+	if node == nil {
+		return nil, false, nil
+	}
+	if subquery, ok := node.(*googlesql.ResolvedSubqueryExpr); ok {
+		if m1(subquery.SubqueryType()) == googlesql.ResolvedSubqueryExprEnums_SubqueryTypeArray {
+			return subquery, true, nil
+		}
+	}
+	children, err := node.GetChildNodes()
+	if err != nil {
+		return nil, false, err
+	}
+	for _, child := range children {
+		subquery, ok, err := findArraySubqueryExpr(child)
+		if err != nil || ok {
+			return subquery, ok, err
+		}
+	}
+	return nil, false, nil
+}
+
+func arrayAggTopNRewritePlanFromArraySubquery(ctx context.Context, subquery *googlesql.ResolvedSubqueryExpr) (arrayAggTopNRewritePlan, bool, error) {
+	scan, err := subquery.Subquery()
+	if err != nil || scan == nil {
+		return arrayAggTopNRewritePlan{}, false, err
+	}
+	limitScan, ok := scan.(*googlesql.ResolvedLimitOffsetScan)
+	if !ok || m1(limitScan.Limit()) == nil {
+		return arrayAggTopNRewritePlan{}, false, nil
+	}
+	if offset := m1(limitScan.Offset()); offset != nil {
+		offsetSQL, err := newNode(offset).FormatSQL(ctx)
+		if err != nil {
+			return arrayAggTopNRewritePlan{}, false, err
+		}
+		if strings.TrimSpace(offsetSQL) != "0" {
+			return arrayAggTopNRewritePlan{}, false, nil
+		}
+	}
+	limitSQL, err := newNode(m1(limitScan.Limit())).FormatSQL(ctx)
+	if err != nil {
+		return arrayAggTopNRewritePlan{}, false, err
+	}
+	orderScan, ok := m1(limitScan.InputScan()).(*googlesql.ResolvedOrderByScan)
+	if !ok {
+		return arrayAggTopNRewritePlan{}, false, nil
+	}
+	info, ok, err := arrayAggRewriterScanInfoFromScan(ctx, m1(orderScan.InputScan()))
+	if err != nil || !ok {
+		return arrayAggTopNRewritePlan{}, false, err
+	}
+	valueExpr, err := arrayAggTopNRewriteValueExpr(ctx, limitScan, m1(orderScan.InputScan()))
+	if err != nil {
+		return arrayAggTopNRewritePlan{}, false, err
+	}
+	var orderBy []arrayAggTopNRewriteOrder
+	for _, item := range m1(orderScan.OrderByItemList()) {
+		columnRef := m1(item.ColumnRef())
+		if columnRef == nil {
+			return arrayAggTopNRewritePlan{}, false, nil
+		}
+		colName := uniqueColumnName(ctx, m1(columnRef.Column()))
+		fieldIndex, ok := info.fieldByColumn[colName]
+		if !ok {
+			return arrayAggTopNRewritePlan{}, false, nil
+		}
+		orderBy = append(orderBy, arrayAggTopNRewriteOrder{
+			fieldIndex: fieldIndex,
+			descending: m1(item.IsDescending()),
+			nullOrder:  m1(item.NullOrder()),
+		})
+	}
+	if info.helperColumn == "" || len(orderBy) == 0 {
+		return arrayAggTopNRewritePlan{}, false, nil
+	}
+	return arrayAggTopNRewritePlan{
+		helperColumn:  info.helperColumn,
+		elementColumn: info.elementColumn,
+		limitSQL:      limitSQL,
+		orderBy:       orderBy,
+		valueExpr:     valueExpr,
+		fieldByColumn: info.fieldByColumn,
+	}, true, nil
+}
+
+func arrayAggTopNRewriteValueExpr(ctx context.Context, limitScan *googlesql.ResolvedLimitOffsetScan, input googlesql.ResolvedScanNode) (googlesql.ResolvedExprNode, error) {
+	cols := m1(limitScan.ColumnList())
+	if len(cols) != 1 {
+		return nil, nil
+	}
+	expr, _, err := computedColumnExprForScan(ctx, input, uniqueColumnName(ctx, cols[0]))
+	return expr, err
+}
+
+func computedColumnExprForScan(ctx context.Context, scan googlesql.ResolvedScanNode, target string) (googlesql.ResolvedExprNode, bool, error) {
+	switch s := scan.(type) {
+	case *googlesql.ResolvedProjectScan:
+		for _, col := range m1(s.ExprList()) {
+			out, err := col.Column()
+			if err != nil || out == nil {
+				return nil, false, err
+			}
+			if uniqueColumnName(ctx, out) != target {
+				continue
+			}
+			expr, err := col.Expr()
+			return expr, expr != nil, err
+		}
+		return computedColumnExprForScan(ctx, m1(s.InputScan()), target)
+	case *googlesql.ResolvedOrderByScan:
+		return computedColumnExprForScan(ctx, m1(s.InputScan()), target)
+	case *googlesql.ResolvedLimitOffsetScan:
+		return computedColumnExprForScan(ctx, m1(s.InputScan()), target)
+	}
+	return nil, false, nil
+}
+
+func arrayAggRewriterScanInfoFromScan(ctx context.Context, scan googlesql.ResolvedScanNode) (arrayAggRewriterScanInfo, bool, error) {
+	switch s := scan.(type) {
+	case *googlesql.ResolvedProjectScan:
+		info, ok, err := arrayAggRewriterScanInfoFromScan(ctx, m1(s.InputScan()))
+		if err != nil || !ok {
+			return arrayAggRewriterScanInfo{}, false, err
+		}
+		for _, col := range m1(s.ExprList()) {
+			expr, err := col.Expr()
+			if err != nil || expr == nil {
+				return arrayAggRewriterScanInfo{}, false, err
+			}
+			fieldIndex, ok, err := helperStructFieldIndex(ctx, expr, info.elementColumn)
+			if err != nil {
+				return arrayAggRewriterScanInfo{}, false, err
+			}
+			if !ok {
+				continue
+			}
+			out, err := col.Column()
+			if err != nil || out == nil {
+				return arrayAggRewriterScanInfo{}, false, err
+			}
+			info.fieldByColumn[uniqueColumnName(ctx, out)] = fieldIndex
+		}
+		return info, true, nil
+	case *googlesql.ResolvedArrayScan:
+		exprs := m1(s.ArrayExprList())
+		cols := m1(s.ElementColumnList())
+		if len(exprs) != 1 || len(cols) != 1 {
+			return arrayAggRewriterScanInfo{}, false, nil
+		}
+		ref, ok := exprs[0].(*googlesql.ResolvedColumnRef)
+		if !ok {
+			return arrayAggRewriterScanInfo{}, false, nil
+		}
+		return arrayAggRewriterScanInfo{
+			helperColumn:  uniqueColumnName(ctx, m1(ref.Column())),
+			elementColumn: uniqueColumnName(ctx, cols[0]),
+			fieldByColumn: map[string]int{},
+		}, true, nil
+	}
+	return arrayAggRewriterScanInfo{}, false, nil
+}
+
+func helperStructFieldIndex(ctx context.Context, expr googlesql.ResolvedExprNode, elementColumn string) (int, bool, error) {
+	getField, ok := expr.(*googlesql.ResolvedGetStructField)
+	if !ok {
+		return 0, false, nil
+	}
+	ref, ok := m1(getField.Expr()).(*googlesql.ResolvedColumnRef)
+	if !ok {
+		return 0, false, nil
+	}
+	if uniqueColumnName(ctx, m1(ref.Column())) != elementColumn {
+		return 0, false, nil
+	}
+	idx, err := getField.FieldIdx()
+	if err != nil {
+		return 0, false, err
+	}
+	return int(idx), true, nil
 }
 
 // FormatSQL lowers a ResolvedAnonymizedAggregateScan (the
@@ -6050,6 +6687,11 @@ func (n *ProjectScanNode) FormatSQL(ctx context.Context) (string, error) {
 	if n.node == nil {
 		return "", nil
 	}
+	rewritePlans, err := arrayAggTopNRewritePlansFromProject(ctx, n.node)
+	if err != nil {
+		return "", err
+	}
+	ctx = withArrayAggTopNRewrite(ctx, rewritePlans)
 	for _, col := range m1(n.node.ExprList()) {
 		// assign expr to columnRefMap
 		if _, err := newNode(col).FormatSQL(ctx); err != nil {

@@ -23,6 +23,7 @@ type (
 	analyticInputScanKey            struct{}
 	analyticEmulationFlagKey        struct{}
 	arraySubqueryColumnNameKey      struct{}
+	arrayAggTopNRewriteKey          struct{}
 	currentTimeKey                  struct{}
 	tableNameToColumnListMapKey     struct{}
 	useColumnIDKey                  struct{}
@@ -280,6 +281,30 @@ func arraySubqueryColumnNameFromContext(ctx context.Context) *arraySubqueryColum
 		return nil
 	}
 	return value.(*arraySubqueryColumnNames)
+}
+
+func withArrayAggTopNRewrite(ctx context.Context, plans map[string]arrayAggTopNRewritePlan) context.Context {
+	if len(plans) == 0 {
+		return ctx
+	}
+	merged := map[string]arrayAggTopNRewritePlan{}
+	if existing := arrayAggTopNRewriteFromContext(ctx); existing != nil {
+		for k, v := range existing {
+			merged[k] = v
+		}
+	}
+	for k, v := range plans {
+		merged[k] = v
+	}
+	return context.WithValue(ctx, arrayAggTopNRewriteKey{}, merged)
+}
+
+func arrayAggTopNRewriteFromContext(ctx context.Context) map[string]arrayAggTopNRewritePlan {
+	value := ctx.Value(arrayAggTopNRewriteKey{})
+	if value == nil {
+		return nil
+	}
+	return value.(map[string]arrayAggTopNRewritePlan)
 }
 
 func withUseColumnID(ctx context.Context) context.Context {
