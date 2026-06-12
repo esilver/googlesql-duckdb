@@ -1,6 +1,7 @@
 package date
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/goccy/googlesqlite/internal/functions/helper"
@@ -33,7 +34,11 @@ func DATE(args ...value.Value) (value.Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		return value.DateValue(time.Time{}.AddDate(yearInt-1, monthInt-1, dayInt-1)), nil
+		t := time.Date(yearInt, time.Month(monthInt), dayInt, 0, 0, 0, 0, time.UTC)
+		if t.Year() != yearInt || int(t.Month()) != monthInt || t.Day() != dayInt {
+			return nil, fmt.Errorf("DATE: date field out of range: %04d-%02d-%02d", yearInt, monthInt, dayInt)
+		}
+		return value.DateValue(t), nil
 	} else if len(args) == 2 {
 		t, err := args[0].ToTime()
 		if err != nil {

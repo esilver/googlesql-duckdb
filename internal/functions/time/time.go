@@ -38,7 +38,10 @@ func TIME(args ...value.Value) (value.Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		return value.TimeValue(time.Date(0, 0, 0, hourInt, minInt, secInt, 0, loc)), nil
+		if hourInt < 0 || hourInt > 23 || minInt < 0 || minInt > 59 || secInt < 0 || secInt > 59 {
+			return nil, fmt.Errorf("TIME: time field out of range: %02d:%02d:%02d", hourInt, minInt, secInt)
+		}
+		return value.TimeValue(time.Date(0, 1, 1, hourInt, minInt, secInt, 0, loc)), nil
 	}
 	if len(args) != 1 && len(args) != 2 {
 		return nil, fmt.Errorf("TIME: invalid number of arguments: got %d, want 1 or 2", len(args))

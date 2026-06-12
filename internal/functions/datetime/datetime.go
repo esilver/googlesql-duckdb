@@ -62,7 +62,10 @@ func DATETIME(args ...value.Value) (value.Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		return value.DatetimeValue(time.Date(
+		if hourInt < 0 || hourInt > 23 || minuteInt < 0 || minuteInt > 59 || secondInt < 0 || secondInt > 59 {
+			return nil, fmt.Errorf("DATETIME: time field out of range: %02d:%02d:%02d", hourInt, minuteInt, secondInt)
+		}
+		t := time.Date(
 			yearInt,
 			time.Month(monthInt),
 			dayInt,
@@ -71,7 +74,11 @@ func DATETIME(args ...value.Value) (value.Value, error) {
 			secondInt,
 			0,
 			location,
-		)), nil
+		)
+		if t.Year() != yearInt || int(t.Month()) != monthInt || t.Day() != dayInt {
+			return nil, fmt.Errorf("DATETIME: date field out of range: %04d-%02d-%02d", yearInt, monthInt, dayInt)
+		}
+		return value.DatetimeValue(t), nil
 	}
 	if len(args) != 1 && len(args) != 2 {
 		return nil, fmt.Errorf("DATETIME: invalid number of arguments: got %d, want 1 or 2", len(args))
