@@ -167,6 +167,7 @@ func duckdbAggSpecs() []aggSpec {
 		// appear in the DISTINCT argument list. Route that shape through the
 		// existing GoogleSQL aggregate body under a non-conflicting name.
 		{name: "googlesqlite_array_agg", minParams: 1, maxParams: 8, newAgg: aggregate.BindArrayAgg()},
+		{name: "googlesqlite_string_agg", minParams: 1, maxParams: 8, newAgg: aggregate.BindStringAgg()},
 
 		// ANY_VALUE(value HAVING { MAX | MIN } key): the formatter lowers
 		// the HAVING modifier to having_any_value(value, key, 'MAX'|'MIN'),

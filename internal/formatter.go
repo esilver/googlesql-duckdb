@@ -3040,6 +3040,10 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 		funcName = "googlesqlite_array_agg"
 		useMarkerAggregate = true
 	}
+	if funcName == "string_agg" && m1(n.node.Limit()) != nil {
+		funcName = "googlesqlite_string_agg"
+		useMarkerAggregate = true
+	}
 	if useMarkerAggregate {
 		var opts []string
 		for _, item := range m1(n.node.OrderByItemList()) {
@@ -5983,19 +5987,11 @@ func aggregateTopNOrderByItem(ctx context.Context, item *googlesql.ResolvedOrder
 }
 
 func aggregateTopNOrderByExpr(expr string, descending bool, nullOrder googlesql.ResolvedOrderByItemEnums_NullOrderMode) []string {
-	var orderBy []string
-	switch nullOrder {
-	case googlesql.ResolvedOrderByItemEnums_NullOrderModeNullsFirst:
-		orderBy = append(orderBy, fmt.Sprintf("(%s IS NOT NULL)", expr))
-	case googlesql.ResolvedOrderByItemEnums_NullOrderModeNullsLast:
-		orderBy = append(orderBy, fmt.Sprintf("(%s IS NULL)", expr))
-	}
+	direction := ""
 	if descending {
-		orderBy = append(orderBy, fmt.Sprintf("%s DESC", expr))
-	} else {
-		orderBy = append(orderBy, expr)
+		direction = " DESC"
 	}
-	return orderBy
+	return []string{fmt.Sprintf("%s%s%s", expr, direction, nullOrderSQL(descending, nullOrder))}
 }
 
 func arrayAggTopNRewritePlansFromProject(ctx context.Context, project *googlesql.ResolvedProjectScan) (map[string]arrayAggTopNRewritePlan, error) {
