@@ -1,9 +1,9 @@
-//go:build !cgo
+//go:build !duckdb_cgo
 
 package googlesqlite
 
-// This file is the pure-Go (CGO_ENABLED=0) counterpart of duckdb_aggregate_udf.go
-// (which is tagged //go:build cgo): it registers the same GoogleSQL aggregate /
+// This file is the default pure-Go counterpart of duckdb_aggregate_udf.go
+// (which is tagged //go:build duckdb_cgo): it registers the same GoogleSQL aggregate /
 // window UDF surface against the wasm2go pure-Go DuckDB engine through
 // github.com/esilver/duckdb-go-pure's RegisterAggregateBandConn instead of the C aggregate
 // API. The two files are mutually exclusive by build tag and intentionally share
