@@ -58,9 +58,10 @@ client-side. Highlights:
   executed inside the browser tab; nothing is sent anywhere.
 - **Responsive UI.** The engine runs in a Web Worker, so editing and
   running queries never blocks the page.
-- **Persistent database.** The DuckDB database lives in the Origin
-  Private File System (OPFS), so your tables and data survive page
-  reloads with no explicit save step.
+- **In-memory database.** The current DuckDB WebAssembly build runs
+  in-memory inside the browser tab. Query history is kept by the
+  Playground UI, but tables and data reset on reload until the DuckDB
+  filesystem seam grows browser persistence.
 - **A real SQL editor**, with query history and result export.
 
 It is the quickest way to explore the supported GoogleSQL syntax and

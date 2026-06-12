@@ -81,8 +81,8 @@ github.com/envoyproxy/go-control-plane/ratelimit v0.1.0/go.mod h1:Wk+tMFAFbCXaJP
 github.com/envoyproxy/protoc-gen-validate v0.1.0/go.mod h1:iSmxcyjqTsJpI2R4NaDN7+kN2VEUnK/pcBlmesArF7c=
 github.com/envoyproxy/protoc-gen-validate v1.3.0 h1:TvGH1wof4H33rezVKWSpqKz5NXWg5VPuZ0uONDT6eb4=
 github.com/envoyproxy/protoc-gen-validate v1.3.0/go.mod h1:HvYl7zwPa5mffgyeTUHA9zHIH36nmrm7oCbo4YKoSWA=
-github.com/esilver/duckdb-go-pure v0.3.8 h1:7nCnrYSV9XspF54p0ztivMLhD/z5v77DaE3Bk3iMzm0=
-github.com/esilver/duckdb-go-pure v0.3.8/go.mod h1:K0lu75wP4hv1zaaEEqaq42/cE96wNg/azf4kGnIwg2g=
+github.com/esilver/duckdb-go-pure v0.3.9 h1:W/Kur1v/yeG5AuY/DF4LJLl1rCkFOlq9JXKXiRICd20=
+github.com/esilver/duckdb-go-pure v0.3.9/go.mod h1:ArM/CohRgBCoOLcKcDJjMuFoWvFHIL7FYNzI5aJs5VI=
 github.com/esilver/go-googlesql v0.2.4-finalizer.1.0.20260611225755-3bdff21371a3 h1:Tm09ZeN8KjwfBCt1myLlszltewYuGLff66rrfY0rBB4=
 github.com/esilver/go-googlesql v0.2.4-finalizer.1.0.20260611225755-3bdff21371a3/go.mod h1:0CUrO9fG9A5lAxOQDjCUr7ibzoRLiv2iaAwbGvESAhM=
 github.com/fatih/color v1.19.0 h1:Zp3PiM21/9Ld6FzSKyL5c/BULoe/ONr9KlbYVOfG8+w=

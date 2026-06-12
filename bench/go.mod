@@ -29,7 +29,7 @@ require (
 	github.com/dop251/goja v0.0.0-20260311135729-065cd970411c // indirect
 	github.com/envoyproxy/go-control-plane/envoy v1.36.0 // indirect
 	github.com/envoyproxy/protoc-gen-validate v1.3.0 // indirect
-	github.com/esilver/duckdb-go-pure v0.3.8 // indirect
+	github.com/esilver/duckdb-go-pure v0.3.9 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
@@ -89,3 +89,8 @@ require (
 // googlesqlite is the module under development; benchmark the local
 // checkout rather than a published version.
 replace github.com/goccy/googlesqlite => ../
+
+// Keep the benchmark module on the same patched analyzer bridge as the
+// root module. Without this, `go test` from bench/ resolves upstream
+// go-googlesql and benchmarks a different stack.
+replace github.com/goccy/go-googlesql => github.com/esilver/go-googlesql v0.2.4-finalizer.1.0.20260611225755-3bdff21371a3

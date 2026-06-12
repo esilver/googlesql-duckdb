@@ -71,16 +71,15 @@ The `js/wasm` build installs `globalThis.googlesqlite` with:
 | function | description |
 |----------|-------------|
 | `exec(sql)` / `execScript(text)` | run statements; returns `{ output, results }` |
-| `exportDB()` | return the database as a `Uint8Array` |
-| `importDB(bytes)` | replace the session database |
 | `getHistory()` | return the query/result history |
 | `loadHistory(json)` | restore a history exported as JSON |
 | `clearHistory()` | drop all history |
 | `exportHistory(format)` | export history as `json`, `sql`, `markdown` or `csv` |
+| `listTables()` | return table names visible to the session |
 | `setDebug(bool)` | toggle the translated-SQL display |
 
-The host page is responsible for persisting `exportDB()` bytes and the
-history (e.g. in IndexedDB) and restoring them on load via `importDB`
-and `loadHistory`. Load the module with the Go `wasm_exec.js` shipped
-alongside `googlesqlite.wasm`; call code after `onGoogleSQLiteReady`
-fires.
+The browser DuckDB build is currently in-memory only, so tables reset
+on reload. The host page may persist and restore query history via
+`exportHistory` and `loadHistory`. Load the module with the Go
+`wasm_exec.js` shipped alongside `googlesqlite.wasm`; call code after
+`onGoogleSQLiteReady` fires.
