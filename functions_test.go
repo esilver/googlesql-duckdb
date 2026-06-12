@@ -920,3 +920,61 @@ func TestErrorGroupErrorPath(t *testing.T) {
 		t.Fatalf("err.Error() returned empty")
 	}
 }
+
+// TestJavaScriptUDFVolatile guards eval_javascript's membership in
+// duckDBVolatileUDFNames. JS UDF bodies are arbitrary user code
+// (Math.random(), Date.now()); when the bridge UDF is registered
+// non-volatile, DuckDB constant-folds the call and every row sees the
+// same single value.
+func TestJavaScriptUDFVolatile(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:?_test=js_udf_volatile")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("Conn: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(ctx,
+		`CREATE TABLE vol_rows (id INT64)`); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx,
+		`INSERT INTO vol_rows VALUES (1), (2), (3)`); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx,
+		`CREATE FUNCTION RandomJS() RETURNS FLOAT64 LANGUAGE js AS 'return Math.random();'`); err != nil {
+		t.Fatalf("CREATE FUNCTION (js): %v", err)
+	}
+	rows, err := conn.QueryContext(ctx, "SELECT RandomJS() FROM vol_rows")
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	defer rows.Close()
+	distinct := map[float64]struct{}{}
+	n := 0
+	for rows.Next() {
+		var v float64
+		if err := rows.Scan(&v); err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		distinct[v] = struct{}{}
+		n++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("row count = %d; want 3", n)
+	}
+	if len(distinct) < 2 {
+		t.Fatalf("Math.random() JS UDF returned %d distinct values over 3 rows; "+
+			"want >1 (eval_javascript was constant-folded — missing from duckDBVolatileUDFNames?)", len(distinct))
+	}
+}

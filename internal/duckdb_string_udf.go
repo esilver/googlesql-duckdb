@@ -174,6 +174,11 @@ var duckDBVolatileUDFNames = map[string]struct{}{
 	"mysql_localtimestamp":        {},
 	"pending_commit_timestamp":    {},
 	"get_next_sequence_value":     {},
+	// EVAL_JAVASCRIPT executes arbitrary user JS (CREATE TEMP FUNCTION
+	// ... LANGUAGE js), which can be non-deterministic (Math.random(),
+	// Date.now()). Without this entry DuckDB constant-folds the call and
+	// every row sees one value.
+	"eval_javascript": {},
 }
 
 // stringFamilyUDFNames is the canonical builtin names of the string-family
