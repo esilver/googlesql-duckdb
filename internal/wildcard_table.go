@@ -87,9 +87,12 @@ func (t *WildcardTable) FormatSQL(ctx context.Context) (string, error) {
 				continue
 			}
 			if t.existsColumn(table, column.Name) {
-				columns = append(columns, fmt.Sprintf("`%s`", column.Name))
+				// DuckDB identifier quoting (double quotes) — the
+				// backtick form this emitted on the SQLite backend is a
+				// DuckDB Parser Error (same family as issue #11).
+				columns = append(columns, fmt.Sprintf("\"%s\"", column.Name))
 			} else {
-				columns = append(columns, fmt.Sprintf("NULL as %s", column.Name))
+				columns = append(columns, fmt.Sprintf("NULL as \"%s\"", column.Name))
 			}
 		}
 		fullName := strings.Join(table.NamePath, ".")
@@ -103,7 +106,7 @@ func (t *WildcardTable) FormatSQL(ctx context.Context) (string, error) {
 		}
 		queries = append(queries,
 			fmt.Sprintf(
-				"SELECT %s, '%s' as _TABLE_SUFFIX FROM `%s`",
+				"SELECT %s, '%s' as _TABLE_SUFFIX FROM \"%s\"",
 				strings.Join(columns, ","),
 				encodedSuffix,
 				table.TableName(),

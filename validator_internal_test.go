@@ -19,9 +19,11 @@ import (
 //
 // Driving translateConnDone directly with the sentinel — rather than
 // trying to time a real cancellation — keeps this test deterministic;
-// the end-to-end behaviour is exercised by bigquery-emulator's
-// TestIssue478ConnectionCorruptionOnCancel, which depends on the same
-// translation working through database/sql's two-layer pool.
+// the end-to-end shape (cancel mid-statement on one pooled conn, the
+// pool keeps serving) is exercised by TestRegression_WedgedSlotRecovery
+// in regression_test.go.
+//
+// Ported from upstream goccy/googlesqlite bf326675 (fork issue #12).
 func TestConn_IsValid_And_TranslateConnDone(t *testing.T) {
 	t.Run("fresh Conn is valid", func(t *testing.T) {
 		c := &Conn{}

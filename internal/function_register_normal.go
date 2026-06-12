@@ -370,6 +370,7 @@ var normalFuncs = []*funcInfo{
 	{Name: "int64", BindFunc: bindInt64},
 	{Name: "double", BindFunc: bindDouble},
 	{Name: "float64", BindFunc: bindDouble},
+	{Name: "typeof", BindFunc: bindTypeof},
 	{Name: "json_type", BindFunc: jsonfn.BindJsonType},
 	{Name: "json_strip_nulls", BindFunc: jsonfn.BindJsonStripNulls},
 	{Name: "json_remove", BindFunc: jsonfn.BindJsonRemove},
@@ -619,6 +620,8 @@ var normalFuncs = []*funcInfo{
 	// aggregate option funcs
 	{Name: "distinct", BindFunc: bindDistinct},
 	{Name: "ignore_nulls", BindFunc: bindIgnoreNulls},
+	{Name: "limit", BindFunc: bindLimit},
+	{Name: "order_by", BindFunc: bindOrderBy},
 
 	// window option funcs
 	{Name: "window_rowid", BindFunc: bindWindowRowID},

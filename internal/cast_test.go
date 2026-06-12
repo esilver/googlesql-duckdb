@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 
+	googlesql "github.com/goccy/go-googlesql"
+
 	"github.com/goccy/googlesqlite/internal/value"
 )
 
@@ -88,5 +90,31 @@ func TestBindCast_HappyPath(t *testing.T) {
 	s, _ := got.ToString()
 	if !strings.Contains(s, "42") {
 		t.Fatalf("expected result containing 42, got %q", s)
+	}
+}
+
+// TestResolveCastType_Caches pins the issue-#8 fix: the JSON type
+// literals the formatter embeds in every googlesqlite_cast call resolve
+// through the wasm type factory ONCE per literal, not once per row. A
+// second resolve of the same literal must return the cached entry
+// (same pointer), keeping the per-row cast body wasm-free.
+func TestResolveCastType_Caches(t *testing.T) {
+	const lit = `{"name":"INT64","kind":3,"signatureKind":1,"elementType":null,"fieldTypes":null}`
+	first, err := resolveCastType(lit)
+	if err != nil {
+		t.Fatalf("resolveCastType: %v", err)
+	}
+	second, err := resolveCastType(lit)
+	if err != nil {
+		t.Fatalf("resolveCastType (cached): %v", err)
+	}
+	if first != second {
+		t.Fatalf("expected cached *resolvedCastType on second resolve")
+	}
+	if first.node == nil {
+		t.Fatalf("resolved node is nil")
+	}
+	if first.kind != googlesql.TypeKindTypeInt64 {
+		t.Fatalf("kind = %v, want TypeKindTypeInt64", first.kind)
 	}
 }

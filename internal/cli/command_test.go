@@ -45,7 +45,7 @@ func TestSessionDebugDotCommand(t *testing.T) {
 	}
 	buf.Reset()
 	s.RunStatement(ctx, "SELECT 1 AS x")
-	if !strings.Contains(buf.String(), "-- sqlite:") {
+	if !strings.Contains(buf.String(), "-- duckdb:") {
 		t.Errorf("debug mode did not print the translated query:\n%s", buf.String())
 	}
 }

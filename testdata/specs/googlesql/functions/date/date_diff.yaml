@@ -15,6 +15,25 @@ cases:
     expected:
       rows:
         - [1]
+  - desc: upstream example - Sunday to Monday week variants
+    sql: |-
+      SELECT
+        DATE_DIFF(DATE '2017-12-18', DATE '2017-12-17', WEEK) AS week_diff,
+        DATE_DIFF(DATE '2017-12-18', DATE '2017-12-17', WEEK(MONDAY)) AS week_monday_diff,
+        DATE_DIFF(DATE '2017-12-18', DATE '2017-12-17', ISOWEEK) AS isoweek_diff
+    expected:
+      rows:
+        - [0, 1, 1]
+  - desc: custom week boundary counts Thursday starts
+    sql: SELECT DATE_DIFF(DATE '2024-01-04', DATE '2024-01-03', WEEK(THURSDAY))
+    expected:
+      rows:
+        - [1]
+  - desc: custom week boundary negative direction
+    sql: SELECT DATE_DIFF(DATE '2024-01-03', DATE '2024-01-04', WEEK(THURSDAY))
+    expected:
+      rows:
+        - [-1]
   - desc: upstream example — YEAR vs ISOYEAR
     sql: |-
       SELECT

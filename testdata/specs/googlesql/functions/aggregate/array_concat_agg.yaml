@@ -16,3 +16,14 @@ cases:
     expected:
       rows:
         - [null]
+  - desc: limit ignores NULL input arrays
+    sql: |
+      SELECT TO_JSON_STRING(ARRAY_CONCAT_AGG(arr LIMIT 1))
+      FROM UNNEST([
+        STRUCT(CAST(NULL AS ARRAY<INT64>) AS arr),
+        STRUCT([1, 2] AS arr),
+        STRUCT([3, 4] AS arr)
+      ])
+    expected:
+      rows:
+        - ["[1,2]"]

@@ -16,6 +16,7 @@ import (
 	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/proto"
 
+	duckdb "github.com/goccy/googlesqlite/internal/duckdbgo"
 	"github.com/goccy/googlesqlite/internal/value"
 )
 
@@ -86,12 +87,22 @@ func (r *Rows) Next(dest []driver.Value) error {
 		return unwrapSQLiteUserError(err)
 	}
 	colTypes := r.columnTypes()
-	values := make([]any, 0, len(dest))
-	for range dest {
+	scanCols, err := r.rows.Columns()
+	if err != nil {
+		return err
+	}
+	if len(scanCols) < len(dest) {
+		return fmt.Errorf("row scan returned %d columns; want at least %d", len(scanCols), len(dest))
+	}
+	values := make([]any, 0, len(scanCols))
+	for range scanCols {
 		var v any
 		values = append(values, &v)
 	}
 	retErr := r.rows.Scan(values...)
+	if retErr != nil {
+		return retErr
+	}
 	destV := reflect.ValueOf(dest)
 	for idx, colType := range colTypes {
 		src := reflect.ValueOf(values[idx]).Elem().Interface()
@@ -100,13 +111,32 @@ func (r *Rows) Next(dest []driver.Value) error {
 			return err
 		}
 	}
-	return retErr
+	return nil
 }
 
 func (r *Rows) assignValue(src any, dst reflect.Value, typ *Type) error {
+	// duckdb-go-pure >= v0.3.3 scans JSON-alias result cells as
+	// duckdb.JSONValue (the raw, type-marked JSON text) where the
+	// v0.3.2-era driver delivered the PARSED native value. Restore those
+	// semantics before decoding: an envelope string inside JSON quotes
+	// must arrive unquoted for DecodeValue's base64 path, and a JSON
+	// null must hit the nil early-return below.
+	if jv, ok := src.(duckdb.JSONValue); ok {
+		src = duckdb.DecodeJSONNative(string(jv))
+	}
 	if src == nil {
 		dst.Set(reflect.New(dst.Type()).Elem())
 		return nil
+	}
+	// DuckDB retarget: native DATE / TIME / TIMESTAMP / TIMESTAMPTZ
+	// columns are scanned by duckdb-go as a Go time.Time, not the
+	// SQLite-era base64 envelope. DecodeValue has no time.Time case, so
+	// wrap it in the value type the analyzer resolved for this column
+	// before the normal CastValue -> ToString/ToJSON render path.
+	if tt, ok := src.(time.Time); ok {
+		if tv := timeValueForKind(tt, googlesql.TypeKind(typ.Kind)); tv != nil {
+			return r.renderDecodedValue(tv, dst, typ)
+		}
 	}
 	decodedValue, err := DecodeValue(src)
 	if err != nil {
@@ -138,17 +168,26 @@ func (r *Rows) assignValue(src any, dst reflect.Value, typ *Type) error {
 			return err
 		}
 	}
+	return r.renderDecodedValue(decodedValue, dst, typ)
+}
+
+// renderDecodedValue casts an already-decoded value.Value to the
+// analyzer-resolved column type and writes it into dst via the
+// destination-kind converters (scalar widths) or the interface render
+// path (string/temporal/struct/array). Shared by the base64-envelope
+// decode path and the DuckDB-native time.Time path.
+func (r *Rows) renderDecodedValue(decoded value.Value, dst reflect.Value, typ *Type) error {
 	t, err := typ.ToGoogleSQLType()
 	if err != nil {
 		return err
 	}
-	value, err := CastValue(t, decodedValue)
+	casted, err := CastValue(t, decoded)
 	if err != nil {
 		return err
 	}
 	kind := dst.Type().Kind()
 	if conv, ok := scalarValueConverters[kind]; ok {
-		rv, err := conv(value)
+		rv, err := conv(casted)
 		if err != nil {
 			return err
 		}
@@ -156,9 +195,29 @@ func (r *Rows) assignValue(src any, dst reflect.Value, typ *Type) error {
 		return nil
 	}
 	if kind == reflect.Interface {
-		return r.assignInterfaceValue(value, dst, typ)
+		return r.assignInterfaceValue(casted, dst, typ)
 	}
-	return fmt.Errorf("unexpected destination type %s for %T", kind, value)
+	return fmt.Errorf("unexpected destination type %s for %T", kind, casted)
+}
+
+// timeValueForKind wraps a DuckDB-native time.Time into the
+// googlesqlite value.Value matching the analyzer-resolved column kind.
+// DuckDB returns DATE / TIME / TIMESTAMP / TIMESTAMPTZ uniformly as
+// time.Time; the resolved kind tells us which civil/absolute reading
+// the caller expects. Returns nil for non-temporal kinds so the caller
+// falls back to the generic decode path.
+func timeValueForKind(t time.Time, kind googlesql.TypeKind) value.Value {
+	switch kind {
+	case googlesql.TypeKindTypeDate:
+		return value.DateValue(t)
+	case googlesql.TypeKindTypeTime:
+		return value.TimeValue(t)
+	case googlesql.TypeKindTypeDatetime:
+		return value.DatetimeValue(t)
+	case googlesql.TypeKindTypeTimestamp:
+		return value.TimestampValue(t)
+	}
+	return nil
 }
 
 // scalarValueConverters maps a destination reflect.Kind to a function
@@ -240,8 +299,21 @@ func (r *Rows) assignInterfaceValue(src value.Value, dst reflect.Value, typ *Typ
 			return err
 		}
 		dst.Set(reflect.ValueOf(f64))
-	case googlesql.TypeKindTypeBytes,
-		googlesql.TypeKindTypeString,
+	case googlesql.TypeKindTypeBytes:
+		// BYTES renders as its base64 text — BigQuery's wire form and
+		// the upstream googlesqlite driver contract. Storage is native
+		// BLOB (payload bytes) since the native-storage migration, but
+		// the SCAN contract stays base64: API-layer consumers
+		// (bigquery-emulator's convertValueToCell) stringify scalar
+		// cells via fmt.Sprint, which only yields the correct wire
+		// value for a base64 string, and the TestQuery corpus encodes
+		// the same expectation.
+		s, err := src.ToString()
+		if err != nil {
+			return err
+		}
+		dst.Set(reflect.ValueOf(s))
+	case googlesql.TypeKindTypeString,
 		googlesql.TypeKindTypeNumeric,
 		googlesql.TypeKindTypeBignumeric,
 		googlesql.TypeKindTypeInterval,

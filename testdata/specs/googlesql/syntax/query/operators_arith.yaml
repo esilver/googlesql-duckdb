@@ -16,3 +16,13 @@ cases:
     expected:
       rows:
         - [-5]
+  - desc: DATE plus and minus integer day offsets
+    sql: SELECT DATE '2024-03-15' + CAST(2 AS INT64) AS plus_days, DATE '2024-03-15' - CAST(3 AS INT64) AS minus_days
+    expected:
+      rows:
+        - ["2024-03-17", "2024-03-12"]
+  - desc: integer day offset plus DATE
+    sql: SELECT CAST(2 AS INT64) + DATE '2024-03-15'
+    expected:
+      rows:
+        - ["2024-03-17"]

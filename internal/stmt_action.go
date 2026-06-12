@@ -34,7 +34,7 @@ func (a *CreateTableStmtAction) Prepare(ctx context.Context, conn *Conn) (driver
 	if a.spec.CreateMode == googlesql.ResolvedCreateStatementEnums_CreateModeCreateOrReplace {
 		if _, err := conn.ExecContext(
 			ctx,
-			fmt.Sprintf("DROP TABLE IF EXISTS `%s`", a.spec.TableName()),
+			fmt.Sprintf("DROP TABLE IF EXISTS %q", a.spec.TableName()),
 		); err != nil {
 			return nil, err
 		}
@@ -53,7 +53,7 @@ func (a *CreateTableStmtAction) createIndexAutomatically(ctx context.Context, co
 		}
 		indexName := fmt.Sprintf("googlesqlite_autoindex_%s_%s", col.Name, strings.Join(a.spec.NamePath, "_"))
 		createIndexQuery := fmt.Sprintf(
-			"CREATE INDEX IF NOT EXISTS %s ON `%s`(`%s`)",
+			"CREATE INDEX IF NOT EXISTS %s ON %q(%q)",
 			indexName,
 			a.spec.TableName(),
 			col.Name,
@@ -74,7 +74,7 @@ func (a *CreateTableStmtAction) exec(ctx context.Context, conn *Conn) error {
 	if a.spec.CreateMode == googlesql.ResolvedCreateStatementEnums_CreateModeCreateOrReplace || a.spec.IsTemp {
 		if _, err := conn.ExecContext(
 			ctx,
-			fmt.Sprintf("DROP TABLE IF EXISTS `%s`", a.spec.TableName()),
+			fmt.Sprintf("DROP TABLE IF EXISTS %q", a.spec.TableName()),
 		); err != nil {
 			return err
 		}
@@ -121,7 +121,7 @@ func (a *CreateTableStmtAction) Cleanup(ctx context.Context, conn *Conn) error {
 
 	if _, err := conn.ExecContext(
 		ctx,
-		fmt.Sprintf("DROP TABLE IF EXISTS `%s`", a.spec.TableName()),
+		fmt.Sprintf("DROP TABLE IF EXISTS %q", a.spec.TableName()),
 	); err != nil {
 		return fmt.Errorf("failed to cleanup table %s: %w", a.spec.TableName(), err)
 	}
@@ -141,7 +141,7 @@ func (a *CreateViewStmtAction) Prepare(ctx context.Context, conn *Conn) (driver.
 	if a.spec.CreateMode == googlesql.ResolvedCreateStatementEnums_CreateModeCreateOrReplace {
 		if _, err := conn.ExecContext(
 			ctx,
-			fmt.Sprintf("DROP VIEW IF EXISTS `%s`", a.spec.TableName()),
+			fmt.Sprintf("DROP VIEW IF EXISTS %q", a.spec.TableName()),
 		); err != nil {
 			return nil, err
 		}
@@ -157,7 +157,7 @@ func (a *CreateViewStmtAction) exec(ctx context.Context, conn *Conn) error {
 	if a.spec.CreateMode == googlesql.ResolvedCreateStatementEnums_CreateModeCreateOrReplace {
 		if _, err := conn.ExecContext(
 			ctx,
-			fmt.Sprintf("DROP VIEW IF EXISTS `%s`", a.spec.TableName()),
+			fmt.Sprintf("DROP VIEW IF EXISTS %q", a.spec.TableName()),
 		); err != nil {
 			return err
 		}
@@ -193,7 +193,7 @@ func (a *CreateViewStmtAction) Cleanup(ctx context.Context, conn *Conn) error {
 	}
 	if _, err := conn.ExecContext(
 		ctx,
-		fmt.Sprintf("DROP VIEW IF EXISTS `%s`", a.spec.TableName()),
+		fmt.Sprintf("DROP VIEW IF EXISTS %q", a.spec.TableName()),
 	); err != nil {
 		return fmt.Errorf("failed to cleanup view %s: %w", a.spec.TableName(), err)
 	}
@@ -307,6 +307,7 @@ func (a *CreateTableFunctionStmtAction) Cleanup(ctx context.Context, conn *Conn)
 type DropStmtAction struct {
 	name           string
 	objectType     string
+	ifExists       bool
 	funcMap        map[string]*FunctionSpec
 	catalog        *Catalog
 	query          string
@@ -320,7 +321,16 @@ func (a *DropStmtAction) exec(ctx context.Context, conn *Conn) error {
 		if _, err := conn.ExecContext(ctx, a.formattedQuery, a.args...); err != nil {
 			return fmt.Errorf("failed to exec %s: %w", a.query, err)
 		}
-		spec := a.catalog.tableMap[a.name]
+		spec, specExists := a.catalog.tableMap[a.name]
+		if !specExists && a.ifExists {
+			// DROP ... IF EXISTS on a table/view that is not in the
+			// catalog: BigQuery semantics are silent success. The
+			// engine-level DROP above already carried IF EXISTS (the
+			// formatter preserves the modifier), so there is nothing
+			// to clean up — swallow the not-found instead of failing
+			// with "failed to delete table spec" (issue #8 part 2).
+			return nil
+		}
 		if err := a.catalog.DeleteTableSpec(ctx, conn, a.name); err != nil {
 			return fmt.Errorf("failed to delete table spec: %w", err)
 		}
@@ -435,7 +445,10 @@ func (a *QueryStmtAction) ExecContext(ctx context.Context, conn *Conn) (driver.R
 }
 
 func (a *QueryStmtAction) ExplainQueryPlan(ctx context.Context, conn *Conn) error {
-	rows, err := conn.QueryContext(ctx, fmt.Sprintf("EXPLAIN QUERY PLAN %s", a.formattedQuery), a.args...)
+	// DuckDB has no `EXPLAIN QUERY PLAN` (that was SQLite syntax); its
+	// `EXPLAIN <query>` returns (explain_key, explain_value) VARCHAR
+	// rows carrying the rendered physical plan.
+	rows, err := conn.QueryContext(ctx, fmt.Sprintf("EXPLAIN %s", a.formattedQuery), a.args...)
 	if err != nil {
 		return fmt.Errorf("failed to explain query plan: %w", err)
 	}
@@ -443,17 +456,12 @@ func (a *QueryStmtAction) ExplainQueryPlan(ctx context.Context, conn *Conn) erro
 		return fmt.Errorf("failed to explain query plan: %w", err)
 	}
 	defer rows.Close()
-	fmt.Println("|selectid|order|from|detail|")
-	fmt.Println("----------------------------")
 	for rows.Next() {
-		var (
-			selectID, order, from int
-			detail                string
-		)
-		if err := rows.Scan(&selectID, &order, &from, &detail); err != nil {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
 			return fmt.Errorf("failed to scan: %w", err)
 		}
-		fmt.Printf("|%d|%d|%d|%s|\n", selectID, order, from, detail)
+		fmt.Printf("%s\n%s\n", key, value)
 	}
 	return nil
 }
@@ -621,15 +629,22 @@ func (a *ExportDataStmtAction) export(ctx context.Context, conn *Conn) error {
 // nil) terminator surfaces both natural end-of-stream and an underlying
 // scan error (via rows.Err()).
 func sqlRowsSource(rows *sql.Rows, ncols int) exportdata.RowSource {
+	scanCols, scanColsErr := rows.Columns()
 	return func() ([]any, bool, error) {
+		if scanColsErr != nil {
+			return nil, false, fmt.Errorf("EXPORT DATA: read inner query columns: %w", scanColsErr)
+		}
+		if len(scanCols) < ncols {
+			return nil, false, fmt.Errorf("EXPORT DATA: inner query returned %d columns; want at least %d", len(scanCols), ncols)
+		}
 		if !rows.Next() {
 			if err := rows.Err(); err != nil {
 				return nil, false, fmt.Errorf("EXPORT DATA: iterate inner query: %w", err)
 			}
 			return nil, false, nil
 		}
-		raw := make([]any, ncols)
-		ptrs := make([]any, ncols)
+		raw := make([]any, len(scanCols))
+		ptrs := make([]any, len(scanCols))
 		for i := range raw {
 			ptrs[i] = &raw[i]
 		}
@@ -637,7 +652,7 @@ func sqlRowsSource(rows *sql.Rows, ncols int) exportdata.RowSource {
 			return nil, false, fmt.Errorf("EXPORT DATA: scan row: %w", err)
 		}
 		out := make([]any, ncols)
-		for i, v := range raw {
+		for i, v := range raw[:ncols] {
 			decoded, err := decodeExportValue(v)
 			if err != nil {
 				return nil, false, fmt.Errorf("EXPORT DATA: decode column %d: %w", i, err)

@@ -44,3 +44,13 @@ cases:
     expected:
       rows:
         - ['[]']
+  - desc: temporal values render as JSON strings
+    sql: |-
+      SELECT TO_JSON_STRING(STRUCT(
+        DATE '2024-02-29' AS d,
+        TIME '12:34:56' AS t,
+        DATETIME '2024-02-29 12:34:56' AS dt,
+        TIMESTAMP '2024-02-29 12:34:56+00' AS ts))
+    expected:
+      rows:
+        - ['{"d":"2024-02-29","t":"12:34:56","dt":"2024-02-29T12:34:56","ts":"2024-02-29T12:34:56Z"}']

@@ -55,3 +55,7 @@ go.work.sum
 # Internal working note tracking asks to the upstream go-googlesql
 # project — not part of the shipped source tree.
 docs/decisions/upstream-asks.md
+
+# Playground server default database (cmd/playground -db)
+playground.db
+playground.db.wal

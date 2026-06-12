@@ -11,10 +11,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	googlesql "github.com/goccy/go-googlesql"
 	"github.com/goccy/go-json"
 
+	jsonfn "github.com/goccy/googlesqlite/internal/functions/json"
 	"github.com/goccy/googlesqlite/internal/value"
 )
 
@@ -103,6 +105,47 @@ func literalFromValue(v value.Value) (string, error) {
 		return fmt.Sprint(b), nil
 	case *value.SafeValue:
 		return literalFromValue(vv.Value)
+	case value.DateValue:
+		// DuckDB retarget: emit a native typed literal so DuckDB binds
+		// the operand as DATE. GoogleSQL DATE is a civil calendar date,
+		// matching DuckDB DATE exactly.
+		return fmt.Sprintf("DATE '%s'", time.Time(vv).Format("2006-01-02")), nil
+	case value.TimeValue:
+		// GoogleSQL TIME is a civil time-of-day -> DuckDB TIME. Carry
+		// microsecond precision (GoogleSQL's resolution).
+		return fmt.Sprintf("TIME '%s'", time.Time(vv).Format("15:04:05.999999")), nil
+	case value.DatetimeValue:
+		// GoogleSQL DATETIME is a civil date+time with no zone -> DuckDB
+		// TIMESTAMP (zoneless). The base64 envelope would otherwise reach
+		// DuckDB as VARCHAR and miss every DATETIME_* overload.
+		return fmt.Sprintf("TIMESTAMP '%s'", time.Time(vv).Format("2006-01-02 15:04:05.999999")), nil
+	case value.TimestampValue:
+		// GoogleSQL TIMESTAMP is an absolute instant -> DuckDB
+		// TIMESTAMPTZ. Normalize to UTC and pin the +00 offset so the
+		// instant round-trips regardless of DuckDB's session TimeZone.
+		return fmt.Sprintf("TIMESTAMPTZ '%s+00'", time.Time(vv).UTC().Format("2006-01-02 15:04:05.999999")), nil
+	case *value.NumericValue:
+		// Native-storage migration: NUMERIC literals are typed native
+		// DECIMAL(38,9) literals, matching the stored column type, so
+		// operators / reducers / INSERTs bind the value directly.
+		// BIGNUMERIC stays on the value-layer envelope below (it
+		// exceeds DuckDB's 38-digit DECIMAL).
+		if !vv.IsBigNumeric {
+			s, err := vv.ToString()
+			if err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("CAST('%s' AS DECIMAL(38,9))", s), nil
+		}
+	case value.BytesValue:
+		// Native-storage migration: BYTES literals are DuckDB blob
+		// literals carrying the payload bytes ('\xNN...'::BLOB),
+		// matching the payload-byte BLOB cells of stored columns.
+		var sb strings.Builder
+		for _, b := range []byte(vv) {
+			fmt.Fprintf(&sb, "\\x%02X", b)
+		}
+		return fmt.Sprintf("'%s'::BLOB", sb.String()), nil
 	}
 	layout, err := value.ValueLayoutFromValue(v)
 	if err != nil {
@@ -112,7 +155,14 @@ func literalFromValue(v value.Value) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to encode value: %w", err)
 	}
-	return fmt.Sprintf("%q", base64.StdEncoding.EncodeToString(b)), nil
+	// DuckDB retarget: the value-layer envelope (base64 of the JSON
+	// layout) must be spliced into SQL as a single-quoted string
+	// literal. The predecessor used Go's %q, which double-quotes; DuckDB
+	// reads a double-quoted token as an identifier and raises a Binder
+	// Error ('Referenced column "<base64>" not found'). Emit a SQL
+	// string literal with embedded single quotes doubled instead.
+	encoded := base64.StdEncoding.EncodeToString(b)
+	return "'" + strings.ReplaceAll(encoded, "'", "''") + "'", nil
 }
 
 func literalFromGoogleSQLValue(v googlesql.Value) (string, error) {
@@ -121,6 +171,31 @@ func literalFromGoogleSQLValue(v googlesql.Value) (string, error) {
 		return "", err
 	}
 	return literalFromValue(value)
+}
+
+// envelopeLiteralFromValue renders v as the value-layer base64 envelope
+// SQL literal unconditionally, bypassing literalFromValue's native-typed
+// shortcuts for temporal kinds. The RANGE family needs its DATE /
+// DATETIME / TIMESTAMP bounds to arrive at the googlesqlite_range UDF in
+// the envelope form (which carries the element-type header the
+// constructor reads), not as a native DuckDB DATE / TIMESTAMP literal
+// that the VARCHAR-typed UDF cannot bind and that erases the DATE vs
+// midnight-TIMESTAMP distinction once duckdb-go maps both to a bare Go
+// time.Time.
+func envelopeLiteralFromValue(v value.Value) (string, error) {
+	if v == nil {
+		return "null", nil
+	}
+	layout, err := value.ValueLayoutFromValue(v)
+	if err != nil {
+		return "", err
+	}
+	b, err := json.Marshal(layout)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode value: %w", err)
+	}
+	encoded := base64.StdEncoding.EncodeToString(b)
+	return "'" + strings.ReplaceAll(encoded, "'", "''") + "'", nil
 }
 
 func valueFromGoogleSQLValue(v googlesql.Value) (value.Value, error) {
@@ -265,7 +340,11 @@ func bytesValueFromLiteral(lit string) value.BytesValue {
 }
 
 func dateValueFromLiteral(days int64) value.DateValue {
-	t := time.Unix(int64(time.Duration(days)*24*(time.Hour/time.Second)), 0)
+	// time.Unix returns a local-zone time.Time; a DATE is a civil value,
+	// so it must stay at UTC midnight. Formatting a local-zone value in
+	// any zone west of UTC rendered the previous day (DATE "2024-03-22"
+	// stored and displayed as "2024-03-21" in America/New_York).
+	t := time.Unix(int64(time.Duration(days)*24*(time.Hour/time.Second)), 0).UTC()
 	return value.DateValue(t)
 }
 
@@ -470,7 +549,22 @@ func CastValue(t googlesql.Googlesql_TypeNode, v value.Value) (value.Value, erro
 		return v, nil
 	}
 	// Googlesql_TypeNode carries Kind directly, no upcast needed.
-	switch m1(t.Kind()) {
+	return castValueWithKind(m1(t.Kind()), t, v)
+}
+
+// castValueWithKind is CastValue with the type's Kind already resolved.
+// Type.Kind() is a wasm round-trip into the ZetaSQL analyzer module, so
+// per-exec hot paths (prepared-statement arg encoding) resolve the kind
+// once at prepare time and call this variant; CastValue keeps the
+// resolve-on-every-call behavior for the remaining callers.
+func castValueWithKind(kind googlesql.TypeKind, t googlesql.Googlesql_TypeNode, v value.Value) (value.Value, error) {
+	if v == nil {
+		return nil, nil
+	}
+	if t == nil {
+		return v, nil
+	}
+	switch kind {
 	case googlesql.TypeKindTypeInt32, googlesql.TypeKindTypeInt64, googlesql.TypeKindTypeUint32, googlesql.TypeKindTypeUint64:
 		i64, err := v.ToInt64()
 		if err != nil {
@@ -490,6 +584,19 @@ func CastValue(t googlesql.Googlesql_TypeNode, v value.Value) (value.Value, erro
 		}
 		return value.FloatValue(f64), nil
 	case googlesql.TypeKindTypeString, googlesql.TypeKindTypeEnum:
+		// BYTES -> STRING follows BigQuery CAST semantics: the payload
+		// must be valid UTF-8 and decodes to that text (issue #9). The
+		// generic ToString() on BytesValue is the base64 rendering (the
+		// BigQuery JSON-API wire form used when a BYTES value itself is
+		// displayed), which is NOT what CAST returns.
+		if kind == googlesql.TypeKindTypeString {
+			if bv, ok := v.(value.BytesValue); ok {
+				if !utf8.Valid([]byte(bv)) {
+					return nil, fmt.Errorf("CAST(BYTES AS STRING): invalid UTF-8 payload")
+				}
+				return value.StringValue(string(bv)), nil
+			}
+		}
 		s, err := v.ToString()
 		if err != nil {
 			return nil, err
@@ -650,7 +757,11 @@ func CastValue(t googlesql.Googlesql_TypeNode, v value.Value) (value.Value, erro
 		}
 		return &value.NumericValue{Rat: r, IsBigNumeric: true}, nil
 	case googlesql.TypeKindTypeJson:
-		j, err := v.ToJSON()
+		// Use the shared JSON-literal renderer so temporal values
+		// (including ones nested in arrays/structs) become quoted JSON
+		// strings; bare ToJSON leaves them as invalid tokens like
+		// 2024-02-29. Non-temporal values keep their ToJSON behavior.
+		j, err := jsonfn.ToJSONLiteral(v)
 		if err != nil {
 			return nil, err
 		}
@@ -739,13 +850,24 @@ func encodeNamedValue(v driver.NamedValue, param *googlesql.ResolvedParameter) (
 	}, nil
 }
 
-// encodeValueAgainstParamType produces the canonical googlesqlite
-// layout for v under the analyzer-declared param type. The value
-// arriving here may already be a base64-encoded layout (because
-// Conn.CheckNamedValue encodes by Go type before we know the
-// declared param type), so first try to decode and re-encode against
-// the declared type. If decoding fails, treat v as a raw Go value
-// and run the standard EncodeGoValue path.
+// encodeValueAgainstParamType produces the over-the-wire form for v
+// under the analyzer-declared param type. The value arriving here may
+// already be a base64-encoded layout (because Conn.CheckNamedValue
+// encodes by Go type before we know the declared param type), so first
+// try to decode and re-encode against the declared type. If decoding
+// fails, treat v as a raw Go value and run the standard cast path.
+//
+// DuckDB retarget: the bcf0852 storage seam made DATE / TIME / DATETIME
+// / TIMESTAMP / JSON columns native-typed, and the expression lowering
+// emits native temporal literals (DATE '...', TIMESTAMPTZ '...') for
+// inline values. A bound parameter must arrive in the same native form
+// — the legacy base64 envelope fails DuckDB's VARCHAR->DATE/JSON cast
+// at bind time ("invalid date field format: eyJoZWFkZXIi...").
+// encodeParamValue mirrors literalFromValue's native shortcuts for
+// exactly those kinds (plus NUMERIC / BYTES since the native-storage
+// migration); everything else (STRING, BIGNUMERIC, ARRAY, STRUCT, ...)
+// keeps the envelope the TEXT-backed columns and googlesqlite_* UDFs
+// store and decode.
 func encodeValueAgainstParamType(v any, t googlesql.Googlesql_TypeNode) (any, error) {
 	if v == nil {
 		return nil, nil
@@ -754,9 +876,109 @@ func encodeValueAgainstParamType(v any, t googlesql.Googlesql_TypeNode) (any, er
 		if decoded, err := DecodeValue(s); err == nil && decoded != nil {
 			cast, err := CastValue(t, decoded)
 			if err == nil && cast != nil {
-				return EncodeValue(cast)
+				return encodeParamValue(cast)
 			}
 		}
 	}
-	return encodeGoValue(t, v)
+	val, err := ValueFromGoValue(v)
+	if err != nil {
+		return nil, err
+	}
+	casted, err := CastValue(t, val)
+	if err != nil {
+		return nil, err
+	}
+	return encodeParamValue(casted)
+}
+
+// encodeParamValue renders a declared-type-cast parameter value in the
+// form the DuckDB storage layer expects: temporal kinds as the plain
+// text DuckDB casts into its native DATE / TIME / TIMESTAMP /
+// TIMESTAMPTZ columns (the same calendar/instant readings
+// literalFromValue pins for inline literals), JSON as the raw JSON
+// text a native JSON column accepts, NUMERIC as plain decimal text
+// (cast into the native DECIMAL(38,9)), BYTES as the raw payload
+// []byte (a native BLOB), and every other kind through EncodeValue
+// (bare Go scalars for INT64 / FLOAT64 / BOOL, the base64 value-layer
+// envelope for STRING / BIGNUMERIC / ARRAY / STRUCT / ...).
+func encodeParamValue(v value.Value) (any, error) {
+	switch vv := v.(type) {
+	case *value.SafeValue:
+		return encodeParamValue(vv.Value)
+	case value.DateValue:
+		return time.Time(vv).Format("2006-01-02"), nil
+	case value.TimeValue:
+		return time.Time(vv).Format("15:04:05.999999"), nil
+	case value.DatetimeValue:
+		return time.Time(vv).Format("2006-01-02 15:04:05.999999"), nil
+	case value.TimestampValue:
+		// Normalize to UTC and pin the +00 offset so the instant
+		// round-trips regardless of DuckDB's session TimeZone.
+		return time.Time(vv).UTC().Format("2006-01-02 15:04:05.999999+00"), nil
+	case value.JsonValue:
+		return string(vv), nil
+	case *value.NumericValue:
+		// Native-storage migration: a NUMERIC parameter binds as plain
+		// decimal text, which DuckDB casts into the native
+		// DECIMAL(38,9) storage / operand type (the same value reading
+		// literalFromValue pins for inline literals). BIGNUMERIC keeps
+		// the envelope (TEXT storage).
+		if !vv.IsBigNumeric {
+			return vv.ToString()
+		}
+	case value.BytesValue:
+		// Native-storage migration: a BYTES parameter binds as the raw
+		// payload []byte, which the driver delivers as a native BLOB —
+		// matching the payload-byte cells of stored BYTES columns.
+		return []byte(vv), nil
+	}
+	return EncodeValue(v)
+}
+
+// encodeValueAgainstParamTypeWithKind is encodeValueAgainstParamType with
+// the param type's Kind pre-resolved (see castValueWithKind). It also
+// short-circuits the scalar identity cases — an int64/float64/bool Go
+// value bound to a matching scalar param kind round-trips unchanged
+// through ValueFromGoValue → CastValue → EncodeValue, so the conversion
+// is skipped entirely. hasKind is false when the param's Type() was
+// unavailable at prepare time; the un-typed path then matches the
+// original behavior (CastValue passthrough on nil type).
+func encodeValueAgainstParamTypeWithKind(v any, t googlesql.Googlesql_TypeNode, kind googlesql.TypeKind, hasKind bool) (any, error) {
+	if v == nil {
+		return nil, nil
+	}
+	if !hasKind || t == nil {
+		return encodeValueAgainstParamType(v, nil)
+	}
+	switch kind {
+	case googlesql.TypeKindTypeInt32, googlesql.TypeKindTypeInt64, googlesql.TypeKindTypeUint32, googlesql.TypeKindTypeUint64:
+		if iv, ok := v.(int64); ok {
+			return iv, nil
+		}
+	case googlesql.TypeKindTypeFloat, googlesql.TypeKindTypeDouble:
+		if fv, ok := v.(float64); ok {
+			return fv, nil
+		}
+	case googlesql.TypeKindTypeBool:
+		if bv, ok := v.(bool); ok {
+			return bv, nil
+		}
+	}
+	if s, ok := v.(string); ok {
+		if decoded, err := DecodeValue(s); err == nil && decoded != nil {
+			cast, err := castValueWithKind(kind, t, decoded)
+			if err == nil && cast != nil {
+				return encodeParamValue(cast)
+			}
+		}
+	}
+	val, err := ValueFromGoValue(v)
+	if err != nil {
+		return nil, err
+	}
+	casted, err := castValueWithKind(kind, t, val)
+	if err != nil {
+		return nil, err
+	}
+	return encodeParamValue(casted)
 }

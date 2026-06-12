@@ -49,6 +49,16 @@ func ChangedCatalogFromResult(result sql.Result) (*ChangedCatalog, error) {
 	return googlesqliteResult.ChangedCatalog(), nil
 }
 
+// SetForceLegacyStorageForTest stamps tables created while enabled with
+// the LEGACY storage version (pre-native-storage cell conventions:
+// NUMERIC TEXT envelopes, BYTES envelope-ASCII blobs), so the
+// legacy-database compat test can build a faithful pre-migration
+// fixture through the current binary. Process-global; tests using it
+// must not run in parallel with other CREATE TABLE traffic.
+func SetForceLegacyStorageForTest(legacy bool) {
+	internal.SetForceLegacyStorageForTest(legacy)
+}
+
 // SetMaterializeCTE controls whether CTEs referenced more than once
 // are emitted with the SQLite MATERIALIZED hint.
 func (c *Conn) SetMaterializeCTE(enabled bool) { c.materializeCTE = enabled }
@@ -83,4 +93,57 @@ func (c *Conn) RegisterProto(fileDescriptorProtoBytes []byte) error {
 func (c *Conn) RegisterProtoMessage(fullName string) error {
 	_, err := c.catalog.RegisterProtoMessage(fullName)
 	return err
+}
+
+// RawEngineExec runs SQL directly on the inner engine connection,
+// bypassing the analyzer/formatter and the catalog. Test-only: used to
+// drive the engine into states the GoogleSQL surface cannot reach
+// (e.g. dropping an engine table behind the catalog's back to force a
+// deterministic DuckDB prepare failure).
+func (c *Conn) RawEngineExec(ctx context.Context, query string) error {
+	_, err := c.conn.ExecContext(ctx, query)
+	return err
+}
+
+// RawEngineQuery runs SQL directly on the inner engine connection and
+// returns every row formatted as strings ("<NULL>" for SQL NULL).
+// Test-only: the BulkInsert storage-parity tests read RAW stored cell
+// representations (typeof(c), CAST(c AS VARCHAR), hex(c)) to assert the
+// bulk path stores byte-identical values to the per-row INSERT path.
+func (c *Conn) RawEngineQuery(ctx context.Context, query string) ([][]string, error) {
+	rows, err := c.conn.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	var out [][]string
+	for rows.Next() {
+		cells := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range cells {
+			ptrs[i] = &cells[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		row := make([]string, len(cols))
+		for i, cv := range cells {
+			switch v := cv.(type) {
+			case nil:
+				row[i] = "<NULL>"
+			case []byte:
+				row[i] = string(v)
+			case time.Time:
+				row[i] = v.Format(time.RFC3339Nano)
+			default:
+				row[i] = fmt.Sprintf("%v", v)
+			}
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
 }

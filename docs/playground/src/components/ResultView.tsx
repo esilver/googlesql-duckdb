@@ -42,6 +42,7 @@ function ResultBlock({
   result: QueryResult
   showDebug: boolean
 }) {
+  const translatedQuery = result.duckdbQuery ?? result.sqliteQuery
   return (
     <Paper variant="outlined" sx={{ p: 1.5 }}>
       <Typography
@@ -51,7 +52,7 @@ function ResultBlock({
       >
         {result.statement}
       </Typography>
-      {showDebug && result.sqliteQuery && (
+      {showDebug && translatedQuery && (
         <Typography
           variant="caption"
           component="pre"
@@ -63,7 +64,7 @@ function ResultBlock({
             fontFamily: 'monospace',
           }}
         >
-          {`-- sqlite: ${result.sqliteQuery}`}
+          {`-- duckdb: ${translatedQuery}`}
         </Typography>
       )}
       {result.error ? (

@@ -33,6 +33,16 @@ var (
 // driver.Value types. Numeric and bool primitives stay raw because
 // EncodeValue passes them through unchanged.
 func CheckNamedValue(value *driver.NamedValue) error {
+	// Scalar fast path: nil/int64/float64/bool round-trip unchanged
+	// through ValueFromGoValue → EncodeValue (IntValue/FloatValue/
+	// BoolValue encode back to the same Go primitive), so skip the
+	// reflection walk and re-boxing for them. Strings are NOT identity
+	// (they encode into the base64 layout envelope) and must take the
+	// full path.
+	switch value.Value.(type) {
+	case nil, int64, float64, bool:
+		return nil
+	}
 	val, err := ValueFromGoValue(value.Value)
 	if err != nil {
 		return err
@@ -55,6 +65,98 @@ func encodeOrPassArgs(values []any, params []*googlesql.ResolvedParameter) ([]an
 		return out, nil
 	}
 	return EncodeGoValues(values, params)
+}
+
+// typeKindCache pins the wasm-resolved Kind of a googlesql type node so
+// prepared statements pay the analyzer round-trip once at prepare time
+// instead of on every Exec/Query. hasKind is false when the type was nil
+// or its Kind() call failed; consumers then fall back to the un-typed
+// behavior the un-cached path would have produced.
+type typeKindCache struct {
+	kind    googlesql.TypeKind
+	hasKind bool
+}
+
+// cacheTypeKinds resolves Kind once per type node. A nil node yields a
+// hasKind=false slot.
+func cacheTypeKinds(types []googlesql.Googlesql_TypeNode) []typeKindCache {
+	if len(types) == 0 {
+		return nil
+	}
+	out := make([]typeKindCache, len(types))
+	for i, t := range types {
+		if t == nil {
+			continue
+		}
+		kind, err := t.Kind()
+		if err != nil {
+			continue
+		}
+		out[i] = typeKindCache{kind: kind, hasKind: true}
+	}
+	return out
+}
+
+// paramTypeCache pins a resolved parameter's type node and kind, both of
+// which are wasm round-trips (ResolvedParameter.Type() and Type.Kind())
+// that EncodeGoValues would otherwise re-issue per exec.
+type paramTypeCache struct {
+	typ googlesql.Googlesql_TypeNode
+	typeKindCache
+}
+
+// cacheParamTypes resolves each parameter's Type and Kind once, at
+// statement-prepare time. A failed Type() lookup leaves typ nil, which
+// reproduces EncodeGoValues' m1(param.Type()) == nil behavior.
+func cacheParamTypes(params []*googlesql.ResolvedParameter) []paramTypeCache {
+	if len(params) == 0 {
+		return nil
+	}
+	out := make([]paramTypeCache, len(params))
+	for i, p := range params {
+		if p == nil {
+			continue
+		}
+		t, err := p.Type()
+		if err != nil || t == nil {
+			continue
+		}
+		out[i].typ = t
+		kind, err := t.Kind()
+		if err != nil {
+			continue
+		}
+		out[i].typeKindCache = typeKindCache{kind: kind, hasKind: true}
+	}
+	return out
+}
+
+// encodeOrPassArgsCached is encodeOrPassArgs for statements that cached
+// their parameter types at prepare time. Behavior matches
+// EncodeGoValues(values, params) exactly, minus the per-exec wasm
+// round-trips.
+func encodeOrPassArgsCached(values []any, params []*googlesql.ResolvedParameter, cache []paramTypeCache) ([]any, error) {
+	if len(params) == 0 && len(values) > 0 {
+		out := make([]any, len(values))
+		copy(out, values)
+		return out, nil
+	}
+	if len(values) != len(params) {
+		return nil, fmt.Errorf(
+			"failed to match args values num (%d) and params num (%d)",
+			len(values), len(params),
+		)
+	}
+	ret := make([]any, 0, len(values))
+	for idx, vv := range values {
+		pc := cache[idx]
+		encoded, err := encodeValueAgainstParamTypeWithKind(vv, pc.typ, pc.kind, pc.hasKind)
+		if err != nil {
+			return nil, err
+		}
+		ret = append(ret, encoded)
+	}
+	return ret, nil
 }
 
 type CreateTableStmt struct {
@@ -210,7 +312,9 @@ func newCreateTableFunctionStmt(conn *Conn, catalog *Catalog, spec *TVFSpec) *Cr
 type DMLStmt struct {
 	stmt           *sql.Stmt
 	args           []*googlesql.ResolvedParameter
+	argTypes       []paramTypeCache
 	colTypes       []googlesql.Googlesql_TypeNode
+	colKinds       []typeKindCache
 	formattedQuery string
 }
 
@@ -218,7 +322,9 @@ func newDMLStmt(stmt *sql.Stmt, args []*googlesql.ResolvedParameter, colTypes []
 	return &DMLStmt{
 		stmt:           stmt,
 		args:           args,
+		argTypes:       cacheParamTypes(args),
 		colTypes:       colTypes,
+		colKinds:       cacheTypeKinds(colTypes),
 		formattedQuery: formattedQuery,
 	}
 }
@@ -254,9 +360,16 @@ func (s *DMLStmt) Exec(args []driver.Value) (driver.Result, error) {
 		if i >= len(s.colTypes) || s.colTypes[i] == nil {
 			continue
 		}
-		values[i] = reshapeArgToType(v, s.colTypes[i])
+		// colKinds is built from colTypes, so the index is in range and
+		// hasKind mirrors the Kind() error reshapeArgToType would have
+		// swallowed (kind 0 / unknown is not a reshape candidate).
+		ck := s.colKinds[i]
+		if !ck.hasKind {
+			continue
+		}
+		values[i] = reshapeArgToTypeWithKind(v, s.colTypes[i], ck.kind)
 	}
-	newArgs, err := encodeOrPassArgs(values, s.args)
+	newArgs, err := encodeOrPassArgsCached(values, s.args, s.argTypes)
 	if err != nil {
 		return nil, err
 	}
@@ -269,7 +382,7 @@ func (s *DMLStmt) Exec(args []driver.Value) (driver.Result, error) {
 			err,
 		)
 	}
-	return result, nil
+	return &execResult{result: result}, nil
 }
 
 func (s *DMLStmt) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
@@ -287,6 +400,7 @@ func (s *DMLStmt) QueryContext(ctx context.Context, query string, args []driver.
 type QueryStmt struct {
 	stmt           *sql.Stmt
 	args           []*googlesql.ResolvedParameter
+	argTypes       []paramTypeCache
 	formattedQuery string
 	outputColumns  []*ColumnSpec
 }
@@ -295,6 +409,7 @@ func newQueryStmt(stmt *sql.Stmt, args []*googlesql.ResolvedParameter, formatted
 	return &QueryStmt{
 		stmt:           stmt,
 		args:           args,
+		argTypes:       cacheParamTypes(args),
 		formattedQuery: formattedQuery,
 		outputColumns:  outputColumns,
 	}
@@ -329,7 +444,7 @@ func (s *QueryStmt) Query(args []driver.Value) (driver.Rows, error) {
 	for _, arg := range args {
 		values = append(values, arg)
 	}
-	newArgs, err := encodeOrPassArgs(values, s.args)
+	newArgs, err := encodeOrPassArgsCached(values, s.args, s.argTypes)
 	if err != nil {
 		return nil, err
 	}

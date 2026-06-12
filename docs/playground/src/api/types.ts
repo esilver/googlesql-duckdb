@@ -4,7 +4,9 @@
 // `exec` call (see cmd/googlesqlite/main_js.go: entryToJS).
 export interface QueryResult {
   statement: string
-  sqliteQuery: string
+  duckdbQuery?: string
+  // Legacy alias emitted by older playground builds and history exports.
+  sqliteQuery?: string
   isQuery: boolean
   columns: string[]
   rows: string[][]

@@ -8,7 +8,11 @@ import (
 )
 
 func TO_JSON(v value.Value, stringifyWideNumbers bool) (value.Value, error) {
-	s, err := v.ToJSON()
+	// Share TO_JSON_STRING's literal rendering so temporal values
+	// (DATE/DATETIME/TIME/TIMESTAMP, also nested in arrays/structs)
+	// are quoted JSON strings; bare v.ToJSON() emitted invalid JSON
+	// tokens like 2024-02-29.
+	s, err := ToJSONLiteral(v)
 	if err != nil {
 		return nil, err
 	}

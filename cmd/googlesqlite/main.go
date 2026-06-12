@@ -1,7 +1,7 @@
 //go:build !js
 
 // Command googlesqlite is an interactive console for running
-// GoogleSQL queries against the SQLite-backed googlesqlite engine,
+// GoogleSQL queries against the pure-Go DuckDB-backed googlesqlite engine,
 // in the spirit of the sqlite3 and spanner-cli REPLs.
 //
 // It can also run SQL scripts: pass --file to execute a file before
@@ -56,7 +56,7 @@ func realMain() int {
 	)
 	flag.StringVar(&dsnFlag, "dsn", "", "data source name (overrides the positional database argument)")
 	flag.Var(&files, "file", "run statements from a SQL file before the REPL starts (repeatable)")
-	flag.BoolVar(&debug, "debug", false, "show the translated SQLite query for each statement")
+	flag.BoolVar(&debug, "debug", false, "show the translated DuckDB query for each statement")
 	flag.BoolVar(&noColor, "no-color", false, "disable coloured output")
 	flag.StringVar(&histFile, "history", defaultHistoryFile(), "REPL history file")
 	flag.BoolVar(&contOnErr, "continue-on-error", false, "keep running a script after a statement fails")

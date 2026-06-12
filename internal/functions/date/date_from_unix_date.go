@@ -8,7 +8,11 @@ import (
 )
 
 func DATE_FROM_UNIX_DATE(unixdate int64) (value.Value, error) {
-	t := time.Unix(int64(time.Duration(unixdate)*24*time.Hour/time.Second), 0)
+	// A unix date is a day count from the epoch, independent of any
+	// time zone. Build the date in UTC: time.Unix renders in the local
+	// zone, which shifts the calendar day for any process west of UTC
+	// (epoch day 0 became 1969-12-31 in EST).
+	t := time.Unix(int64(time.Duration(unixdate)*24*time.Hour/time.Second), 0).UTC()
 	return value.DateValue(t), nil
 }
 

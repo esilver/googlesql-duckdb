@@ -17,11 +17,13 @@ type (
 	systemVarsKey                   struct{}
 	connKey                         struct{}
 	cteRefCountsKey                 struct{}
+	cteSetOperationOrdinalKey       struct{}
 	analyticOrderColumnNamesKey     struct{}
 	analyticPartitionColumnNamesKey struct{}
 	analyticInputScanKey            struct{}
 	analyticEmulationFlagKey        struct{}
 	arraySubqueryColumnNameKey      struct{}
+	arrayAggTopNRewriteKey          struct{}
 	currentTimeKey                  struct{}
 	tableNameToColumnListMapKey     struct{}
 	useColumnIDKey                  struct{}
@@ -154,6 +156,18 @@ func cteRefCounts(ctx context.Context) map[string]int {
 	return value.(map[string]int)
 }
 
+func withCteSetOperationOrdinals(ctx context.Context, m map[string]bool) context.Context {
+	return context.WithValue(ctx, cteSetOperationOrdinalKey{}, m)
+}
+
+func cteSetOperationOrdinals(ctx context.Context) map[string]bool {
+	value := ctx.Value(cteSetOperationOrdinalKey{})
+	if value == nil {
+		return nil
+	}
+	return value.(map[string]bool)
+}
+
 // nullOrderMode represents the OVER (ORDER BY ... NULLS FIRST/LAST)
 // clause as captured from the resolved AST. The default zero value
 // "unspecified" leaves null placement to the SQLite default for the
@@ -170,6 +184,30 @@ type analyticOrderBy struct {
 	column    string
 	isAsc     bool
 	nullOrder nullOrderMode
+	// sortExpr is the SQL expression to use when this entry appears as a
+	// native ORDER BY sort key (window OVER clause or the analytic scan's
+	// trailing output ORDER BY). For value-layer STRING / UUID columns the
+	// base64 envelope text does NOT order like the payload, so sortExpr
+	// carries the googlesqlite_plain_string unwrap; for every other kind
+	// it equals column. The emulation argument path keeps using column
+	// (it needs the envelope form for value-layer decoding).
+	sortExpr string
+	// fromPartition marks entries that were derived from the window's
+	// PARTITION BY keys rather than its ORDER BY items. The native OVER
+	// clause must not repeat partition keys inside ORDER BY: they are
+	// constant per partition (semantically a no-op) and a RANGE frame
+	// with an offset requires exactly one ORDER BY key, which a leading
+	// partition key would break.
+	fromPartition bool
+}
+
+// sortSQL returns the expression to order by for this entry, preferring
+// the native sortExpr when set.
+func (a *analyticOrderBy) sortSQL() string {
+	if a.sortExpr != "" {
+		return a.sortExpr
+	}
+	return a.column
 }
 
 type analyticOrderColumnNames struct {
@@ -243,6 +281,30 @@ func arraySubqueryColumnNameFromContext(ctx context.Context) *arraySubqueryColum
 		return nil
 	}
 	return value.(*arraySubqueryColumnNames)
+}
+
+func withArrayAggTopNRewrite(ctx context.Context, plans map[string]arrayAggTopNRewritePlan) context.Context {
+	if len(plans) == 0 {
+		return ctx
+	}
+	merged := map[string]arrayAggTopNRewritePlan{}
+	if existing := arrayAggTopNRewriteFromContext(ctx); existing != nil {
+		for k, v := range existing {
+			merged[k] = v
+		}
+	}
+	for k, v := range plans {
+		merged[k] = v
+	}
+	return context.WithValue(ctx, arrayAggTopNRewriteKey{}, merged)
+}
+
+func arrayAggTopNRewriteFromContext(ctx context.Context) map[string]arrayAggTopNRewritePlan {
+	value := ctx.Value(arrayAggTopNRewriteKey{})
+	if value == nil {
+		return nil
+	}
+	return value.(map[string]arrayAggTopNRewritePlan)
 }
 
 func withUseColumnID(ctx context.Context) context.Context {

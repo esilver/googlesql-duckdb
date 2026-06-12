@@ -11,7 +11,10 @@ import (
 // HistoryEntry is one executed statement and its outcome, in a form
 // that is convenient to persist (browser storage) and to export.
 type HistoryEntry struct {
-	Statement    string     `json:"statement"`
+	Statement   string `json:"statement"`
+	DuckDBQuery string `json:"duckdbQuery,omitempty"`
+	// SQLiteQuery is a legacy history/export field kept so histories
+	// produced by older SQLite-backed playground builds still load.
 	SQLiteQuery  string     `json:"sqliteQuery,omitempty"`
 	IsQuery      bool       `json:"isQuery"`
 	Columns      []string   `json:"columns,omitempty"`
@@ -27,7 +30,7 @@ type HistoryEntry struct {
 func NewHistoryEntry(res Result) HistoryEntry {
 	e := HistoryEntry{
 		Statement:    res.Statement,
-		SQLiteQuery:  res.SQLiteQuery,
+		DuckDBQuery:  res.SQLiteQuery,
 		IsQuery:      res.IsQuery,
 		Columns:      res.Columns,
 		RowsAffected: res.RowsAffected,
@@ -48,6 +51,16 @@ func NewHistoryEntry(res Result) HistoryEntry {
 		}
 	}
 	return e
+}
+
+// TranslatedQuery returns the backend SQL attached to the entry. New
+// histories store it as duckdbQuery; sqliteQuery is accepted as a
+// legacy alias for histories exported before the DuckDB retarget.
+func (e HistoryEntry) TranslatedQuery() string {
+	if e.DuckDBQuery != "" {
+		return e.DuckDBQuery
+	}
+	return e.SQLiteQuery
 }
 
 // History is an append-only log of executed statements. It is the

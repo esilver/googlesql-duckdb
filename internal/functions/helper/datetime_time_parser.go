@@ -1031,7 +1031,10 @@ func unixtimeSecondsParser(text []rune, t *time.Time) (int, error) {
 	if u < 0 {
 		return 0, fmt.Errorf("invalid unixtime number %d", u)
 	}
-	*t = time.Unix(u, 0)
+	// Unix seconds name an absolute instant; render it in UTC so the
+	// parsed calendar fields are zone-independent (time.Unix returns a
+	// local-zone time, which shifts the day for processes west of UTC).
+	*t = time.Unix(u, 0).UTC()
 	return unixtimeLen, nil
 }
 
@@ -1278,6 +1281,10 @@ func FormatTime(formatStr string, t *time.Time, typ TimeFormatType) (string, err
 				}
 				ret = append(ret, formatted...)
 				i += formatProgress
+				continue
+			}
+			if c == 't' && typ == FormatTypeTimestamp {
+				ret = append(ret, []rune(t.UTC().Format("2006-01-02 15:04:05")+"+00")...)
 				continue
 			}
 			info := formatPatternMap[c]

@@ -6,3 +6,8 @@ cases:
     expected:
       rows:
         - [13]
+  - desc: EXTRACT(WEEK(MONDAY) before first Monday returns week zero
+    sql: SELECT EXTRACT(WEEK(MONDAY) FROM DATE '2026-01-01')
+    expected:
+      rows:
+        - [0]

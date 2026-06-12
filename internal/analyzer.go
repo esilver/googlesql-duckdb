@@ -1407,6 +1407,8 @@ var sqlRewritePipelinePreScriptVars = []sqlRewriteStep{
 // sqlRewritePipelinePostScriptVars holds the uniform-signature rewrites
 // that run after applyScriptVariables. ORDER IS LOAD-BEARING.
 var sqlRewritePipelinePostScriptVars = []sqlRewriteStep{
+	{"timestampDiffWeekRewrite", applyTimestampDiffWeekRewrite},
+	{"extractAtTimeZoneRewrite", applyExtractAtTimeZoneRewrite},
 	{"gapFillRewrite", applyGapFillRewrite},
 	{"rangeSessionizeRewrite", applyRangeSessionizeRewrite},
 	{"iferrorTypePropagation", applyIferrorTypePropagation},
@@ -1510,6 +1512,15 @@ func (a *Analyzer) Analyze(ctx context.Context, conn *Conn, query string, args [
 	// AnalyzerOptions. See the doc on sharedAnalyzerOpt above.
 	wasmAnalyzeMu.Lock()
 	defer wasmAnalyzeMu.Unlock()
+	// Analyzer fairness (#18 follow-up): a caller whose context died while
+	// queued for this mutex must not run catalog sync + parse + analysis —
+	// those wasm spans are un-interruptible, and under a cancellation storm
+	// (a client in a tight timeout-retry loop, every query's text unique so
+	// the analysis cache never hits) the doomed analyses monopolize the
+	// analyzer and starve live callers.
+	if cerr := ctx.Err(); cerr != nil {
+		return nil, cerr
+	}
 	if err := a.catalog.Sync(ctx, conn); err != nil {
 		return nil, fmt.Errorf("failed to sync catalog: %w", err)
 	}
@@ -1522,10 +1533,6 @@ func (a *Analyzer) Analyze(ctx context.Context, conn *Conn, query string, args [
 	query = applySQLRewritePipeline(query, sqlRewritePipelinePreScriptVars)
 	query = applyScriptVariables(ctx, query, conn)
 	query = applySQLRewritePipeline(query, sqlRewritePipelinePostScriptVars)
-	parsed, err := a.parseScript(query)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse statements: %w", err)
-	}
 	funcMap := map[string]*FunctionSpec{}
 	for _, spec := range a.catalog.getFunctions(a.namePath) {
 		funcMap[spec.FuncName()] = spec
@@ -1533,6 +1540,30 @@ func (a *Analyzer) Analyze(ctx context.Context, conn *Conn, query string, args [
 	tvfMap := map[string]*TVFSpec{}
 	for _, spec := range a.catalog.getTVFs(a.namePath) {
 		tvfMap[spec.TVFName()] = spec
+	}
+	// Analysis cache (see analysis_cache.go). System variables feed the
+	// formatter through context, so connections carrying them bypass
+	// the cache; everything else keys on the post-rewrite text plus
+	// the parameter shape and catalog generation.
+	cacheEnabled := len(conn.systemVars) == 0
+	var (
+		cacheKey  string
+		lookupGen uint64
+	)
+	if cacheEnabled {
+		cacheKey = analysisCacheKey(a.namePath, query, args, conn.MaterializeCTE())
+		lookupGen = a.catalog.analysisGeneration()
+		if entry := a.catalog.lookupAnalysis(cacheKey, lookupGen); entry != nil {
+			entryArgs := args
+			cachedQuery := query
+			return []stmtActionFunc{func() (StmtAction, error) {
+				return entry.buildAction(a, cachedQuery, entryArgs)
+			}}, nil
+		}
+	}
+	parsed, err := a.parseScript(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse statements: %w", err)
 	}
 	actionFuncs := make([]stmtActionFunc, 0, len(parsed.stmts))
 	stmtArgsList, err := a.sliceArgsPerStatement(parsed, args)
@@ -1575,6 +1606,9 @@ func (a *Analyzer) Analyze(ctx context.Context, conn *Conn, query string, args [
 			action, err := a.newStmtAction(ctx, query, stmtArgs, stmtNode)
 			if err != nil {
 				return nil, err
+			}
+			if cacheEnabled && len(parsed.stmts) == 1 {
+				a.maybeStoreAnalysis(cacheKey, lookupGen, stmt, mode, action)
 			}
 			return action, nil
 		})
@@ -2058,10 +2092,12 @@ func (a *Analyzer) newDropStmtAction(ctx context.Context, query string, args []d
 		return nil, err
 	}
 	objectType, _ := node.ObjectType()
+	ifExists, _ := node.IsIfExists()
 	name := a.namePath.format2(node.NamePath())
 	return &DropStmtAction{
 		name:           name,
 		objectType:     objectType,
+		ifExists:       ifExists,
 		funcMap:        funcMapFromContext(ctx),
 		catalog:        a.catalog,
 		query:          query,
@@ -2097,6 +2133,9 @@ func (a *Analyzer) newDMLStmtAction(ctx context.Context, query string, args []dr
 	}
 	if formattedQuery == "" {
 		return nil, fmt.Errorf("failed to format query %s", query)
+	}
+	if os.Getenv("GSX_DUMP_SQL") != "" {
+		fmt.Fprintf(os.Stderr, "[gsx-dump] in : %s\n[gsx-dump] out: %s\n", query, formattedQuery)
 	}
 	queryArgs, err := getArgsFromParams(args, params)
 	if err != nil {
@@ -2179,6 +2218,18 @@ func reshapeArgToType(v any, t googlesql.Googlesql_TypeNode) any {
 		return v
 	}
 	kind, _ := t.Kind()
+	return reshapeArgToTypeWithKind(v, t, kind)
+}
+
+// reshapeArgToTypeWithKind is reshapeArgToType with the column type's
+// Kind pre-resolved. Type.Kind() is a wasm round-trip into the ZetaSQL
+// analyzer module; DMLStmt caches the per-column kinds at prepare time
+// so the per-exec reshape pass costs no analyzer calls for the common
+// scalar columns (which are not reshape candidates at all).
+func reshapeArgToTypeWithKind(v any, t googlesql.Googlesql_TypeNode, kind googlesql.TypeKind) any {
+	if v == nil || t == nil {
+		return v
+	}
 	switch kind {
 	case googlesql.TypeKindTypeStruct,
 		googlesql.TypeKindTypeArray,
@@ -2303,6 +2354,9 @@ func (a *Analyzer) newQueryStmtAction(ctx context.Context, query string, args []
 	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "GRAPH ") {
 		fmt.Fprintf(debugStream(), "[googlesqlite][graph] in : %s\n[googlesqlite][graph] out: %s\n", query, formattedQuery)
 	}
+	if os.Getenv("GSX_DUMP_SQL") != "" {
+		fmt.Fprintf(os.Stderr, "[gsx-dump] in : %s\n[gsx-dump] out: %s\n", query, formattedQuery)
+	}
 	queryArgs, err := getArgsFromParams(args, params)
 	if err != nil {
 		return nil, err
@@ -2318,10 +2372,8 @@ func (a *Analyzer) newQueryStmtAction(ctx context.Context, query string, args []
 }
 
 // newCreateTableFunctionStmtAction handles `CREATE TABLE FUNCTION`
-// DDL. The TVF body is captured into a TVFSpec, the spec is
-// registered on the catalog so `SELECT * FROM <tvf>(...)` resolves at
-// the analyzer, and the spec is persisted via the standard catalog
-// table.
+// DDL. The resolved TVF body is captured into a TVFSpec and persisted
+// via the standard catalog table.
 func (a *Analyzer) newCreateTableFunctionStmtAction(ctx context.Context, _ string, _ []driver.NamedValue, node *googlesql.ResolvedCreateTableFunctionStmt) (*CreateTableFunctionStmtAction, error) {
 	spec, err := newTVFSpec(ctx, a.namePath, node)
 	if err != nil {
@@ -2609,251 +2661,213 @@ func (a *Analyzer) newAssignmentStmtAction(ctx context.Context, _ string, _ []dr
 	}, nil
 }
 
-//nolint:unparam
-func (a *Analyzer) newTruncateStmtAction(_ context.Context, _ string, _ []driver.NamedValue, node *googlesql.ResolvedTruncateStmt) (*TruncateStmtAction, error) {
-	table, _ := m1(m1(node.TableScan()).Table()).Name()
-	return &TruncateStmtAction{query: fmt.Sprintf("DELETE FROM `%s`", table)}, nil
+func (a *Analyzer) newTruncateStmtAction(ctx context.Context, _ string, _ []driver.NamedValue, node *googlesql.ResolvedTruncateStmt) (*TruncateStmtAction, error) {
+	// Resolve the storage name through the catalog index so every path
+	// form (bare table, dataset.table, project.dataset.table, and
+	// backquoted compound) collapses to the same flattened SQLite
+	// identifier the DELETE/UPDATE/INSERT formatters use. Quote with
+	// double-quotes - DuckDB rejects backquoted identifiers.
+	table, err := getTableName(ctx, m1(node.TableScan()))
+	if err != nil {
+		return nil, err
+	}
+	return &TruncateStmtAction{query: fmt.Sprintf("DELETE FROM \"%s\"", table)}, nil
 }
 
-// newMergeStmtAction translates `MERGE target USING source ON <P>
-// WHEN ... THEN ...` into a deterministic sequence of straight SQL
-// statements that emulate the BigQuery semantics on SQLite.
-//
-// The implementation is predicate-agnostic: any boolean expression that
-// the analyzer accepts in the ON clause flows through unchanged. Two
-// staging temp tables are built once and then each WHEN clause maps to
-// exactly one INSERT / UPDATE / DELETE that filters them:
-//
-//   - googlesqlite_merge_t_set: every target row, LEFT JOINed with
-//     matching source rows under <P>. The __s_present sentinel is 1
-//     when a source row joined and 0 otherwise. WHEN MATCHED reads
-//     rows with __s_present = 1; WHEN NOT MATCHED BY SOURCE reads
-//     rows with __s_present = 0. __t_rowid carries each row back to
-//     its origin in the target base table so UPDATE / DELETE can
-//     identify it.
-//   - googlesqlite_merge_s_only_set: source rows for which no target
-//     row satisfies <P>. WHEN NOT MATCHED BY TARGET INSERTs read
-//     directly from here.
-//
-// Each subquery projects its columns with the analyzer-assigned unique
-// id (`colName#colId`) so that the formatted ON predicate, the
-// formatted SET expressions, and the formatted INSERT row references —
-// which already render columns through `uniqueColumnName(ctx, ...)`
-// with useColumnID set — resolve unambiguously inside the staging
-// tables. ON FALSE is the natural degenerate case: every target row
-// LEFT JOINs to no source row, every source row survives the
-// NOT EXISTS filter into s_only.
-//
-// Per-WHEN AND conditions (when.MatchExpr) are honoured by attaching
-// the formatted expression as an extra WHERE conjunct on the staging
-// filter for that clause.
-//
-// Known gaps (pre-existing): WHEN clauses are emitted independently,
-// so first-match-wins is not enforced across overlapping conditions;
-// and a matched (target, source) pair that has multiple source rows
-// for one target row is silently accepted (SQLite UPDATE FROM
-// behaves last-match-wins). Neither restriction is new in this
-// rewrite.
-func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, _ []driver.NamedValue, node *googlesql.ResolvedMergeStmt) (*MergeStmtAction, error) {
-	// node.TableScan() is typed *ResolvedTableScan already (the grammar
-	// guarantees the MERGE target is a base table reference), so no
-	// assertion is needed. node.FromScan() returns the interface
-	// ResolvedScanNode because USING-clause subqueries are legal in
-	// the spec; here we accept only the table-reference form so the
-	// per-WHEN UPDATE / DELETE can hand identity off to rowid.
-	targetTableScan := m1(node.TableScan())
-	targetName, err := getTableName(ctx, targetTableScan)
+func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, args []driver.NamedValue, node *googlesql.ResolvedMergeStmt) (*MergeStmtAction, error) {
+	targetTable, err := newNode(m1(node.TableScan())).FormatSQL(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("MERGE: target table: %w", err)
+		return nil, err
 	}
-	sourceScan := m1(node.FromScan())
-	sourceTableScan, ok := sourceScan.(*googlesql.ResolvedTableScan)
+	fromScan := m1(node.FromScan())
+	sourceTable, err := newNode(fromScan).FormatSQL(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// The merged-table materialization below consumes the source through
+	// `SELECT DISTINCT * FROM (source FULL OUTER JOIN target)` — a
+	// fixed-shape splice. When the source scan's own projection exposes
+	// the set-operation ordinal helper column (a bare UNION ALL source),
+	// re-project to the scan's column list so the helper neither becomes
+	// a merged-table column nor distorts the DISTINCT pair collapsing.
+	if scanExposesSetOperationOrdinal(ctx, fromScan) {
+		sourceTable = reprojectScanColumns(ctx, sourceTable, m1(fromScan.MutableColumnList()))
+	}
+	// A computed-subquery source (issue #17) formats as a bare
+	// `SELECT ...`; splicing that into `... FROM %s LEFT JOIN ...`
+	// hands the engine `FROM SELECT ...` — a Parser Error that also
+	// poisons the surrounding transaction. Table scans already format
+	// parenthesized; wrap everything else the same way.
+	if getInputPattern(sourceTable) == InputNeedsWrap {
+		sourceTable = fmt.Sprintf("(%s)", sourceTable)
+	}
+	expr, err := newNode(m1(node.MergeExpr())).FormatSQL(ctx)
+	if err != nil {
+		return nil, err
+	}
+	fn, ok := m1(node.MergeExpr()).(*googlesql.ResolvedFunctionCall)
 	if !ok {
-		return nil, fmt.Errorf("MERGE: source must be a single-table reference, got %T", sourceScan)
+		return nil, fmt.Errorf("currently MERGE expression is supported equal expression only")
 	}
-	sourceName, err := getTableName(ctx, sourceTableScan)
-	if err != nil {
-		return nil, fmt.Errorf("MERGE: source table: %w", err)
+	if m1(m1(fn.Function()).FullName(false)) != "$equal" {
+		return nil, fmt.Errorf("currently MERGE expression is supported equal expression only")
 	}
-
-	targetCols := m1(targetTableScan.ColumnList())
-	sourceCols := m1(sourceTableScan.ColumnList())
-	targetSubquery := mergeProjectScan(ctx, targetCols, targetName, "__t_rowid")
-	sourceSubquery := mergeProjectScan(ctx, sourceCols, sourceName, "__s_rowid")
-
-	onExpr, err := newNode(m1(node.MergeExpr())).FormatSQL(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("MERGE: ON expression: %w", err)
+	argList := m1(fn.ArgumentList())
+	if len(argList) != 2 {
+		return nil, fmt.Errorf("unexpected MERGE expression column num. expected 2 column but specified %d column", len(args))
 	}
-
-	const (
-		tSetName     = "googlesqlite_merge_t_set"
-		sOnlySetName = "googlesqlite_merge_s_only_set"
+	colA, ok := argList[0].(*googlesql.ResolvedColumnRef)
+	if !ok {
+		return nil, fmt.Errorf("unexpected MERGE expression. expected column reference but got %T", argList[0])
+	}
+	colB, ok := argList[1].(*googlesql.ResolvedColumnRef)
+	if !ok {
+		return nil, fmt.Errorf("unexpected MERGE expression. expected column reference but got %T", argList[1])
+	}
+	var (
+		sourceColumn *googlesql.ResolvedColumn
+		targetColumn *googlesql.ResolvedColumn
 	)
-
+	// Classify the ON-clause columns by column-ID membership in the
+	// target TableScan's column list. The previous heuristic —
+	// strings.Contains(sourceTable, colA's TableName) — breaks for
+	// computed-subquery sources, whose formatted SQL contains no
+	// table reference at all (and whose literals can accidentally
+	// contain the target's name).
+	targetColumnIDs := map[int32]struct{}{}
+	for _, col := range m1(m1(node.TableScan()).ColumnList()) {
+		targetColumnIDs[m1(col.ColumnId())] = struct{}{}
+	}
+	if _, isTarget := targetColumnIDs[m1(m1(colA.Column()).ColumnId())]; isTarget {
+		targetColumn = m1(colA.Column())
+		sourceColumn = m1(colB.Column())
+	} else {
+		sourceColumn = m1(colA.Column())
+		targetColumn = m1(colB.Column())
+	}
+	mergedTableSourceColumnName := fmt.Sprintf("\"%s\"", uniqueColumnName(ctx, sourceColumn))
+	mergedTableTargetColumnName := fmt.Sprintf("\"%s\"", uniqueColumnName(ctx, targetColumn))
+	// Source relation, correlated column name, and insert-row formatting
+	// context for the INSERT arms. A real table keeps the historical
+	// shape: the raw table (plain column names) with the insert row
+	// formatted without column IDs. A computed-subquery source has no
+	// backing table — and re-formatting it without column IDs collides
+	// whenever a projected alias shadows a base column (`SELECT id+1 AS
+	// id ... WHERE id <= 1` made the filter's column ref pick up the
+	// aliased expression) — so the subquery path reuses the ID-aliased
+	// sourceTable relation and formats the insert row with column IDs to
+	// match. The INSERT statement aliases the relation as
+	// googlesqlite_merge_source so the EXISTS correlation survives the
+	// name overlap with googlesqlite_merged_table's columns.
+	insertSourceTable := fmt.Sprintf("\"%s\"", m1(sourceColumn.TableName()))
+	insertSourceColumnName := fmt.Sprintf("\"%s\"", m1(sourceColumn.Name()))
+	insertRowCtx := unuseColumnID(ctx)
+	if m1(m1(node.FromScan()).NodeKind()) != googlesql.ResolvedNodeKindResolvedTableScan {
+		insertSourceTable = sourceTable
+		insertSourceColumnName = mergedTableSourceColumnName
+		insertRowCtx = ctx
+	}
+	mergedTableOutputColumns := []string{
+		mergedTableTargetColumnName,
+		mergedTableSourceColumnName,
+	}
+	// The merged table materializes every (source row, target row)
+	// pairing class in one scan: matched pairs, source-only rows
+	// (target side NULL) and target-only rows (source side NULL).
+	// The SQLite-era lowering emulated this with `src LEFT JOIN tgt
+	// UNION ALL tgt LEFT JOIN src`, but UNION ALL is positional: the
+	// second arm put target values under source-named columns, which
+	// made asymmetric matched UPDATEs (SET v = s.v) nondeterministic
+	// and broke NOT MATCHED BY SOURCE. A FULL OUTER JOIN keeps every
+	// value under its own column name.
 	var stmts []string
-	// Defensive cleanup: a previous MERGE in this connection may have
-	// errored mid-flight and left the staging tables behind.
-	stmts = append(stmts,
-		fmt.Sprintf("DROP TABLE IF EXISTS %s", tSetName),
-		fmt.Sprintf("DROP TABLE IF EXISTS %s", sOnlySetName),
-	)
 	stmts = append(stmts, fmt.Sprintf(
-		"CREATE TEMP TABLE %s AS SELECT __t.*, __s.*, (__s.__s_rowid IS NOT NULL) AS __s_present FROM %s AS __t LEFT JOIN %s AS __s ON %s",
-		tSetName, targetSubquery, sourceSubquery, onExpr,
-	))
-	stmts = append(stmts, fmt.Sprintf(
-		"CREATE TEMP TABLE %s AS SELECT __s.* FROM %s AS __s WHERE NOT EXISTS (SELECT 1 FROM %s AS __t WHERE %s)",
-		sOnlySetName, sourceSubquery, targetSubquery, onExpr,
+		"CREATE TABLE googlesqlite_merged_table AS SELECT DISTINCT * FROM (SELECT * FROM %[1]s FULL OUTER JOIN %[2]s ON %[3]s)",
+		sourceTable, targetTable, expr,
 	))
 
+	// exists target table and source table
+	matchedFromStmt := fmt.Sprintf(
+		"FROM googlesqlite_merged_table WHERE %[2]s = \"%[1]s\" AND %[3]s = \"%[1]s\"",
+		m1(targetColumn.Name()),
+		mergedTableSourceColumnName,
+		mergedTableTargetColumnName,
+	)
+
+	// exists target table but not exists source table
+	notMatchedBySourceFromStmt := fmt.Sprintf(
+		"FROM googlesqlite_merged_table WHERE %[2]s = \"%[1]s\" AND %[3]s IS NULL",
+		m1(targetColumn.Name()),
+		mergedTableTargetColumnName,
+		mergedTableSourceColumnName,
+	)
+
+	// exists source table but not exists target table (correlated to the
+	// aliased source relation of the INSERT arm — see insertSourceTable)
+	notMatchedByTargetFromStmt := fmt.Sprintf(
+		"FROM googlesqlite_merged_table WHERE %[2]s = googlesqlite_merge_source.%[1]s AND %[3]s IS NULL",
+		insertSourceColumnName,
+		mergedTableSourceColumnName,
+		mergedTableTargetColumnName,
+	)
 	for _, when := range m1(node.WhenClauseList()) {
-		matchCondSQL, err := formatMergeWhenMatchExpr(ctx, when)
-		if err != nil {
-			return nil, err
+		var fromStmt string
+		switch m1(when.MatchType()) {
+		case googlesql.ResolvedMergeWhenEnums_MatchTypeMatched:
+			fromStmt = matchedFromStmt
+		case googlesql.ResolvedMergeWhenEnums_MatchTypeNotMatchedBySource:
+			fromStmt = notMatchedBySourceFromStmt
+		case googlesql.ResolvedMergeWhenEnums_MatchTypeNotMatchedByTarget:
+			fromStmt = notMatchedByTargetFromStmt
 		}
-		stmt, err := mergeWhenStatement(ctx, when, targetName, tSetName, sOnlySetName, matchCondSQL)
-		if err != nil {
-			return nil, err
-		}
-		if stmt != "" {
-			stmts = append(stmts, stmt)
+		whereStmt := fmt.Sprintf(
+			"WHERE EXISTS(SELECT %s %s)",
+			strings.Join(mergedTableOutputColumns, ","),
+			fromStmt,
+		)
+		switch m1(when.ActionType()) {
+		case googlesql.ResolvedMergeWhenEnums_ActionTypeInsert:
+			var columns []string
+			for _, col := range m1(when.InsertColumnList()) {
+				columns = append(columns, fmt.Sprintf("\"%s\"", m1(col.Name())))
+			}
+			row, err := newNode(m1(when.InsertRow())).FormatSQL(insertRowCtx)
+			if err != nil {
+				return nil, err
+			}
+			stmts = append(stmts, fmt.Sprintf(
+				"INSERT INTO \"%[1]s\"(%[2]s) SELECT %[3]s FROM (SELECT * FROM %[4]s AS googlesqlite_merge_source %[5]s)",
+				m1(targetColumn.TableName()),
+				strings.Join(columns, ","),
+				row,
+				insertSourceTable,
+				whereStmt,
+			))
+		case googlesql.ResolvedMergeWhenEnums_ActionTypeUpdate:
+			var items []string
+			for _, item := range m1(when.UpdateItemList()) {
+				sql, err := newNode(item).FormatSQL(ctx)
+				if err != nil {
+					return nil, err
+				}
+				items = append(items, sql)
+			}
+			stmts = append(stmts, fmt.Sprintf(
+				"UPDATE \"%s\" SET %s %s",
+				m1(targetColumn.TableName()),
+				strings.Join(items, ","),
+				fromStmt,
+			))
+		case googlesql.ResolvedMergeWhenEnums_ActionTypeDelete:
+			stmts = append(stmts, fmt.Sprintf(
+				"DELETE FROM \"%s\" %s",
+				m1(targetColumn.TableName()),
+				whereStmt,
+			))
 		}
 	}
-
-	stmts = append(stmts,
-		fmt.Sprintf("DROP TABLE IF EXISTS %s", tSetName),
-		fmt.Sprintf("DROP TABLE IF EXISTS %s", sOnlySetName),
-	)
+	stmts = append(stmts, "DROP TABLE googlesqlite_merged_table")
 	return &MergeStmtAction{stmts: stmts}, nil
-}
-
-// mergeProjectScan builds the per-side subquery used as one half of the
-// MERGE staging tables — each user column is projected under its
-// analyzer-assigned unique name, plus a rowid alias that the per-WHEN
-// UPDATE / DELETE statements use to identify the underlying target row.
-func mergeProjectScan(ctx context.Context, cols []*googlesql.ResolvedColumn, tableName, rowidAlias string) string {
-	projections := make([]string, 0, len(cols)+1)
-	for _, col := range cols {
-		projections = append(projections, fmt.Sprintf("`%s` AS `%s`", m1(col.Name()), uniqueColumnName(ctx, col)))
-	}
-	projections = append(projections, fmt.Sprintf("rowid AS %s", rowidAlias))
-	return fmt.Sprintf("(SELECT %s FROM `%s`)", strings.Join(projections, ","), tableName)
-}
-
-// formatMergeWhenMatchExpr renders the optional `AND <expr>` that may
-// follow a WHEN clause's match-type. Returns the empty string when the
-// resolver did not attach a match expression — callers append it
-// verbatim to the staging filter, so an empty result means "no extra
-// conjunct".
-func formatMergeWhenMatchExpr(ctx context.Context, when *googlesql.ResolvedMergeWhen) (string, error) {
-	expr := m1(when.MatchExpr())
-	if expr == nil {
-		return "", nil
-	}
-	sql, err := newNode(expr).FormatSQL(ctx)
-	if err != nil {
-		return "", fmt.Errorf("MERGE: WHEN AND condition: %w", err)
-	}
-	if sql == "" {
-		return "", nil
-	}
-	return " AND " + sql, nil
-}
-
-// mergeWhenStatement renders the single SQL statement that implements
-// the given WHEN clause against the staging tables built by
-// newMergeStmtAction. It returns ("", nil) when the clause has no
-// effect under the chosen routing (currently never — every supported
-// MatchType/ActionType combination produces a statement).
-func mergeWhenStatement(ctx context.Context, when *googlesql.ResolvedMergeWhen, targetName, tSetName, sOnlySetName, matchCondSQL string) (string, error) {
-	matchType := m1(when.MatchType())
-	actionType := m1(when.ActionType())
-	switch matchType {
-	case googlesql.ResolvedMergeWhenEnums_MatchTypeMatched:
-		stagingFilter := "__s_present = 1" + matchCondSQL
-		switch actionType {
-		case googlesql.ResolvedMergeWhenEnums_ActionTypeUpdate:
-			items, err := mergeFormatUpdateItems(ctx, m1(when.UpdateItemList()))
-			if err != nil {
-				return "", err
-			}
-			return fmt.Sprintf(
-				"UPDATE `%s` SET %s FROM (SELECT * FROM %s WHERE %s) AS __m WHERE `%s`.rowid = __m.__t_rowid",
-				targetName, items, tSetName, stagingFilter, targetName,
-			), nil
-		case googlesql.ResolvedMergeWhenEnums_ActionTypeDelete:
-			return fmt.Sprintf(
-				"DELETE FROM `%s` WHERE rowid IN (SELECT __t_rowid FROM %s WHERE %s)",
-				targetName, tSetName, stagingFilter,
-			), nil
-		default:
-			return "", fmt.Errorf("MERGE WHEN MATCHED supports UPDATE or DELETE; got %v", actionType)
-		}
-	case googlesql.ResolvedMergeWhenEnums_MatchTypeNotMatchedBySource:
-		stagingFilter := "__s_present = 0" + matchCondSQL
-		switch actionType {
-		case googlesql.ResolvedMergeWhenEnums_ActionTypeUpdate:
-			items, err := mergeFormatUpdateItems(ctx, m1(when.UpdateItemList()))
-			if err != nil {
-				return "", err
-			}
-			// FROM the staging table even though the WHEN-clause body
-			// cannot reference source columns: it is what gives the SET
-			// right-hand side a scope in which the target columns
-			// resolve under their unique ids.
-			return fmt.Sprintf(
-				"UPDATE `%s` SET %s FROM (SELECT * FROM %s WHERE %s) AS __m WHERE `%s`.rowid = __m.__t_rowid",
-				targetName, items, tSetName, stagingFilter, targetName,
-			), nil
-		case googlesql.ResolvedMergeWhenEnums_ActionTypeDelete:
-			return fmt.Sprintf(
-				"DELETE FROM `%s` WHERE rowid IN (SELECT __t_rowid FROM %s WHERE %s)",
-				targetName, tSetName, stagingFilter,
-			), nil
-		default:
-			return "", fmt.Errorf("MERGE WHEN NOT MATCHED BY SOURCE supports UPDATE or DELETE; got %v", actionType)
-		}
-	case googlesql.ResolvedMergeWhenEnums_MatchTypeNotMatchedByTarget:
-		if actionType != googlesql.ResolvedMergeWhenEnums_ActionTypeInsert {
-			return "", fmt.Errorf("MERGE WHEN NOT MATCHED BY TARGET supports INSERT only; got %v", actionType)
-		}
-		var columns []string
-		for _, col := range m1(when.InsertColumnList()) {
-			columns = append(columns, fmt.Sprintf("`%s`", m1(col.Name())))
-		}
-		row, err := newNode(m1(when.InsertRow())).FormatSQL(ctx)
-		if err != nil {
-			return "", err
-		}
-		whereCond := ""
-		if matchCondSQL != "" {
-			whereCond = " WHERE" + strings.TrimPrefix(matchCondSQL, " AND")
-		}
-		return fmt.Sprintf(
-			"INSERT INTO `%s`(%s) SELECT %s FROM %s%s",
-			targetName, strings.Join(columns, ","), row, sOnlySetName, whereCond,
-		), nil
-	default:
-		return "", fmt.Errorf("MERGE: unsupported WHEN match type %v", matchType)
-	}
-}
-
-// mergeFormatUpdateItems renders a comma-separated SET-clause body for
-// a MERGE UPDATE action. Each ResolvedUpdateItem formats its target
-// column with useColumnID disabled — so the LHS is a bare column name
-// on the target base table — and its SetValue with useColumnID set,
-// so the RHS references staging-table columns by their unique id.
-func mergeFormatUpdateItems(ctx context.Context, items []*googlesql.ResolvedUpdateItem) (string, error) {
-	parts := make([]string, 0, len(items))
-	for _, item := range items {
-		sql, err := newNode(item).FormatSQL(ctx)
-		if err != nil {
-			return "", err
-		}
-		parts = append(parts, sql)
-	}
-	return strings.Join(parts, ","), nil
 }
 
 // getParamsFromNode returns the deduplicated `*ResolvedParameter`

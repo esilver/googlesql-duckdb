@@ -34,6 +34,15 @@ cases:
     expected:
       rows:
         - [1]
+  - desc: Sunday to Monday week variants
+    sql: |-
+      SELECT
+        DATETIME_DIFF(DATETIME "2017-12-18T00:00:00", DATETIME "2017-12-17T23:59:59", WEEK) AS week_diff,
+        DATETIME_DIFF(DATETIME "2017-12-18T00:00:00", DATETIME "2017-12-17T23:59:59", WEEK(MONDAY)) AS week_monday_diff,
+        DATETIME_DIFF(DATETIME "2017-12-18T00:00:00", DATETIME "2017-12-17T23:59:59", ISOWEEK) AS isoweek_diff
+    expected:
+      rows:
+        - [0, 1, 1]
   - desc: month-end-of-month MONTH boundary (1/31 → 2/28)
     sql: SELECT DATETIME_DIFF(DATETIME "2020-02-28T00:00:00", DATETIME "2020-01-31T00:00:00", MONTH)
     expected:

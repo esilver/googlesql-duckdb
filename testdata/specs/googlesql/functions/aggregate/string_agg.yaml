@@ -11,3 +11,11 @@ cases:
     expected:
       rows:
         - [null]
+  - desc: window distinct aggregate deduplicates
+    sql: |
+      SELECT STRING_AGG(DISTINCT s) OVER ()
+      FROM (SELECT 'a' AS s UNION ALL SELECT 'a' UNION ALL SELECT 'b')
+      LIMIT 1
+    expected:
+      rows:
+        - ["a,b"]

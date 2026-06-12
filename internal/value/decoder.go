@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"math/big"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -60,6 +61,23 @@ func ConvertArgs(args ...any) ([]Value, error) {
 	return values, nil
 }
 
+// foreignDecoders holds decoder hooks for engine-specific Go carrier
+// types this dialect-agnostic leaf package must not import — e.g. the
+// DuckDB driver's duckdb.Decimal, which a native DECIMAL(38,9) NUMERIC
+// column delivers for UDF arguments, LIST elements and STRUCT fields.
+// internal/decoder.go installs the DuckDB hooks at init. Hooks run for
+// every value DecodeValue's own type switch does not claim, including
+// recursive element/field decodes.
+var foreignDecoders []func(any) (Value, bool)
+
+// RegisterForeignDecoder appends fn to the decoder hooks consulted by
+// DecodeValue for engine-specific carrier types (see foreignDecoders).
+// Must be called from package init functions only — the slice is read
+// without synchronization afterwards.
+func RegisterForeignDecoder(fn func(any) (Value, bool)) {
+	foreignDecoders = append(foreignDecoders, fn)
+}
+
 // DecodeValue is the inverse of EncodeValue: given the over-the-wire
 // form (Go primitive or base64-encoded ValueLayout JSON) produce the
 // matching googlesqlite Value.
@@ -67,14 +85,152 @@ func DecodeValue(v any) (Value, error) {
 	if isNullValue(v) {
 		return nil, nil
 	}
+	// Pass an already-decoded Value straight through. The generate-array
+	// bridges pre-wrap a native time.Time bound as a DateValue /
+	// TimestampValue (ConvertArgs cannot decode a bare time.Time), so the
+	// decoder must treat an incoming Value as a no-op rather than reject it.
+	if vv, ok := v.(Value); ok {
+		return vv, nil
+	}
+	for _, fd := range foreignDecoders {
+		if dv, ok := fd(v); ok {
+			return dv, nil
+		}
+	}
 	v = coerceJSONNumber(v)
 	switch vv := v.(type) {
+	case time.Time:
+		// Engine-native temporal carrier (bigquery-emulator issue #17): a
+		// stored DATE / TIME / DATETIME / TIMESTAMP column (or a native
+		// temporal literal) that reaches a value-layer UDF argument, LIST
+		// element or STRUCT field arrives as a bare Go time.Time — the
+		// duckdb-go UDF codec decodes every temporal vector uniformly to a
+		// UTC time.Time and the logical column type is not carried along
+		// (DATE = midnight UTC, TIME = epoch day + clock, TIMESTAMP /
+		// DATETIME = the instant; see duckdb-go-pure udf_codec readCellT).
+		// The kind is therefore inferred from the carrier's shape. Every
+		// value-layer comparison (EQ/GT/GTE/LT/LTE on all four temporal
+		// kinds) funnels through ToTime on the SAME underlying time.Time,
+		// so ordering and equality — the operations that route raw native
+		// temporals here (e.g. googlesqlite_between for
+		// `d BETWEEN DATE '...' AND DATE '...'`) — are exact regardless of
+		// which temporal kind the inference picks; only kind-sensitive
+		// rendering can differ for the ambiguous midnight / epoch-day
+		// shapes, and those sites previously failed outright with
+		// "unexpected value type: time.Time".
+		return decodeNativeTime(vv), nil
 	case int64:
 		return IntValue(vv), nil
+	// DuckDB returns narrower integer widths natively (e.g. INT -> int32,
+	// SELECT 1 -> int32, SMALLINT -> int16), whereas SQLite always handed
+	// back int64. Widen them so scalar columns and integer literals decode.
+	case int32:
+		return IntValue(int64(vv)), nil
+	case int16:
+		return IntValue(int64(vv)), nil
+	case int8:
+		return IntValue(int64(vv)), nil
+	case int:
+		return IntValue(int64(vv)), nil
+	case uint64:
+		return IntValue(int64(vv)), nil
+	case uint32:
+		return IntValue(int64(vv)), nil
+	case uint16:
+		return IntValue(int64(vv)), nil
+	case uint8:
+		return IntValue(int64(vv)), nil
 	case float64:
 		return FloatValue(vv), nil
+	case float32:
+		return FloatValue(float64(vv)), nil
 	case bool:
 		return BoolValue(vv), nil
+	case []byte:
+		// DuckDB hands a BLOB column / BLOB-returning UDF result back as a
+		// Go []byte. The raw-BYTES geography serializers (ST_ASBINARY -> WKB
+		// declared TYPE_BLOB) flow their result into a value-layer UDF
+		// wrapper (TO_HEX / BYTE_LENGTH); without this case the wrapper's
+		// ConvertArgs rejects the []byte. Wrap it as the BYTES value the
+		// body expects.
+		//
+		// Stored BYTES columns are the exception (issue #9): the column is
+		// a native BLOB, but the INSERT path persists the value-layer
+		// base64 envelope as the blob's ASCII content, so a stored cell
+		// arrives here as []byte("eyJoZWFkZXIi..."). Without unwrapping,
+		// engine-side consumers (googlesqlite_cast for CAST(b AS STRING),
+		// TO_HEX, BYTE_LENGTH, ...) operate on the envelope text instead
+		// of the payload bytes. Sniff the canonical envelope exactly the
+		// way the string path below does; genuine binary blobs (WKB, proto
+		// wire bytes) fail the base64/JSON/header probe and pass through
+		// untouched.
+		if dv, ok, err := decodeEnvelopeString(string(vv)); ok {
+			return dv, err
+		}
+		return BytesValue(vv), nil
+	case *big.Int:
+		// DuckDB returns HUGEINT (128-bit) results as *big.Int, which the
+		// SQLite backend never produced. COUNT / COUNTIF / SUM(INTEGER)
+		// promote to HUGEINT in DuckDB even when the true result fits in
+		// 64 bits, so map a representable value to INT64 and fall back to
+		// FLOAT64 only when it genuinely overflows int64.
+		if vv == nil {
+			return nil, nil
+		}
+		if vv.IsInt64() {
+			return IntValue(vv.Int64()), nil
+		}
+		f, _ := new(big.Float).SetInt(vv).Float64()
+		return FloatValue(f), nil
+	case big.Int:
+		bi := vv
+		if bi.IsInt64() {
+			return IntValue(bi.Int64()), nil
+		}
+		f, _ := new(big.Float).SetInt(&bi).Float64()
+		return FloatValue(f), nil
+	case []any:
+		// DuckDB-native LIST: duckdb-go scans a LIST / ARRAY column to a Go
+		// []any. Each element is either a value-layer envelope (a richer
+		// element type re-encoded as VARCHAR by a UDF) or a native Go
+		// primitive (INT64 / FLOAT64 / BOOL element), so recurse through
+		// DecodeValue per element to materialise the ArrayValue. This lets a
+		// native aggregate (array_agg / list / the ARRAY(SELECT ...)
+		// subquery lowering) round-trip back through ToArray on the result
+		// path without the base64 envelope.
+		elems := make([]Value, 0, len(vv))
+		for _, e := range vv {
+			ev, err := DecodeValue(e)
+			if err != nil {
+				return nil, err
+			}
+			elems = append(elems, ev)
+		}
+		return &ArrayValue{Values: elems}, nil
+	case map[string]any:
+		// DuckDB-native STRUCT: duckdb-go scans a STRUCT column to a Go
+		// map[string]any keyed by field name. The struct value layer carries
+		// field names on the column type rather than the value, so we keep
+		// the keys for round-tripping but the row decoder reads fields
+		// positionally; preserve a stable key order so the positional read
+		// matches the declared field order is the caller's concern. Recurse
+		// per field value (envelope or native primitive).
+		keys := make([]string, 0, len(vv))
+		for k := range vv {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		values := make([]Value, 0, len(keys))
+		m := make(map[string]Value, len(keys))
+		for _, k := range keys {
+			fv, err := DecodeValue(vv[k])
+			if err != nil {
+				return nil, err
+			}
+			values = append(values, fv)
+			m[k] = fv
+		}
+		return &StructValue{Keys: keys, Values: values, M: m}, nil
 	}
 	s, ok := v.(string)
 	if !ok {
@@ -85,24 +241,82 @@ func DecodeValue(v any) (Value, error) {
 	// `'int32'`, `'date'`, `'bytes'`) that the formatter inlined
 	// without the envelope. Fall back to a plain StringValue so the
 	// receiver can still call .ToString() on it.
+	if dv, ok, err := decodeEnvelopeString(s); ok {
+		return dv, err
+	}
+	return StringValue(s), nil
+}
+
+// decodeNativeTime wraps an engine-native bare time.Time carrier into the
+// temporal Value whose kind its shape implies. The duckdb-go UDF codec
+// produces every temporal as a UTC time.Time with the logical type erased:
+//
+//   - engine DATE        -> midnight UTC of the civil date
+//   - engine TIME        -> epoch day (1970-01-01) + the time of day
+//   - engine TIMESTAMP   -> the civil micros (gsx DATETIME storage)
+//   - engine TIMESTAMPTZ -> the absolute instant (gsx TIMESTAMP storage)
+//
+// Inference: an exact-midnight value reads as DATE (true for every engine
+// DATE cell; a TIMESTAMP/DATETIME landing exactly on midnight gets the DATE
+// reading — comparisons stay exact via ToTime, and its "2006-01-02" string
+// form casts back to all three types as the same instant under the
+// UTC-pinned session). A non-midnight value on the epoch day reads as TIME
+// (true for every engine TIME cell). Everything else reads as DATETIME:
+// TIMESTAMP and DATETIME carriers are indistinguishable, and the civil
+// "2006-01-02T15:04:05" rendering is interpretation-neutral — it re-parses
+// into both DuckDB TIMESTAMP and TIMESTAMPTZ as the same instant, whereas
+// an RFC3339 "Z" rendering would assert instant-ness a true DATETIME does
+// not have.
+func decodeNativeTime(t time.Time) Value {
+	h, m, s := t.Clock()
+	if h == 0 && m == 0 && s == 0 && t.Nanosecond() == 0 {
+		return DateValue(t)
+	}
+	if y, mo, d := t.Date(); y == 1970 && mo == time.January && d == 1 {
+		return TimeValue(t)
+	}
+	return DatetimeValue(t)
+}
+
+// decodeEnvelopeString probes s for the canonical value-layer carrier
+// (base64 of a {"header","body"} ValueLayout JSON). ok reports whether s
+// is such an envelope; when it is, the decoded Value (or the layout's
+// decode error) is returned. Callers fall back to their raw reading
+// (StringValue / BytesValue) when ok is false.
+func decodeEnvelopeString(s string) (Value, bool, error) {
 	decoded, err := base64.StdEncoding.DecodeString(s)
 	if err != nil {
-		return StringValue(s), nil
+		return nil, false, nil
 	}
 	var layout ValueLayout
 	if err := json.Unmarshal(decoded, &layout); err != nil {
-		return StringValue(s), nil
+		return nil, false, nil
 	}
 	if layout.Header == "" {
-		return StringValue(s), nil
+		return nil, false, nil
 	}
-	return decodeFromValueLayout(&layout)
+	v, err := decodeFromValueLayout(&layout)
+	return v, true, err
 }
 
 func decodeFromValueLayout(layout *ValueLayout) (Value, error) {
 	switch layout.Header {
 	case StringValueType:
 		return StringValue(layout.Body), nil
+	case IntValueType:
+		i, err := strconv.ParseInt(layout.Body, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode int body %q: %w", layout.Body, err)
+		}
+		return IntValue(i), nil
+	case FloatValueType:
+		f, err := strconv.ParseFloat(layout.Body, 64)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode float body %q: %w", layout.Body, err)
+		}
+		return FloatValue(f), nil
+	case BoolValueType:
+		return BoolValue(layout.Body == "true"), nil
 	case BytesValueType:
 		decoded, err := base64.StdEncoding.DecodeString(layout.Body)
 		if err != nil {

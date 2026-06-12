@@ -1,12 +1,17 @@
 package internal
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/binary"
 	"fmt"
+	"reflect"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	googlesql "github.com/goccy/go-googlesql"
@@ -31,17 +36,17 @@ INSERT INTO googlesqlite_catalog (
   updatedAt,
   createdAt
 ) VALUES (
-  @name,
-  @kind,
-  @spec,
-  @updatedAt,
-  @createdAt
+  $name,
+  $kind,
+  $spec,
+  $updatedAt,
+  $createdAt
 ) ON CONFLICT(name) DO UPDATE SET
-  spec = @spec,
-  updatedAt = @updatedAt
+  spec = $spec,
+  updatedAt = $updatedAt
 `
 	deleteCatalogQuery = `
-DELETE FROM googlesqlite_catalog WHERE name = @name
+DELETE FROM googlesqlite_catalog WHERE name = $name
 `
 )
 
@@ -102,6 +107,13 @@ type Catalog struct {
 	// through CREATE PROPERTY GRAPH. Currently a metadata-only
 	// store; full GRAPH_EXPAND / AGG integration is not yet wired.
 	propertyGraphs map[string]*propertyGraphSpec
+	// analysisGen counts semantic catalog mutations; analysisCache
+	// holds Analyzer.Analyze output keyed by query text + parameter
+	// shape, valid only at the generation it was built under. See
+	// analysis_cache.go.
+	analysisGen     atomic.Uint64
+	analysisCacheMu sync.Mutex
+	analysisCache   map[string]*analysisCacheEntry
 }
 
 // PropertyGraphSpec captures the essentials of a CREATE PROPERTY
@@ -115,6 +127,57 @@ type propertyGraphSpec struct {
 	EdgeTables []string
 }
 
+// catalogLangOpts returns the process-wide LanguageOptions used for
+// builtin registration at catalog construction. resetCatalog rebuilds
+// the SimpleCatalog on every DDL mutation — a dbt build does this per
+// node — and each rebuild previously created and abandoned a fresh
+// wasm-side LanguageOptions, arming one GC finalizer per node
+// (googlesqlite#16: the production crash trace is exactly
+// LanguageOptions.free on the runtime-finalizer goroutine). The
+// options are pure configuration read by AddGoogleSQLFunctions2, so
+// one shared instance is correct, kills the churn, and skips the
+// per-rebuild maximum-features setup calls.
+var catalogLangOpts = sync.OnceValue(func() *googlesql.LanguageOptions {
+	opts, err := googlesql.NewLanguageOptionsMaximumFeatures()
+	if err != nil || opts == nil {
+		return nil
+	}
+	// Explicitly enable the Anonymization / Differential
+	// Privacy language features. NewLanguageOptionsMaximumFeatures
+	// does NOT include them by default (DP/Anon are gated as
+	// "in development"), so without these the catalog wouldn't
+	// even contain the DP signature ids we ask for via
+	// IncludeFunctionIds.
+	for _, f := range []googlesql.LanguageFeature{
+		googlesql.LanguageFeatureFeatureDifferentialPrivacy,
+		googlesql.LanguageFeatureFeatureDifferentialPrivacyThresholding,
+		googlesql.LanguageFeatureFeatureDifferentialPrivacyReportFunctions,
+		googlesql.LanguageFeatureFeatureAnonymization,
+		googlesql.LanguageFeatureFeatureAnonymizationThresholding,
+		// AEAD / KEYS encryption family is gated behind the
+		// Encryption feature flag — not on by default in
+		// NewLanguageOptionsMaximumFeatures.
+		googlesql.LanguageFeatureFeatureEncryption,
+		// GoogleSQL proto-reflection feature flags. Enabling
+		// these on the catalog-construction options ensures the
+		// proto family is included in the builtin function set
+		// when Conn.RegisterProto plugs a DescriptorPool into
+		// the catalog.
+		googlesql.LanguageFeatureFeatureProtoBase,
+		googlesql.LanguageFeatureFeatureProtoDefaultIfNull,
+		googlesql.LanguageFeatureFeatureExtractFromProto,
+		googlesql.LanguageFeatureFeatureReplaceFields,
+		googlesql.LanguageFeatureFeatureFilterFields,
+		googlesql.LanguageFeatureFeatureProtoMaps,
+		googlesql.LanguageFeatureFeatureProtoExtensionsWithNew,
+		googlesql.LanguageFeatureFeatureProtoExtensionsWithSet,
+		googlesql.LanguageFeatureFeatureEnumValueDescriptorProto,
+	} {
+		_ = opts.EnableLanguageFeature(f)
+	}
+	return opts
+})
+
 func newSimpleCatalog(name string) *googlesql.SimpleCatalog {
 	catalog, err := googlesql.NewSimpleCatalog(name, tf())
 	if err != nil {
@@ -126,40 +189,7 @@ func newSimpleCatalog(name string) *googlesql.SimpleCatalog {
 	// for callers that turn the matching analyzer feature on. Having
 	// extras in the catalog is harmless — the analyzer's own
 	// LanguageOptions gates whether each call site can use them.
-	if opts, err := googlesql.NewLanguageOptionsMaximumFeatures(); err == nil && opts != nil {
-		// Explicitly enable the Anonymization / Differential
-		// Privacy language features. NewLanguageOptionsMaximumFeatures
-		// does NOT include them by default (DP/Anon are gated as
-		// "in development"), so without these the catalog wouldn't
-		// even contain the DP signature ids we ask for via
-		// IncludeFunctionIds.
-		for _, f := range []googlesql.LanguageFeature{
-			googlesql.LanguageFeatureFeatureDifferentialPrivacy,
-			googlesql.LanguageFeatureFeatureDifferentialPrivacyThresholding,
-			googlesql.LanguageFeatureFeatureDifferentialPrivacyReportFunctions,
-			googlesql.LanguageFeatureFeatureAnonymization,
-			googlesql.LanguageFeatureFeatureAnonymizationThresholding,
-			// AEAD / KEYS encryption family is gated behind the
-			// Encryption feature flag — not on by default in
-			// NewLanguageOptionsMaximumFeatures.
-			googlesql.LanguageFeatureFeatureEncryption,
-			// GoogleSQL proto-reflection feature flags. Enabling
-			// these on the catalog-construction options ensures the
-			// proto family is included in the builtin function set
-			// when Conn.RegisterProto plugs a DescriptorPool into
-			// the catalog.
-			googlesql.LanguageFeatureFeatureProtoBase,
-			googlesql.LanguageFeatureFeatureProtoDefaultIfNull,
-			googlesql.LanguageFeatureFeatureExtractFromProto,
-			googlesql.LanguageFeatureFeatureReplaceFields,
-			googlesql.LanguageFeatureFeatureFilterFields,
-			googlesql.LanguageFeatureFeatureProtoMaps,
-			googlesql.LanguageFeatureFeatureProtoExtensionsWithNew,
-			googlesql.LanguageFeatureFeatureProtoExtensionsWithSet,
-			googlesql.LanguageFeatureFeatureEnumValueDescriptorProto,
-		} {
-			_ = opts.EnableLanguageFeature(f)
-		}
+	if opts := catalogLangOpts(); opts != nil {
 		// Combine the public-builtin registration and the DP/Anon
 		// IncludeFunctionIds into a single AddGoogleSQLFunctions2
 		// call. Calling AddGoogleSQLFunctions3 first and then
@@ -177,6 +207,29 @@ func newSimpleCatalog(name string) *googlesql.SimpleCatalog {
 	}
 	registerBigQueryExtensionFunctions(catalog)
 	registerSpannerExtensionFunctions(catalog)
+	return catalog
+}
+
+// newBareSubCatalog constructs a SimpleCatalog WITHOUT the builtin /
+// extension function surface. Sub-catalogs only ever resolve tables,
+// nested sub-catalogs and explicitly-aliased UDF/TVF handles —
+// builtin function lookup happens against the root catalog the
+// analyzer was handed, never against a descended sub-catalog.
+//
+// Issue #19: registering the full GoogleSQL + BigQuery + Spanner
+// surface into every sub-catalog (the previous behavior — sub-
+// catalogs shared newSimpleCatalog with the root) allocated the whole
+// function/type set in analyzer linear memory once per
+// (dataset x catalog rebuild). Under a dbt build that was the
+// dominant term in both the per-statement cost climb and the
+// analyzer-heap exhaustion: the production bad_alloc stack is
+// getOrCreateSubCatalog -> newSimpleCatalog ->
+// registerBigQueryExtensionFunctions -> MakeSimpleType.
+func newBareSubCatalog(name string) *googlesql.SimpleCatalog {
+	catalog, err := googlesql.NewSimpleCatalog(name, tf())
+	if err != nil {
+		return nil
+	}
 	return catalog
 }
 
@@ -1463,12 +1516,27 @@ func NewCatalog(db *sql.DB) *Catalog {
 	// wiring. Acquire wasmAnalyzeMu around the proto FFI block so
 	// other goroutines that are mid-Analyze do not see a partially-
 	// populated DescriptorPool / SimpleCatalog while AddType is in
-	// flight.
-	wasmAnalyzeMu.Lock()
-	_ = registerWellKnownProtos(c)
-	wasmAnalyzeMu.Unlock()
+	// flight. The unlock is deferred inside a closure: the body
+	// crosses the analyzer FFI boundary, and an abort there surfaces
+	// as a Go panic — a bare Lock/Unlock pair would orphan
+	// wasmAnalyzeMu for every Analyze in the process even when the
+	// caller recovers the panic (issue #18).
+	func() {
+		wasmAnalyzeMu.Lock()
+		defer wasmAnalyzeMu.Unlock()
+		if h := newCatalogProtoBlockHookForTest; h != nil {
+			h()
+		}
+		_ = registerWellKnownProtos(c)
+	}()
 	return c
 }
+
+// newCatalogProtoBlockHookForTest, when non-nil, runs inside
+// NewCatalog's wasmAnalyzeMu-guarded proto block, before
+// registerWellKnownProtos. Test-only seam for the issue #18
+// lock-leak-on-panic regression test; never set in production.
+var newCatalogProtoBlockHookForTest func()
 
 // DescriptorPool returns the catalog's protobuf DescriptorPool. The
 // pool is created at NewCatalog time and shared across the catalog's
@@ -1489,6 +1557,7 @@ func (c *Catalog) DescriptorPool() *googlesql.DescriptorPool {
 // MakeEnumType and pin them on the catalog under their fully-qualified
 // names so subsequent SQL can reference them.
 func (c *Catalog) RegisterProto(fileDescriptorProtoBytes []byte) error {
+	c.bumpAnalysisGeneration()
 	if c.descriptorPool == nil {
 		return fmt.Errorf("catalog has no DescriptorPool — proto registration unavailable")
 	}
@@ -1506,14 +1575,18 @@ func (c *Catalog) RegisterProto(fileDescriptorProtoBytes []byte) error {
 	if !ok {
 		return fmt.Errorf("RegisterProto: invalid FileDescriptorProto wire format")
 	}
-	c.mu.Lock()
-	fd, err := c.descriptorPool.BuildFile(fdProto)
-	if err != nil {
-		c.mu.Unlock()
+	// Deferred unlock inside a closure: BuildFile crosses the wasm
+	// FFI boundary, and an analyzer abort there surfaces as a Go
+	// panic — manual Unlock calls on each return path would leak
+	// c.mu on that panic (issue #18).
+	if err := func() error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		_, err := c.descriptorPool.BuildFile(fdProto)
+		return err
+	}(); err != nil {
 		return fmt.Errorf("RegisterProto: BuildFile: %w", err)
 	}
-	_ = fd
-	c.mu.Unlock()
 	// Mirror the registration on the Go-side proto registry so the
 	// runtime (CAST(STRING AS Proto) text-format parsing, value
 	// formatters, etc.) can resolve the descriptor without crossing
@@ -1546,6 +1619,7 @@ func (c *Catalog) RegisterProto(fileDescriptorProtoBytes []byte) error {
 // ("foo.bar.MyMessage"). The same `fullName` is used as the catalog
 // key and is what SQL must reference.
 func (c *Catalog) RegisterProtoMessage(fullName string) (*googlesql.ProtoType, error) {
+	c.bumpAnalysisGeneration()
 	if c.descriptorPool == nil {
 		return nil, fmt.Errorf("catalog has no DescriptorPool — proto registration unavailable")
 	}
@@ -1575,6 +1649,7 @@ func (c *Catalog) RegisterProtoMessage(fullName string) (*googlesql.ProtoType, e
 // the dotted name of the enum type. The returned *EnumType is pinned
 // on the catalog at that name.
 func (c *Catalog) RegisterEnum(fullName string) (*googlesql.EnumType, error) {
+	c.bumpAnalysisGeneration()
 	if c.descriptorPool == nil {
 		return nil, fmt.Errorf("catalog has no DescriptorPool — enum registration unavailable")
 	}
@@ -1611,6 +1686,7 @@ func (c *Catalog) LookupProtoType(fullName string) *googlesql.ProtoType {
 // Idempotent on the canonical name path; CREATE_OR_REPLACE simply
 // overwrites the previous entry.
 func (c *Catalog) AddPropertyGraph(spec *propertyGraphSpec) {
+	c.bumpAnalysisGeneration()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.propertyGraphs[spec.Name] = spec
@@ -1674,7 +1750,7 @@ func (c *Catalog) getOrCreateSubCatalog(parent *googlesql.SimpleCatalog, name st
 	if existing, ok := subs[name]; ok {
 		return existing
 	}
-	sub := newSimpleCatalog(name)
+	sub := newBareSubCatalog(name)
 	if sub == nil {
 		return nil
 	}
@@ -1874,7 +1950,7 @@ func (c *Catalog) Sync(ctx context.Context, conn *Conn) error {
 	now := time.Now()
 	rows, err := conn.QueryContext(
 		ctx,
-		`SELECT name, kind, spec FROM googlesqlite_catalog WHERE updatedAt >= @lastUpdatedAt`,
+		`SELECT name, kind, spec FROM googlesqlite_catalog WHERE updatedAt >= ?`,
 		c.lastSyncedAt,
 	)
 	if err != nil {
@@ -1999,6 +2075,7 @@ func (c *Catalog) DeleteFunctionSpec(ctx context.Context, conn *Conn, name strin
 }
 
 func (c *Catalog) deleteTableSpecByName(name string) error {
+	c.bumpAnalysisGeneration()
 	spec, exists := c.tableMap[name]
 	if !exists {
 		return fmt.Errorf("failed to find table spec from map by %s", name)
@@ -2018,6 +2095,7 @@ func (c *Catalog) deleteTableSpecByName(name string) error {
 }
 
 func (c *Catalog) deleteFunctionSpecByName(name string) error {
+	c.bumpAnalysisGeneration()
 	spec, exists := c.funcMap[name]
 	if !exists {
 		return fmt.Errorf("failed to find function spec from map by %s", name)
@@ -2037,6 +2115,7 @@ func (c *Catalog) deleteFunctionSpecByName(name string) error {
 }
 
 func (c *Catalog) deleteTVFSpecByName(name string) error {
+	c.bumpAnalysisGeneration()
 	spec, exists := c.tvfMap[name]
 	if !exists {
 		return fmt.Errorf("failed to find TVF spec from map by %s", name)
@@ -2056,6 +2135,7 @@ func (c *Catalog) deleteTVFSpecByName(name string) error {
 }
 
 func (c *Catalog) resetCatalog(tables []*TableSpec, functions []*FunctionSpec, tvfs []*TVFSpec) error {
+	c.bumpAnalysisGeneration()
 	c.catalog = newSimpleCatalog(catalogName)
 	if c.catalog == nil {
 		return fmt.Errorf("failed to create catalog")
@@ -2106,6 +2186,17 @@ func (c *Catalog) resetCatalog(tables []*TableSpec, functions []*FunctionSpec, t
 	// pressure that pins thousands of catalogs in the wasm heap until
 	// it exhausts and `wasm_alloc` starts returning OOB.
 	c.subCatalogs = map[*googlesql.SimpleCatalog]map[string]*googlesql.SimpleCatalog{}
+	// Issue #19: push the retired catalog tree toward reclamation NOW
+	// instead of waiting for an organic GC cycle. The wasm-side
+	// objects are released by Go finalizers (free is enqueued, then
+	// drained on the next top-level module entry — i.e. during the
+	// re-registration below), so a forced collection here turns
+	// "unreachable eventually" into "freed before the rebuild
+	// allocates its replacement". Under sustained DDL churn the
+	// organic-GC path let allocation outpace reclamation and the
+	// analyzer heap exhausted; resets are rare after the addTableSpec
+	// equivalence gates, so one collection per reset is cheap.
+	runtime.GC()
 	for _, spec := range tables {
 		if err := c.addTableSpec(spec); err != nil {
 			return err
@@ -2236,10 +2327,29 @@ func (c *Catalog) trimmedLastPath(path []string) []string {
 }
 
 func (c *Catalog) addTVFSpec(spec *TVFSpec) error {
+	c.bumpAnalysisGeneration()
 	tvfName := spec.TVFName()
-	if _, exists := c.tvfMap[tvfName]; exists {
-		c.tvfMap[tvfName] = spec
-		return nil
+	if old, exists := c.tvfMap[tvfName]; exists {
+		tvfs := make([]*TVFSpec, 0, len(c.tvfs))
+		oldName := c.formatNamePath(old.NamePath)
+		replaced := false
+		for _, tvf := range c.tvfs {
+			if c.formatNamePath(tvf.NamePath) == oldName {
+				tvfs = append(tvfs, spec)
+				replaced = true
+				continue
+			}
+			tvfs = append(tvfs, tvf)
+		}
+		if !replaced {
+			tvfs = append(tvfs, spec)
+		}
+		if tvfSpecAnalyzerEquivalent(old, spec) {
+			c.tvfs = tvfs
+			c.tvfMap[tvfName] = spec
+			return nil
+		}
+		return c.resetCatalog(c.tables, c.functions, tvfs)
 	}
 	c.tvfs = append(c.tvfs, spec)
 	c.tvfMap[tvfName] = spec
@@ -2249,7 +2359,17 @@ func (c *Catalog) addTVFSpec(spec *TVFSpec) error {
 	return nil
 }
 
+func tvfSpecAnalyzerEquivalent(a, b *TVFSpec) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return reflect.DeepEqual(a.NamePath, b.NamePath) &&
+		reflect.DeepEqual(a.Args, b.Args) &&
+		reflect.DeepEqual(a.OutputColumns, b.OutputColumns)
+}
+
 func (c *Catalog) addFunctionSpec(spec *FunctionSpec) error {
+	c.bumpAnalysisGeneration()
 	funcName := spec.FuncName()
 	if _, exists := c.funcMap[funcName]; exists {
 		c.funcMap[funcName] = spec // update current spec
@@ -2265,13 +2385,34 @@ func (c *Catalog) addFunctionSpec(spec *FunctionSpec) error {
 
 func (c *Catalog) addTableSpec(spec *TableSpec) error {
 	tableName := spec.TableName()
-	if _, exists := c.tableMap[tableName]; exists {
-		// Refresh the entry in-place: CREATE OR REPLACE TABLE has to
-		// update INFORMATION_SCHEMA's view of columns and options as
-		// well as the resolver-side handle. Replace the existing
-		// pointer in c.tables and re-register through the analyzer
-		// catalog. Mapping the new pointer keeps any cached
-		// re-analysis pinned to the latest spec.
+	if old, exists := c.tableMap[tableName]; exists {
+		// CREATE OR REPLACE TABLE/VIEW and Sync re-loads of saved
+		// specs land here. Issue #19: the replace path used to call
+		// resetCatalog unconditionally, so a dbt build (every model
+		// is CREATE OR REPLACE, plus every save echoes back through
+		// the next Sync) rebuilt the WHOLE analyzer catalog — full
+		// builtin + extension function surface per sub-catalog — once
+		// per statement over a growing spec set. Per-statement cost
+		// climbed with catalog size and the analyzer wasm heap filled
+		// until bad_alloc. Gate the rebuild on what actually changed:
+		//
+		//  1. byte-identical spec (modulo bookkeeping timestamps):
+		//     typically a Sync echo of a row this process just saved.
+		//     Nothing the analyzer or the analysis cache can observe
+		//     changed — swap the pointer, keep the cache, done.
+		//  2. analyzer-equivalent spec (same name path, columns,
+		//     primary key, anonymization option): the registered
+		//     SimpleTable handle is still accurate. Swap the Go-side
+		//     registries and invalidate the analysis cache (Query /
+		//     DefaultExpr / options may differ — those are read from
+		//     tableMap at lowering time, so the pointer swap is
+		//     enough) but skip the wasm rebuild entirely.
+		//  3. schema change (issue #10): rebuild via resetCatalog.
+		//     The wasm-side SimpleCatalog has no table-removal API
+		//     and addTableSpecRecursive skips already-registered
+		//     names, so a fresh catalog is the only way to shed the
+		//     stale SimpleTable handle under every lookup alias.
+		identical := tableSpecsEqualIgnoringTimes(old, spec)
 		c.tableMap[tableName] = spec
 		for i := range c.tables {
 			if c.tables[i].TableName() == tableName {
@@ -2279,8 +2420,19 @@ func (c *Catalog) addTableSpec(spec *TableSpec) error {
 				break
 			}
 		}
+		if identical {
+			return nil
+		}
+		c.bumpAnalysisGeneration()
+		if tableSpecsAnalyzerEquivalent(old, spec) {
+			return nil
+		}
+		if err := c.resetCatalog(c.tables, c.functions, c.tvfs); err != nil {
+			return fmt.Errorf("failed to rebuild catalog for replaced table %q: %w", tableName, err)
+		}
 		return nil
 	}
+	c.bumpAnalysisGeneration()
 	c.tables = append(c.tables, spec)
 	c.tableMap[tableName] = spec
 	if err := c.addTableSpecRecursive(c.catalog, spec); err != nil {
@@ -2304,6 +2456,81 @@ func (c *Catalog) addTableSpec(spec *TableSpec) error {
 		}
 	}
 	return nil
+}
+
+// tableSpecsEqualIgnoringTimes reports whether two table specs are
+// byte-identical in their canonical JSON encoding once the
+// bookkeeping timestamps are zeroed. Used by addTableSpec to detect
+// Sync echoes: saveTableSpec bumps updatedAt on every save, so the
+// next Sync re-reads and re-adds a spec this process already holds.
+func tableSpecsEqualIgnoringTimes(a, b *TableSpec) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	ca, cb := *a, *b
+	ca.UpdatedAt, ca.CreatedAt = time.Time{}, time.Time{}
+	cb.UpdatedAt, cb.CreatedAt = time.Time{}, time.Time{}
+	ja, errA := json.Marshal(&ca)
+	jb, errB := json.Marshal(&cb)
+	return errA == nil && errB == nil && bytes.Equal(ja, jb)
+}
+
+// tableSpecsAnalyzerEquivalent reports whether two specs produce
+// indistinguishable analyzer-side registrations. tableHandleForSpec
+// reads the NamePath (which also fixes the alias set), the column
+// names and types, PrimaryKey, and the anonymization_userid_column
+// option — nothing else on the spec reaches the SimpleTable handle.
+// A view<->table flip is treated as a change out of caution even
+// though the handle itself would not differ.
+func tableSpecsAnalyzerEquivalent(a, b *TableSpec) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if a.IsView != b.IsView {
+		return false
+	}
+	if !slices.Equal(a.NamePath, b.NamePath) || !slices.Equal(a.PrimaryKey, b.PrimaryKey) {
+		return false
+	}
+	if len(a.Columns) != len(b.Columns) {
+		return false
+	}
+	for i := range a.Columns {
+		ca, cb := a.Columns[i], b.Columns[i]
+		if ca == nil || cb == nil {
+			if ca != cb {
+				return false
+			}
+			continue
+		}
+		if ca.Name != cb.Name || !columnTypesEqual(ca.Type, cb.Type) {
+			return false
+		}
+	}
+	return anonymizationUserIDColumn(a.Options) == anonymizationUserIDColumn(b.Options)
+}
+
+// columnTypesEqual compares two column type trees structurally via
+// their JSON encoding (Type is a plain JSON-codable value tree).
+func columnTypesEqual(a, b *Type) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	ja, errA := json.Marshal(a)
+	jb, errB := json.Marshal(b)
+	return errA == nil && errB == nil && bytes.Equal(ja, jb)
+}
+
+// anonymizationUserIDColumn extracts the analyzer-visible
+// anonymization_userid_column option value (see applyTableOptions);
+// empty string when the option is absent.
+func anonymizationUserIDColumn(opts []*tableOptionSpec) string {
+	for _, o := range opts {
+		if o != nil && strings.EqualFold(o.Name, "anonymization_userid_column") {
+			return stripQuotes(strings.TrimSpace(o.Value))
+		}
+	}
+	return ""
 }
 
 func (c *Catalog) addTableSpecRecursive(cat *googlesql.SimpleCatalog, spec *TableSpec) error {

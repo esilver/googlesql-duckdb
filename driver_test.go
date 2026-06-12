@@ -6,9 +6,11 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,6 +32,8 @@ import (
 // Expected behaviour is encoded in driver.go GoDoc and in the
 // existing test suite (memory_dsn_isolation_test.go,
 // name_path_public_test.go, transaction_test.go, recover_panic_test.go).
+
+var customDriverCounter atomic.Uint64
 
 // ------------------------------------------------------------------
 // Driver.Open / Driver.Driver / connector lifecycle
@@ -432,7 +436,7 @@ func TestTimeFromTimestampValue_AllForms(t *testing.T) {
 // in the pool when SetMaxOpenConns(1) is in effect).
 func TestFileDSN_SharedCacheKeepsState(t *testing.T) {
 	t.Parallel()
-	dsn := "file:shared_test_kept?mode=memory&cache=shared"
+	dsn := fmt.Sprintf("file:shared_test_kept_%d?mode=memory&cache=shared", customDriverCounter.Add(1))
 	ctx := context.Background()
 
 	db, err := sql.Open("googlesqlite", dsn)
@@ -2831,15 +2835,17 @@ CREATE VIEW IF NOT EXISTS SingerNames AS SELECT FirstName || ' ' || LastName AS 
 }
 
 func TestRegisterCustomDriver(t *testing.T) {
-	sql.Register("googlesqlite-custom", &googlesqlite.Driver{
+	driverName := fmt.Sprintf("googlesqlite-custom-%d", customDriverCounter.Add(1))
+	sql.Register(driverName, &googlesqlite.Driver{
 		ConnectHook: func(conn *googlesqlite.Conn) error {
 			return conn.SetNamePath([]string{"project-id", "datasetID"})
 		},
 	})
-	db, err := sql.Open("googlesqlite-custom", ":memory:")
+	db, err := sql.Open(driverName, ":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer db.Close()
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS tableID (Id INT64 NOT NULL)`); err != nil {
 		t.Fatal(err)
 	}

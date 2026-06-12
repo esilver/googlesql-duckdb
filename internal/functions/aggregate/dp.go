@@ -8,13 +8,43 @@ import (
 	"github.com/goccy/googlesqlite/internal/value"
 )
 
+// This file backs the BigQuery / ZetaSQL differential-privacy
+// aggregates on both engine backends. The analyzer's
+// RewriteAnonymization stage lowers a SELECT WITH ANONYMIZATION /
+// WITH DIFFERENTIAL_PRIVACY query into a two-level plan: an inner
+// per-privacy-unit partial aggregate (sum / count / avg / array_agg
+// grouped by the user-id column) feeding an OUTER differential-privacy
+// aggregate over those partials. These constructors implement the
+// outer aggregate.
+//
+// Argument layout the formatter emits for the outer call (see
+// internal/formatter.go AggregateFunctionCall + the DP / anon scan
+// FormatSQL methods):
+//
+//	[partial-value] [positional...] [contribution-bounds] [epsilon] [delta]
+//
+//   - partial-value is the per-user partial: a scalar for SUM / AVG /
+//     COUNT(->SUM), or an ARRAY of the per-user values for VAR_POP /
+//     STDDEV_POP / PERCENTILE_CONT / QUANTILES.
+//   - positional args precede the bounds only for PERCENTILE_CONT (the
+//     0.5 percentile) and QUANTILES (the bucket count).
+//   - contribution-bounds is EITHER a STRUCT<lo, hi> (the
+//     DIFFERENTIAL_PRIVACY surface's contribution_bounds_per_* named
+//     arg) OR two trailing scalar bounds lo, hi (the ANONYMIZATION
+//     surface's CLAMPED BETWEEN lo AND hi). Either, or neither, may be
+//     present.
+//   - epsilon / delta are appended by the formatter from the scan's
+//     OPTIONS so every body can size noise from the privacy budget. The
+//     high-epsilon "without noise" examples (epsilon=1e20) drive the
+//     noise scale to ~0, so the deterministic exact-value assertions
+//     hold.
+
 // flattenToFloats extracts every numeric leaf from a value, walking
 // through arrays. When a value is an ArrayValue, each element is
 // recursively flattened. Non-numeric leaves are skipped silently.
 // Used by the partial-then-final DP aggregates (variance / stddev /
-// percentile / quantile) where the analyzer's RewriteAnonymization
-// stages collect per-privacy-unit values into an ARRAY before the
-// final aggregate consumes them.
+// percentile / quantile) where the per-privacy-unit values arrive as
+// an ARRAY the final aggregate consumes.
 func flattenToFloats(v value.Value) []float64 {
 	if v == nil {
 		return nil
@@ -35,9 +65,11 @@ func flattenToFloats(v value.Value) []float64 {
 // laplaceSample returns a sample from Laplace(0, scale) using a
 // uniform-random inverse-CDF transform. Used by the differential
 // privacy aggregates to add calibrated noise that satisfies
-// (epsilon, delta)-differential privacy.
+// (epsilon, delta)-differential privacy. A non-positive scale (the
+// high-epsilon path collapses sensitivity/epsilon to ~0) yields 0 so
+// the deterministic "without noise" examples match exactly.
 func laplaceSample(scale float64) float64 {
-	if scale <= 0 {
+	if scale <= 0 || math.IsNaN(scale) {
 		return 0
 	}
 	u := rand.Float64() - 0.5
@@ -47,15 +79,113 @@ func laplaceSample(scale float64) float64 {
 	return -scale * math.Log(1-2*u)
 }
 
-// dpContributionBounds reads a STRUCT<lower, upper> Value pair
-// (as produced by GoogleSQL's `contribution_bounds_per_group =>
-// (a, b)` named argument) and returns the (lo, hi) bounds.
-// Returns (-inf, +inf) when the value isn't a STRUCT — that
-// path is unreachable for the rewriter output but defensive.
-func dpContributionBounds(v value.Value) (float64, float64) {
+// dpNoiseEpsilonFloor is the smallest epsilon below which we still add
+// noise. Above the eps where sensitivity/eps underflows to numerical
+// zero (the epsilon=1e20 "without noise" examples) the noise vanishes
+// on its own; this floor only guards the divide.
+const dpNoiseEpsilonFloor = 1e-12
+
+// dpArgs is the parsed outer-aggregate argument shape: the per-user
+// value, any leading positional args (percentile fraction / bucket
+// count), the contribution bounds, and the privacy budget.
+type dpArgs struct {
+	val        value.Value
+	positional []value.Value
+	lo, hi     float64
+	hasBounds  bool
+	eps, delta float64
+}
+
+// clamp restricts x to [lo, hi] when bounds were supplied; otherwise it
+// returns x unchanged (an absent CLAMP / contribution_bounds means no
+// clamping, matching ZetaSQL where the bound is then implicit).
+func (a dpArgs) clamp(x float64) float64 {
+	if !a.hasBounds {
+		return x
+	}
+	if x < a.lo {
+		return a.lo
+	}
+	if x > a.hi {
+		return a.hi
+	}
+	return x
+}
+
+// parseDPArgs splits one Step argument tuple into dpArgs. nLead is the
+// number of leading positional args that sit between the value and the
+// bounds (1 for PERCENTILE_CONT / QUANTILES, 0 otherwise).
+//
+// Both bounds conventions are handled. A STRUCT anywhere after the
+// value supplies (lo, hi) directly. Otherwise the trailing scalars (the
+// args after the leading positionals, minus the epsilon/delta pair) are
+// read as the (lo, hi) pair. epsilon / delta are taken from the last
+// two scalars when the tuple is long enough to carry them.
+func parseDPArgs(args []value.Value, nLead int) dpArgs {
+	out := dpArgs{eps: 1, delta: 0, lo: math.Inf(-1), hi: math.Inf(1)}
+	if len(args) == 0 {
+		return out
+	}
+	out.val = args[0]
+	rest := args[1:]
+
+	// A STRUCT<lo, hi> bound (DIFFERENTIAL_PRIVACY surface). When
+	// present, drop it from rest so it isn't mistaken for a positional
+	// or scalar bound.
+	structIdx := -1
+	for i, a := range rest {
+		if sv, ok := a.(*value.StructValue); ok && sv != nil {
+			out.lo, out.hi = dpStructBounds(sv)
+			out.hasBounds = true
+			structIdx = i
+			break
+		}
+	}
+	if structIdx >= 0 {
+		rest = append(append([]value.Value{}, rest[:structIdx]...), rest[structIdx+1:]...)
+	}
+
+	// epsilon / delta are the last two scalars the formatter appended.
+	// Require enough room beyond the leading positional args before
+	// peeling them so a bare two-arg call (value, eps) is not misread.
+	if len(rest) >= nLead+2 {
+		if f, err := rest[len(rest)-2].ToFloat64(); err == nil {
+			out.eps = f
+		}
+		if f, err := rest[len(rest)-1].ToFloat64(); err == nil {
+			out.delta = f
+		}
+		rest = rest[:len(rest)-2]
+	}
+
+	// Leading positional args (percentile fraction / bucket count).
+	for i := 0; i < nLead && i < len(rest); i++ {
+		out.positional = append(out.positional, rest[i])
+	}
+	if nLead <= len(rest) {
+		rest = rest[nLead:]
+	} else {
+		rest = nil
+	}
+
+	// Remaining scalars (if no STRUCT bound was found) are the
+	// CLAMPED BETWEEN lo AND hi pair from the ANONYMIZATION surface.
+	if !out.hasBounds && len(rest) >= 2 {
+		if lo, err := rest[len(rest)-2].ToFloat64(); err == nil {
+			if hi, err2 := rest[len(rest)-1].ToFloat64(); err2 == nil {
+				out.lo, out.hi, out.hasBounds = lo, hi, true
+			}
+		}
+	}
+	return out
+}
+
+// dpStructBounds reads a STRUCT<lo, hi> Value pair (as produced by
+// GoogleSQL's `contribution_bounds_per_group => (a, b)` named argument)
+// and returns the (lo, hi) bounds.
+func dpStructBounds(sv *value.StructValue) (float64, float64) {
 	lo, hi := math.Inf(-1), math.Inf(1)
-	sv, ok := v.(*value.StructValue)
-	if !ok || sv == nil {
+	if sv == nil {
 		return lo, hi
 	}
 	if len(sv.Values) >= 1 && sv.Values[0] != nil {
@@ -71,92 +201,49 @@ func dpContributionBounds(v value.Value) (float64, float64) {
 	return lo, hi
 }
 
-// dpStep is the inner state shared by every DP aggregate.
-type dpState struct {
-	sum     float64
-	count   int64
-	lo      float64
-	hi      float64
-	eps     float64
-	del     float64
-	allInts bool
+// dpSensitivity returns the L1 sensitivity for a SUM / AVG aggregate
+// with contribution bounds (lo, hi): the largest absolute clamped
+// contribution. An unbounded aggregate falls back to 1.
+func dpSensitivity(a dpArgs) float64 {
+	if !a.hasBounds {
+		return 1
+	}
+	s := math.Max(math.Abs(a.lo), math.Abs(a.hi))
+	if s == 0 || math.IsInf(s, 0) {
+		return 1
+	}
+	return s
 }
 
-// dpStepInto reads the args [value, contribution_bounds, ...,
-// epsilon, delta] and folds the value into the per-aggregator
-// state after clamping to the bounds. The trailing (epsilon,
-// delta) pair (appended by the DifferentialPrivacyAggregateScan
-// formatter) is captured on the state so Done can use it.
-func dpStepInto(s *dpState, args []value.Value) error {
-	if len(args) < 1 {
-		return nil
+// dpScalarValues folds a Step tuple into a running list of clamped
+// per-user contributions. The value may be a scalar or an ARRAY of
+// per-user values; every numeric leaf is clamped and collected.
+func dpCollect(a dpArgs, vals *[]float64) {
+	if a.val == nil {
+		return
 	}
-	for _, a := range args[1:] {
-		if sv, ok := a.(*value.StructValue); ok {
-			s.lo, s.hi = dpContributionBounds(sv)
-			break
-		}
+	for _, f := range flattenToFloats(a.val) {
+		*vals = append(*vals, a.clamp(f))
 	}
-	if len(args) >= 2 {
-		if f, err := args[len(args)-2].ToFloat64(); err == nil {
-			s.eps = f
-		}
-		if f, err := args[len(args)-1].ToFloat64(); err == nil {
-			s.del = f
-		}
-	}
-	if args[0] == nil {
-		return nil
-	}
-	// Some analyzer rewrite paths box the scalar input as an ARRAY
-	// (the per-privacy-unit partial aggregate's collected values).
-	// Flatten through it so every leaf contributes to the running
-	// sum / count, with clamping applied per leaf.
-	for _, f := range flattenToFloats(args[0]) {
-		if f < s.lo {
-			f = s.lo
-		}
-		if f > s.hi {
-			f = s.hi
-		}
-		s.sum += f
-		s.count++
-	}
-	return nil
 }
-
-// dpSensitivitySum returns the L1 sensitivity for a SUM/AVG
-// aggregate with contribution bounds (lo, hi).
-func dpSensitivitySum(lo, hi float64) float64 {
-	return math.Max(math.Abs(lo), math.Abs(hi))
-}
-
-// BindDifferentialPrivacySumInt / BindDifferentialPrivacySumDouble /
-// BindDifferentialPrivacyCount / ... all share a common runtime
-// shape: they accumulate (clamped, summed) values during Step and
-// emit a noised final value in Done. We register them as separate
-// SQLite aggregate functions because the analyzer dispatches by
-// signature id.
-//
-// The arg list at runtime is (value, contribution_bounds_struct,
-// ..., epsilon, delta) — the contributor-bounds STRUCT is
-// optional (analyzer omits it for COUNT_STAR; the bounds default
-// to (-inf, +inf) and we fall back to a fixed sensitivity = 1).
 
 func BindDifferentialPrivacySum() func() *helper.Aggregator {
 	return func() *helper.Aggregator {
-		st := &dpState{lo: math.Inf(-1), hi: math.Inf(1), eps: 1, allInts: true}
+		var vals []float64
+		var pa dpArgs
 		return helper.NewAggregator(
 			func(args []value.Value, _ *helper.Option) error {
-				return dpStepInto(st, args)
+				pa = parseDPArgs(args, 0)
+				dpCollect(pa, &vals)
+				return nil
 			},
 			func() (value.Value, error) {
-				sens := dpSensitivitySum(st.lo, st.hi)
-				if math.IsInf(sens, 1) {
-					sens = 1
+				var sum float64
+				for _, v := range vals {
+					sum += v
 				}
-				scale := sens / math.Max(st.eps, 1e-12)
-				return value.FloatValue(st.sum + laplaceSample(scale)), nil
+				scale := dpSensitivity(pa) / math.Max(pa.eps, dpNoiseEpsilonFloor)
+				return value.FloatValue(sum + laplaceSample(scale)), nil
 			},
 		)
 	}
@@ -165,33 +252,17 @@ func BindDifferentialPrivacySum() func() *helper.Aggregator {
 func BindDifferentialPrivacyCount() func() *helper.Aggregator {
 	return func() *helper.Aggregator {
 		var n int64
-		var lo, hi float64 = 0, 1
-		eps := 1.0
+		var pa dpArgs
 		return helper.NewAggregator(
 			func(args []value.Value, _ *helper.Option) error {
-				if len(args) == 0 || args[0] == nil {
-					return nil
+				pa = parseDPArgs(args, 0)
+				if pa.val != nil {
+					n++
 				}
-				for _, a := range args[1:] {
-					if sv, ok := a.(*value.StructValue); ok {
-						lo, hi = dpContributionBounds(sv)
-						break
-					}
-				}
-				if len(args) >= 2 {
-					if f, err := args[len(args)-2].ToFloat64(); err == nil {
-						eps = f
-					}
-				}
-				n++
 				return nil
 			},
 			func() (value.Value, error) {
-				sens := math.Max(math.Abs(lo), math.Abs(hi))
-				if sens == 0 {
-					sens = 1
-				}
-				scale := sens / math.Max(eps, 1e-12)
+				scale := dpSensitivity(pa) / math.Max(pa.eps, dpNoiseEpsilonFloor)
 				return value.IntValue(int64(math.Round(float64(n) + laplaceSample(scale)))), nil
 			},
 		)
@@ -201,19 +272,17 @@ func BindDifferentialPrivacyCount() func() *helper.Aggregator {
 func BindDifferentialPrivacyCountStar() func() *helper.Aggregator {
 	return func() *helper.Aggregator {
 		var n int64
-		var eps, _ = 1.0, 0.0
+		var pa dpArgs
 		return helper.NewAggregator(
 			func(args []value.Value, _ *helper.Option) error {
-				if len(args) >= 2 {
-					if f, err := args[len(args)-2].ToFloat64(); err == nil {
-						eps = f
-					}
-				}
+				pa = parseDPArgs(args, 0)
 				n++
 				return nil
 			},
 			func() (value.Value, error) {
-				scale := 1.0 / math.Max(eps, 1e-12)
+				// COUNT(*) sensitivity is 1 (adding/removing one user
+				// changes the count by 1).
+				scale := 1.0 / math.Max(pa.eps, dpNoiseEpsilonFloor)
 				return value.IntValue(int64(math.Round(float64(n) + laplaceSample(scale)))), nil
 			},
 		)
@@ -222,21 +291,24 @@ func BindDifferentialPrivacyCountStar() func() *helper.Aggregator {
 
 func BindDifferentialPrivacyAvg() func() *helper.Aggregator {
 	return func() *helper.Aggregator {
-		st := &dpState{lo: math.Inf(-1), hi: math.Inf(1), eps: 1}
+		var vals []float64
+		var pa dpArgs
 		return helper.NewAggregator(
 			func(args []value.Value, _ *helper.Option) error {
-				return dpStepInto(st, args)
+				pa = parseDPArgs(args, 0)
+				dpCollect(pa, &vals)
+				return nil
 			},
 			func() (value.Value, error) {
-				if st.count == 0 {
-					return value.FloatValue(0), nil
+				if len(vals) == 0 {
+					return nil, nil
 				}
-				sens := dpSensitivitySum(st.lo, st.hi)
-				if math.IsInf(sens, 1) {
-					sens = 1
+				var sum float64
+				for _, v := range vals {
+					sum += v
 				}
-				scale := sens / math.Max(st.eps, 1e-12)
-				mean := (st.sum + laplaceSample(scale)) / float64(st.count)
+				scale := dpSensitivity(pa) / math.Max(pa.eps, dpNoiseEpsilonFloor)
+				mean := (sum + laplaceSample(scale)) / float64(len(vals))
 				return value.FloatValue(mean), nil
 			},
 		)
@@ -245,34 +317,22 @@ func BindDifferentialPrivacyAvg() func() *helper.Aggregator {
 
 func BindDifferentialPrivacyVarPop() func() *helper.Aggregator {
 	return func() *helper.Aggregator {
-		var values []float64
-		st := &dpState{lo: math.Inf(-1), hi: math.Inf(1), eps: 1}
+		var vals []float64
+		var pa dpArgs
 		return helper.NewAggregator(
 			func(args []value.Value, _ *helper.Option) error {
-				if err := dpStepInto(st, args); err != nil {
-					return err
-				}
-				if args[0] != nil {
-					values = append(values, flattenToFloats(args[0])...)
-				}
+				pa = parseDPArgs(args, 0)
+				dpCollect(pa, &vals)
 				return nil
 			},
 			func() (value.Value, error) {
-				if len(values) == 0 {
-					return value.FloatValue(0), nil
+				if len(vals) == 0 {
+					return nil, nil
 				}
-				mean := st.sum / float64(len(values))
-				var ss float64
-				for _, v := range values {
-					ss += (v - mean) * (v - mean)
-				}
-				v := ss / float64(len(values))
-				sens := dpSensitivitySum(st.lo, st.hi)
-				if math.IsInf(sens, 1) {
-					sens = 1
-				}
-				scale := (sens * sens) / math.Max(st.eps, 1e-12)
-				return value.FloatValue(v + laplaceSample(scale)), nil
+				v := popVariance(vals)
+				sens := dpSensitivity(pa)
+				scale := (sens * sens) / math.Max(pa.eps, dpNoiseEpsilonFloor)
+				return value.FloatValue(math.Max(v+laplaceSample(scale), 0)), nil
 			},
 		)
 	}
@@ -280,33 +340,21 @@ func BindDifferentialPrivacyVarPop() func() *helper.Aggregator {
 
 func BindDifferentialPrivacyStddevPop() func() *helper.Aggregator {
 	return func() *helper.Aggregator {
-		var values []float64
-		st := &dpState{lo: math.Inf(-1), hi: math.Inf(1), eps: 1}
+		var vals []float64
+		var pa dpArgs
 		return helper.NewAggregator(
 			func(args []value.Value, _ *helper.Option) error {
-				if err := dpStepInto(st, args); err != nil {
-					return err
-				}
-				if args[0] != nil {
-					values = append(values, flattenToFloats(args[0])...)
-				}
+				pa = parseDPArgs(args, 0)
+				dpCollect(pa, &vals)
 				return nil
 			},
 			func() (value.Value, error) {
-				if len(values) == 0 {
-					return value.FloatValue(0), nil
+				if len(vals) == 0 {
+					return nil, nil
 				}
-				mean := st.sum / float64(len(values))
-				var ss float64
-				for _, v := range values {
-					ss += (v - mean) * (v - mean)
-				}
-				v := ss / float64(len(values))
-				sens := dpSensitivitySum(st.lo, st.hi)
-				if math.IsInf(sens, 1) {
-					sens = 1
-				}
-				scale := (sens * sens) / math.Max(st.eps, 1e-12)
+				v := popVariance(vals)
+				sens := dpSensitivity(pa)
+				scale := (sens * sens) / math.Max(pa.eps, dpNoiseEpsilonFloor)
 				return value.FloatValue(math.Sqrt(math.Max(v+laplaceSample(scale), 0))), nil
 			},
 		)
@@ -316,18 +364,14 @@ func BindDifferentialPrivacyStddevPop() func() *helper.Aggregator {
 func BindDifferentialPrivacyApproxCountDistinct() func() *helper.Aggregator {
 	return func() *helper.Aggregator {
 		seen := map[string]struct{}{}
-		var eps = 1.0
+		var pa dpArgs
 		return helper.NewAggregator(
 			func(args []value.Value, _ *helper.Option) error {
-				if len(args) >= 2 {
-					if f, err := args[len(args)-2].ToFloat64(); err == nil {
-						eps = f
-					}
-				}
-				if len(args) == 0 || args[0] == nil {
+				pa = parseDPArgs(args, 0)
+				if pa.val == nil {
 					return nil
 				}
-				s, err := args[0].ToString()
+				s, err := pa.val.ToString()
 				if err != nil {
 					return err
 				}
@@ -335,7 +379,7 @@ func BindDifferentialPrivacyApproxCountDistinct() func() *helper.Aggregator {
 				return nil
 			},
 			func() (value.Value, error) {
-				scale := 1.0 / math.Max(eps, 1e-12)
+				scale := 1.0 / math.Max(pa.eps, dpNoiseEpsilonFloor)
 				return value.IntValue(int64(math.Round(float64(len(seen)) + laplaceSample(scale)))), nil
 			},
 		)
@@ -343,57 +387,35 @@ func BindDifferentialPrivacyApproxCountDistinct() func() *helper.Aggregator {
 }
 
 // BindDifferentialPrivacyPercentileCont approximates the
-// differentially-private continuous percentile. The percentile
-// argument is captured from args[1]; values flow through args[0]
-// (potentially wrapped in an ARRAY by the partial-aggregate stage).
-// At Done we sort the collected values and linearly interpolate the
-// requested percentile, then add Laplace noise scaled by the
-// contribution-bound sensitivity / epsilon.
+// differentially-private continuous percentile. The percentile fraction
+// is the single leading positional arg; values flow through args[0]
+// (the per-user ARRAY). Done sorts the collected clamped values and
+// linearly interpolates the requested percentile, then adds Laplace
+// noise scaled by the contribution-bound sensitivity / epsilon.
 func BindDifferentialPrivacyPercentileCont() func() *helper.Aggregator {
 	return func() *helper.Aggregator {
-		var values []float64
-		st := &dpState{lo: math.Inf(-1), hi: math.Inf(1), eps: 1}
+		var vals []float64
+		var pa dpArgs
 		percentile := 0.5
 		return helper.NewAggregator(
 			func(args []value.Value, _ *helper.Option) error {
-				if len(args) >= 2 && args[1] != nil {
-					if f, err := args[1].ToFloat64(); err == nil {
+				pa = parseDPArgs(args, 1)
+				if len(pa.positional) >= 1 && pa.positional[0] != nil {
+					if f, err := pa.positional[0].ToFloat64(); err == nil {
 						percentile = f
 					}
 				}
-				if err := dpStepInto(st, args); err != nil {
-					return err
-				}
-				if args[0] != nil {
-					values = append(values, flattenToFloats(args[0])...)
-				}
+				dpCollect(pa, &vals)
 				return nil
 			},
 			func() (value.Value, error) {
-				if len(values) == 0 {
-					return value.FloatValue(0), nil
+				if len(vals) == 0 {
+					return nil, nil
 				}
-				sorted := append([]float64(nil), values...)
+				sorted := append([]float64(nil), vals...)
 				sortFloats(sorted)
-				p := percentile
-				if p < 0 {
-					p = 0
-				}
-				if p > 1 {
-					p = 1
-				}
-				idx := p * float64(len(sorted)-1)
-				lo := int(math.Floor(idx))
-				hi := int(math.Ceil(idx))
-				v := sorted[lo]
-				if hi != lo {
-					v += (sorted[hi] - sorted[lo]) * (idx - float64(lo))
-				}
-				sens := dpSensitivitySum(st.lo, st.hi)
-				if math.IsInf(sens, 1) {
-					sens = 1
-				}
-				scale := sens / math.Max(st.eps, 1e-12)
+				v := interpolatePercentile(sorted, percentile)
+				scale := dpSensitivity(pa) / math.Max(pa.eps, dpNoiseEpsilonFloor)
 				return value.FloatValue(v + laplaceSample(scale)), nil
 			},
 		)
@@ -401,50 +423,36 @@ func BindDifferentialPrivacyPercentileCont() func() *helper.Aggregator {
 }
 
 // BindDifferentialPrivacyQuantiles emits an ARRAY of quantile cut
-// points. The second argument is the number of buckets `n`; the
-// returned array has length `n+1` (`0/n, 1/n, ..., n/n`). Each
-// quantile point gets independent Laplace noise.
+// points. The single leading positional arg is the bucket count n; the
+// returned array has length n+1 (0/n, 1/n, ..., n/n). Each quantile
+// point gets independent Laplace noise.
 func BindDifferentialPrivacyQuantiles() func() *helper.Aggregator {
 	return func() *helper.Aggregator {
-		var values []float64
-		st := &dpState{lo: math.Inf(-1), hi: math.Inf(1), eps: 1}
+		var vals []float64
+		var pa dpArgs
 		buckets := int64(4)
 		return helper.NewAggregator(
 			func(args []value.Value, _ *helper.Option) error {
-				if len(args) >= 2 && args[1] != nil {
-					if n, err := args[1].ToInt64(); err == nil && n > 0 {
+				pa = parseDPArgs(args, 1)
+				if len(pa.positional) >= 1 && pa.positional[0] != nil {
+					if n, err := pa.positional[0].ToInt64(); err == nil && n > 0 {
 						buckets = n
 					}
 				}
-				if err := dpStepInto(st, args); err != nil {
-					return err
-				}
-				if args[0] != nil {
-					values = append(values, flattenToFloats(args[0])...)
-				}
+				dpCollect(pa, &vals)
 				return nil
 			},
 			func() (value.Value, error) {
-				if len(values) == 0 {
+				if len(vals) == 0 {
 					return &value.ArrayValue{}, nil
 				}
-				sorted := append([]float64(nil), values...)
+				sorted := append([]float64(nil), vals...)
 				sortFloats(sorted)
-				sens := dpSensitivitySum(st.lo, st.hi)
-				if math.IsInf(sens, 1) {
-					sens = 1
-				}
-				scale := sens / math.Max(st.eps, 1e-12)
+				scale := dpSensitivity(pa) / math.Max(pa.eps, dpNoiseEpsilonFloor)
 				out := make([]value.Value, 0, buckets+1)
 				for i := int64(0); i <= buckets; i++ {
 					p := float64(i) / float64(buckets)
-					idx := p * float64(len(sorted)-1)
-					lo := int(math.Floor(idx))
-					hi := int(math.Ceil(idx))
-					v := sorted[lo]
-					if hi != lo {
-						v += (sorted[hi] - sorted[lo]) * (idx - float64(lo))
-					}
+					v := interpolatePercentile(sorted, p)
 					out = append(out, value.FloatValue(v+laplaceSample(scale)))
 				}
 				return &value.ArrayValue{Values: out}, nil
@@ -453,9 +461,48 @@ func BindDifferentialPrivacyQuantiles() func() *helper.Aggregator {
 	}
 }
 
+// popVariance returns the population variance of vals.
+func popVariance(vals []float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	var mean float64
+	for _, v := range vals {
+		mean += v
+	}
+	mean /= float64(len(vals))
+	var ss float64
+	for _, v := range vals {
+		ss += (v - mean) * (v - mean)
+	}
+	return ss / float64(len(vals))
+}
+
+// interpolatePercentile returns the linearly-interpolated percentile p
+// (0..1) of a pre-sorted slice.
+func interpolatePercentile(sorted []float64, p float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	if p < 0 {
+		p = 0
+	}
+	if p > 1 {
+		p = 1
+	}
+	idx := p * float64(len(sorted)-1)
+	lo := int(math.Floor(idx))
+	hi := int(math.Ceil(idx))
+	v := sorted[lo]
+	if hi != lo {
+		v += (sorted[hi] - sorted[lo]) * (idx - float64(lo))
+	}
+	return v
+}
+
 func sortFloats(s []float64) {
-	// Small inline insertion sort is enough for the per-group
-	// sizes our DP examples exercise (≤ a few hundred).
+	// Small inline insertion sort is enough for the per-group sizes our
+	// DP examples exercise (a few hundred at most).
 	for i := 1; i < len(s); i++ {
 		for j := i; j > 0 && s[j-1] > s[j]; j-- {
 			s[j-1], s[j] = s[j], s[j-1]

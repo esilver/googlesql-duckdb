@@ -19,16 +19,15 @@ build: build/wasm build/assets build/page
 # (cmd/googlesqlite, the `js && wasm` build) to public/googlesqlite.wasm
 # and copies the matching Go wasm_exec.js loader next to it. Everything
 # under public/ is a generated artifact and is gitignored.
-#
-# -ldflags "-s -w" strips the Go symbol table and DWARF info from the
-# engine wasm; the deployed Playground reads only the compiled bytes
-# and never touches them, and dropping them noticeably reduces the
-# size of both the served .gz and the wasm the browser decompresses.
 build/wasm:
 	mkdir -p $(PUBLIC)
-	cd $(ROOT) && GOOS=js GOARCH=wasm go build -ldflags="-s -w" \
+	cd $(ROOT) && GOOS=js GOARCH=wasm go build -ldflags='-s -w' \
 	  -o docs/playground/$(WASM) ./cmd/googlesqlite
-	cp "$$(go env GOROOT)/lib/wasm/wasm_exec.js" $(PUBLIC)/wasm_exec.js
+	# wasm_exec.js in GOROOT is read-only (0444) and lives in the read-only
+	# module cache; a plain cp inherits that mode, so the NEXT build can't
+	# overwrite it (EACCES). install creates a writable copy, replacing any
+	# stale read-only one.
+	install -m 644 "$$(go env GOROOT)/lib/wasm/wasm_exec.js" $(PUBLIC)/wasm_exec.js
 
 # build/assets derives the artifacts that depend on the engine binary:
 # the packed timezone database, the content-hash build id, and the
@@ -55,8 +54,18 @@ deps:
 
 # dev builds the engine and starts the Vite dev server. The page is
 # served at http://localhost:5173/googlesqlite/.
+#
+# With VITE_ENGINE=server the in-browser wasm engine is not built or
+# loaded: the UI talks to the native engine server instead (run
+# `go run ./cmd/playground` from the repository root first; see
+# cmd/playground/README.md).
+ifeq ($(VITE_ENGINE),server)
+dev:
+	npm run dev
+else
 dev: build/wasm build/assets
 	npm run dev
+endif
 
 # preview serves the production build from dist/.
 preview:

@@ -13,3 +13,34 @@ cases:
     expected:
       rows:
         - ['0-0 5 0:0:0']
+  - desc: negative minutes keep the time-group sign
+    sql: SELECT INTERVAL -45 MINUTE AS i
+    expected:
+      rows:
+        - ['0-0 0 -0:45:0']
+  - desc: negative months keep the year-month-group sign
+    sql: SELECT INTERVAL -2 MONTH AS i
+    expected:
+      rows:
+        - ['-0-2 0 0:0:0']
+  - desc: negative sub-second renders signed fraction
+    sql: SELECT INTERVAL -500 MILLISECOND AS i
+    expected:
+      rows:
+        - ['0-0 0 -0:0:0.5']
+  - desc: mixed per-group signs
+    sql: SELECT INTERVAL '1-2 -3 -4:30:0' YEAR TO SECOND AS i
+    expected:
+      rows:
+        - ['1-2 -3 -4:30:0']
+  - desc: negative day group
+    sql: SELECT INTERVAL -7 DAY AS i
+    expected:
+      rows:
+        - ['0-0 -7 0:0:0']
+  - desc: negative interval survives an array round-trip
+    sql: SELECT i FROM UNNEST([INTERVAL -45 MINUTE, INTERVAL -2 MONTH]) AS i
+    expected:
+      rows:
+        - ['0-0 0 -0:45:0']
+        - ['-0-2 0 0:0:0']

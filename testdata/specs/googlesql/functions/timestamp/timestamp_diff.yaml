@@ -6,3 +6,12 @@ cases:
     expected:
       rows:
         - [3]
+  - desc: Sunday to Monday week variants
+    sql: |-
+      SELECT
+        TIMESTAMP_DIFF(TIMESTAMP "2017-12-18 00:00:00+00", TIMESTAMP "2017-12-17 23:59:59+00", WEEK) AS week_diff,
+        TIMESTAMP_DIFF(TIMESTAMP "2017-12-18 00:00:00+00", TIMESTAMP "2017-12-17 23:59:59+00", WEEK(MONDAY)) AS week_monday_diff,
+        TIMESTAMP_DIFF(TIMESTAMP "2017-12-18 00:00:00+00", TIMESTAMP "2017-12-17 23:59:59+00", ISOWEEK) AS isoweek_diff
+    expected:
+      rows:
+        - [0, 1, 1]

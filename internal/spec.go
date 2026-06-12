@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	googlesql "github.com/goccy/go-googlesql"
@@ -72,6 +74,9 @@ func (s *FunctionSpec) SQL() string {
 	}
 	retType, _ := s.Return.ToGoogleSQLType()
 	return fmt.Sprintf(
+		// Backtick-quote the name: GoogleSQL treats a double-quoted
+		// token as a string literal, so "name" fails to parse
+		// ("Unexpected string literal") on the wasm analyzer.
 		"CREATE FUNCTION `%s`(%s) RETURNS %v AS (%s)",
 		s.FuncName(),
 		strings.Join(args, ", "),
@@ -95,6 +100,8 @@ func (s *FunctionSpec) CallSQL(ctx context.Context, callNode *ResolvedBaseFuncti
 		}
 		funcName := strings.Join(s.NamePath, ".")
 		runtimeDefinedFunc := fmt.Sprintf(
+			// Backtick-quoted: a double-quoted name is a string
+			// literal to the GoogleSQL parser and fails analysis.
 			"CREATE FUNCTION `%s`(%s) as (%s)",
 			funcName,
 			strings.Join(definedArgs, ","),
@@ -109,10 +116,26 @@ func (s *FunctionSpec) CallSQL(ctx context.Context, callNode *ResolvedBaseFuncti
 	} else {
 		body = s.Body
 	}
-	for i := 0; i < len(s.Args); i++ {
-		argRef := fmt.Sprintf("@%s", s.Args[i].Name)
+	// Substitute longer argument names first so a parameter named `x`
+	// cannot clobber the `$x...` prefix of a sibling named `x2`.
+	order := make([]int, len(s.Args))
+	for i := range s.Args {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		return len(s.Args[order[a]].Name) > len(s.Args[order[b]].Name)
+	})
+	for _, i := range order {
 		value := argValues[i]
-		body = strings.Replace(body, argRef, value, -1)
+		// Argument references reach the body under two sigils depending
+		// on the function language. SQL-expression bodies are formatted
+		// through ArgumentRefNode, which on the DuckDB target renders an
+		// argument as `$name`; the JavaScript path (newFunctionSpec)
+		// hand-builds its googlesqlite_eval_javascript call with `@name`
+		// placeholders. Substitute both so either body form binds the
+		// caller's value.
+		body = strings.ReplaceAll(body, fmt.Sprintf("@%s", s.Args[i].Name), value)
+		body = strings.ReplaceAll(body, fmt.Sprintf("$%s", s.Args[i].Name), value)
 	}
 	return fmt.Sprintf("( %s )", body), nil
 }
@@ -127,6 +150,23 @@ type TableSpec struct {
 	Query      string                                            `json:"query"`
 	UpdatedAt  time.Time                                         `json:"updatedAt"`
 	CreatedAt  time.Time                                         `json:"createdAt"`
+	// StorageVersion records which storage convention the table's cells
+	// were written under, so databases created before a storage
+	// migration keep reading correctly after it (compat mode (b) of the
+	// native-storage migration spec). Absent (0) for tables created
+	// before versioning existed:
+	//
+	//	0 — legacy: NUMERIC cells are value-layer base64 envelopes in a
+	//	    TEXT column; BYTES cells are envelope ASCII in a BLOB column.
+	//	1 — native: NUMERIC is a DECIMAL(38,9) column; BYTES BLOB cells
+	//	    hold the payload bytes. (BIGNUMERIC stays a TEXT envelope at
+	//	    both versions — it exceeds DuckDB's 38-digit DECIMAL.)
+	//
+	// New tables are always written at currentStorageVersion. Reads are
+	// shape-tolerant either way (the decoder sniffs envelopes); the
+	// version gates the WRITE paths that must produce the table's actual
+	// cell representation (CREATE TABLE column types, BulkInsert).
+	StorageVersion int `json:"storageVersion,omitempty"`
 	// Options carries the CREATE TABLE ... OPTIONS(name=value, ...)
 	// clause. Each entry has a stable on-disk identity in the JSON
 	// schema (the option name) and an opaque value string; the
@@ -162,11 +202,11 @@ func (s *TableSpec) SQLiteSchema() string {
 		return viewSQLiteSchema(s)
 	}
 	if s.Query != "" {
-		return fmt.Sprintf("CREATE TABLE `%s` AS %s", s.TableName(), s.Query)
+		return fmt.Sprintf("CREATE TABLE \"%s\" AS %s", s.TableName(), s.Query)
 	}
 	columns := []string{}
 	for _, c := range s.Columns {
-		columns = append(columns, c.SQLiteSchema())
+		columns = append(columns, c.sqliteSchemaVersioned(s.legacyStorage()))
 	}
 	if len(s.PrimaryKey) != 0 {
 		columns = append(
@@ -183,7 +223,7 @@ func (s *TableSpec) SQLiteSchema() string {
 	case googlesql.ResolvedCreateStatementEnums_CreateModeCreateIfNotExists:
 		stmt = "CREATE TABLE IF NOT EXISTS"
 	}
-	return fmt.Sprintf("%s `%s` (%s)", stmt, s.TableName(), strings.Join(columns, ","))
+	return fmt.Sprintf("%s \"%s\" (%s)", stmt, s.TableName(), strings.Join(columns, ","))
 }
 
 func viewSQLiteSchema(s *TableSpec) string {
@@ -196,7 +236,7 @@ func viewSQLiteSchema(s *TableSpec) string {
 	case googlesql.ResolvedCreateStatementEnums_CreateModeCreateIfNotExists:
 		stmt = "CREATE VIEW IF NOT EXISTS"
 	}
-	return fmt.Sprintf("%s `%s` AS %s", stmt, s.TableName(), s.Query)
+	return fmt.Sprintf("%s \"%s\" AS %s", stmt, s.TableName(), s.Query)
 }
 
 type ColumnSpec struct {
@@ -211,12 +251,11 @@ type ColumnSpec struct {
 	DefaultExpr string `json:"defaultExpr,omitempty"`
 }
 
-// TVFSpec captures a `CREATE TABLE FUNCTION` definition so the call
-// site (`ResolvedTVFScan`) can be inlined as a subquery at format
-// time. The body is the analyzed-and-formatted query of the TVF body
-// in the same canonical form used by `TableSpec.Query` for views: a
-// `SELECT col#id AS col, ... FROM (...)` envelope that exposes the
-// TVF's declared output column names.
+// TVFSpec captures a `CREATE TABLE FUNCTION` definition so the resolved
+// call site can be lowered as a subquery at format time. The body is the
+// analyzed-and-formatted query of the TVF body in the same canonical form
+// used by `TableSpec.Query` for views: a `SELECT col#id AS col, ... FROM (...)`
+// envelope that exposes the TVF's declared output column names.
 type TVFSpec struct {
 	IsTemp        bool            `json:"isTemp"`
 	NamePath      []string        `json:"namePath"`
@@ -245,18 +284,34 @@ func (s *TVFSpec) CallSQL(argValues []string, callOutputColumns []string) (strin
 		)
 	}
 	body := s.Body
-	for i, arg := range s.Args {
+	// Substitute longer argument names first so a parameter named `x`
+	// cannot clobber the `$x...` / `@x...` prefix of a sibling named
+	// `x2`, mirroring FunctionSpec.CallSQL.
+	order := make([]int, len(s.Args))
+	for i := range s.Args {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		return len(s.Args[order[a]].Name) > len(s.Args[order[b]].Name)
+	})
+	for _, i := range order {
 		if i >= len(argValues) {
-			break
+			continue
 		}
-		argRef := fmt.Sprintf("@%s", arg.Name)
-		body = strings.Replace(body, argRef, argValues[i], -1)
+		// Argument references reach the body under two sigils: the
+		// DuckDB-target ArgumentRefNode renders `$name`, the legacy
+		// SQLite target rendered `@name`. Substitute both; a leftover
+		// `$name` would otherwise be parsed by DuckDB as an unbound
+		// named parameter ("Expected N parameters, but none were
+		// supplied").
+		body = strings.ReplaceAll(body, fmt.Sprintf("@%s", s.Args[i].Name), argValues[i])
+		body = strings.ReplaceAll(body, fmt.Sprintf("$%s", s.Args[i].Name), argValues[i])
 	}
 	projections := make([]string, 0, len(s.OutputColumns))
 	for i, col := range s.OutputColumns {
 		projections = append(
 			projections,
-			fmt.Sprintf("`%s` AS `%s`", col.Name, callOutputColumns[i]),
+			fmt.Sprintf("\"%s\" AS \"%s\"", col.Name, callOutputColumns[i]),
 		)
 	}
 	return fmt.Sprintf(
@@ -396,7 +451,7 @@ func (t *Type) FormatType() string {
 	case googlesql.TypeKindTypeStruct:
 		formatTypes := make([]string, 0, len(t.FieldTypes))
 		for _, field := range t.FieldTypes {
-			formatTypes = append(formatTypes, fmt.Sprintf("`%s` %s", field.Name, field.Type.FormatType()))
+			formatTypes = append(formatTypes, fmt.Sprintf("\"%s\" %s", field.Name, field.Type.FormatType()))
 		}
 		return fmt.Sprintf("STRUCT<%s>", strings.Join(formatTypes, ","))
 	case googlesql.TypeKindTypeArray:
@@ -451,11 +506,61 @@ func typeKindToSQLName(kind googlesql.TypeKind) string {
 	return fmt.Sprintf("%v", kind)
 }
 
+// currentStorageVersion is the TableSpec.StorageVersion stamped onto
+// every newly created table. See the StorageVersion field doc for the
+// per-version cell conventions.
+const currentStorageVersion = 1
+
+// legacyStorage reports whether the table's cells follow the pre-native
+// storage convention (NUMERIC TEXT envelopes, BYTES envelope-ASCII
+// blobs) — i.e. the spec was created before the native-storage
+// migration and must keep its legacy column types / cell encodings.
+func (s *TableSpec) legacyStorage() bool {
+	return s.StorageVersion < currentStorageVersion
+}
+
 func (s *ColumnSpec) SQLiteSchema() string {
+	return s.sqliteSchemaVersioned(false)
+}
+
+func (s *ColumnSpec) sqliteSchemaVersioned(legacy bool) string {
+	typ := storageTypeForKindVersioned(googlesql.TypeKind(s.Type.Kind), legacy)
+	schema := fmt.Sprintf("\"%s\" %s", s.Name, typ)
+	if s.IsNotNull {
+		schema += " NOT NULL"
+	}
+	return schema
+}
+
+// storageTypeForKind maps a GoogleSQL column kind to the DuckDB column type
+// its cells are stored in — the single source of truth shared by the CREATE
+// TABLE schema rendering (SQLiteSchema) and the bulk-insert seam (which must
+// produce/cast into exactly these storage types; see internal/bulkinsert.go).
+func storageTypeForKind(kind googlesql.TypeKind) string {
+	return storageTypeForKindVersioned(kind, false)
+}
+
+// storageTypeForKindVersioned is storageTypeForKind with the table's
+// storage convention made explicit: legacy=true renders the pre-native
+// column types for tables whose cells were written before the
+// native-storage migration (TableSpec.legacyStorage). Only NUMERIC
+// differs at the schema level (TEXT envelope vs DECIMAL(38,9)); legacy
+// BYTES columns are also BLOB, their cells just hold envelope ASCII
+// instead of payload bytes.
+func storageTypeForKindVersioned(kind googlesql.TypeKind, legacy bool) string {
+	if legacy && kind == googlesql.TypeKindTypeNumeric {
+		return "TEXT"
+	}
 	var typ string
-	switch googlesql.TypeKind(s.Type.Kind) {
+	switch kind {
 	case googlesql.TypeKindTypeInt32, googlesql.TypeKindTypeInt64, googlesql.TypeKindTypeUint32, googlesql.TypeKindTypeUint64:
-		typ = "INT"
+		// BIGINT, not INT: GoogleSQL INT64 is 64-bit, and DuckDB's INT is
+		// the 32-bit INTEGER. Storing INT64 columns as INTEGER both
+		// truncates the upper half of the domain and forces the engine to
+		// run an int64->int32 cast on every inserted cell — measured at
+		// ~0.4 ms/row through the unoptimized engine build, larger than
+		// the entire rest of the dialect layer's per-exec overhead.
+		typ = "BIGINT"
 	case googlesql.TypeKindTypeEnum:
 		typ = "INT"
 	case googlesql.TypeKindTypeBool:
@@ -471,9 +576,20 @@ func (s *ColumnSpec) SQLiteSchema() string {
 	case googlesql.TypeKindTypeString:
 		typ = "TEXT"
 	case googlesql.TypeKindTypeDate:
-		typ = "TEXT"
+		// Native DuckDB temporal storage. The expression lowering emits
+		// native date/time functions (date_part, strftime, date_add, ...)
+		// directly on stored columns, so the column type must be the
+		// native one — a TEXT/VARCHAR column fails to bind at DuckDB
+		// prepare time (e.g. date_part(STRING_LITERAL, VARCHAR)). The
+		// scan path already decodes the engine's time.Time cells (see
+		// rows.go timeValueForKind), and INSERT lowers temporal literals
+		// to typed native literals (DATE '...', TIMESTAMPTZ '...').
+		typ = "DATE"
 	case googlesql.TypeKindTypeTimestamp:
-		typ = "TEXT"
+		// GoogleSQL TIMESTAMP is an absolute instant; DuckDB TIMESTAMPTZ
+		// matches (the engine session TimeZone is UTC, so date_part /
+		// strftime over it follow GoogleSQL's default-UTC semantics).
+		typ = "TIMESTAMPTZ"
 	case googlesql.TypeKindTypeArray:
 		typ = "TEXT"
 	case googlesql.TypeKindTypeStruct:
@@ -481,27 +597,39 @@ func (s *ColumnSpec) SQLiteSchema() string {
 	case googlesql.TypeKindTypeProto:
 		typ = "TEXT"
 	case googlesql.TypeKindTypeTime:
-		typ = "TEXT"
+		typ = "TIME"
 	case googlesql.TypeKindTypeDatetime:
-		typ = "TEXT"
+		// GoogleSQL DATETIME is a civil (zone-less) wall-clock value:
+		// DuckDB's plain TIMESTAMP.
+		typ = "TIMESTAMP"
 	case googlesql.TypeKindTypeGeography:
 		typ = "TEXT"
 	case googlesql.TypeKindTypeNumeric:
-		typ = "TEXT"
+		// Native GoogleSQL NUMERIC: exactly DuckDB's DECIMAL(38,9)
+		// (the native-storage migration; legacy tables keep the TEXT
+		// envelope via storageTypeForKindVersioned's legacy branch).
+		// Native storage is what makes arithmetic / comparisons /
+		// ORDER BY / GROUP BY and vectorized aggregates on stored
+		// columns engine-native and value-ordered.
+		typ = "DECIMAL(38,9)"
 	case googlesql.TypeKindTypeBignumeric:
+		// BIGNUMERIC exceeds DuckDB's 38-digit DECIMAL ceiling; it
+		// stays a value-layer TEXT envelope (engine ops decode to
+		// DOUBLE, documented as approximate).
 		typ = "TEXT"
 	case googlesql.TypeKindTypeExtended:
 		typ = "TEXT"
 	case googlesql.TypeKindTypeInterval:
 		typ = "TEXT"
+	case googlesql.TypeKindTypeRange:
+		// RANGE has no DuckDB-native column type; like the other rich
+		// value-layer kinds it round-trips through storage as the base64
+		// wire-form string, so it lands in a TEXT/VARCHAR column.
+		typ = "TEXT"
 	default:
 		typ = "UNKNOWN"
 	}
-	schema := fmt.Sprintf("`%s` %s", s.Name, typ)
-	if s.IsNotNull {
-		schema += " NOT NULL"
-	}
-	return schema
+	return typ
 }
 
 func newTypeFromFunctionArgumentType(t *googlesql.FunctionArgumentType) *Type {
@@ -700,15 +828,37 @@ func newPrimaryKey(key *googlesql.ResolvedPrimaryKey) []string {
 func newTableSpecWithQuery(ctx context.Context, namePath *NamePath, query string, stmt *googlesql.ResolvedCreateTableStmt) *TableSpec {
 	now := time.Now()
 	return &TableSpec{
-		IsTemp:     resolvedCreateScope(stmt) == googlesql.ResolvedCreateStatementEnums_CreateScopeCreateTemp,
-		NamePath:   namePath.mergePath(m1(stmt.NamePath())),
-		Columns:    newColumnsFromDef(ctx, m1(stmt.ColumnDefinitionList())),
-		PrimaryKey: newPrimaryKey(m1(stmt.PrimaryKey())),
-		CreateMode: m1(stmt.CreateMode()),
-		Options:    newTableOptionsFromResolved(m1(stmt.OptionList())),
-		UpdatedAt:  now,
-		CreatedAt:  now,
+		IsTemp:         resolvedCreateScope(stmt) == googlesql.ResolvedCreateStatementEnums_CreateScopeCreateTemp,
+		NamePath:       namePath.mergePath(m1(stmt.NamePath())),
+		Columns:        newColumnsFromDef(ctx, m1(stmt.ColumnDefinitionList())),
+		PrimaryKey:     newPrimaryKey(m1(stmt.PrimaryKey())),
+		CreateMode:     m1(stmt.CreateMode()),
+		Options:        newTableOptionsFromResolved(m1(stmt.OptionList())),
+		StorageVersion: newTableStorageVersion(),
+		UpdatedAt:      now,
+		CreatedAt:      now,
 	}
+}
+
+// forceLegacyStorageForTest, when set, stamps newly created tables with
+// the LEGACY storage version (0) so their columns render the pre-native
+// storage types and BulkInsert encodes envelope cells. Test-only: it
+// exists so the legacy-database compat test can build a faithful
+// pre-migration fixture through the current binary. Toggled via the
+// root package's export_test surface.
+var forceLegacyStorageForTest atomic.Bool
+
+// SetForceLegacyStorageForTest toggles forceLegacyStorageForTest;
+// test-only (see the var doc).
+func SetForceLegacyStorageForTest(legacy bool) {
+	forceLegacyStorageForTest.Store(legacy)
+}
+
+func newTableStorageVersion() int {
+	if forceLegacyStorageForTest.Load() {
+		return 0
+	}
+	return currentStorageVersion
 }
 
 // normaliseStringLiteralQuotes rewrites a double-quoted STRING
@@ -797,7 +947,7 @@ func newTVFSpec(ctx context.Context, namePath *NamePath, stmt *googlesql.Resolve
 		colID, _ := col.ColumnId()
 		projections = append(
 			projections,
-			fmt.Sprintf("`%s#%d` AS `%s`", refColumnName, colID, colName),
+			fmt.Sprintf("\"%s#%d\" AS \"%s\"", refColumnName, colID, colName),
 		)
 		outputColumns = append(outputColumns, &ColumnSpec{
 			Name: colName,
@@ -827,7 +977,7 @@ func newTableAsViewSpec(namePath *NamePath, query string, stmt *googlesql.Resolv
 		colID, _ := col.ColumnId()
 		outputColumns = append(
 			outputColumns,
-			fmt.Sprintf("`%s#%d` AS `%s`", refColumnName, colID, colName),
+			fmt.Sprintf("\"%s#%d\" AS \"%s\"", refColumnName, colID, colName),
 		)
 	}
 	now := time.Now()
@@ -844,26 +994,47 @@ func newTableAsViewSpec(namePath *NamePath, query string, stmt *googlesql.Resolv
 }
 
 func newTableAsSelectSpec(ctx context.Context, namePath *NamePath, query string, stmt *googlesql.ResolvedCreateTableAsSelectStmt) *TableSpec {
+	columns := newColumnsFromDef(ctx, m1(stmt.ColumnDefinitionList()))
+	storageVersion := newTableStorageVersion()
 	var outputColumns []string
-	for _, column := range m1(stmt.OutputColumnList()) {
+	for i, column := range m1(stmt.OutputColumnList()) {
 		colName, _ := column.Name()
 		refColumnName, _ := m1(column.Column()).Name()
 		colID, _ := m1(column.Column()).ColumnId()
+		ref := fmt.Sprintf("\"%s#%d\"", refColumnName, colID)
+		// Native-storage seam: the created table's column types come
+		// from the projected expression types, but a NUMERIC / BYTES
+		// projection may be either native (a stored column, a native
+		// literal/operator result) or a value-layer envelope VARCHAR
+		// (a googlesqlite_* UDF result). Normalize each such column to
+		// its storage representation — DECIMAL(38,9) / payload BLOB —
+		// so the CTAS table is byte-identical to a CREATE TABLE +
+		// INSERT of the same rows (storageTypeForKind is the shared
+		// source of truth; both wrappers pass native values through).
+		if storageVersion >= currentStorageVersion && i < len(columns) && columns[i] != nil && columns[i].Type != nil {
+			switch googlesql.TypeKind(columns[i].Type.Kind) {
+			case googlesql.TypeKindTypeNumeric:
+				ref = numericStorageReadSQL(ref)
+			case googlesql.TypeKindTypeBytes:
+				ref = bytesStorageReadSQL(ref)
+			}
+		}
 		outputColumns = append(
 			outputColumns,
-			fmt.Sprintf("`%s#%d` AS `%s`", refColumnName, colID, colName),
+			fmt.Sprintf("%s AS \"%s\"", ref, colName),
 		)
 	}
 	now := time.Now()
 	return &TableSpec{
-		IsTemp:     resolvedCreateScope(stmt) == googlesql.ResolvedCreateStatementEnums_CreateScopeCreateTemp,
-		NamePath:   namePath.mergePath(m1(stmt.NamePath())),
-		Columns:    newColumnsFromDef(ctx, m1(stmt.ColumnDefinitionList())),
-		PrimaryKey: newPrimaryKey(m1(stmt.PrimaryKey())),
-		CreateMode: m1(stmt.CreateMode()),
-		Query:      fmt.Sprintf("SELECT %s FROM (%s)", strings.Join(outputColumns, ","), query),
-		UpdatedAt:  now,
-		CreatedAt:  now,
+		IsTemp:         resolvedCreateScope(stmt) == googlesql.ResolvedCreateStatementEnums_CreateScopeCreateTemp,
+		NamePath:       namePath.mergePath(m1(stmt.NamePath())),
+		Columns:        columns,
+		PrimaryKey:     newPrimaryKey(m1(stmt.PrimaryKey())),
+		CreateMode:     m1(stmt.CreateMode()),
+		Query:          fmt.Sprintf("SELECT %s FROM (%s)", strings.Join(outputColumns, ","), query),
+		StorageVersion: storageVersion,
+		UpdatedAt:      now,
+		CreatedAt:      now,
 	}
 }
 

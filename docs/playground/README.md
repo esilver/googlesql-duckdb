@@ -7,9 +7,9 @@ client-side, powered by `googlesqlite` compiled to WebAssembly.
 - **CodeMirror 6** as the SQL editor
 - The `googlesqlite` engine runs in a **Web Worker** so the UI stays
   responsive
-- The database is a single file in the **Origin Private File System**
-  (OPFS); SQLite reads and writes it directly, so it survives reloads
-  with no explicit save step
+- The pure-Go DuckDB engine runs an in-memory database (fresh on each
+  reload); query history persists in the **Origin Private File System**
+  (OPFS)
 
 ## Prerequisites
 
@@ -51,11 +51,35 @@ workflow builds the engine, bundles the site, uploads `dist/` as the
 Pages artifact, and publishes it through `actions/deploy-pages`.
 
 The engine binary is large — it bundles the whole googlesqlite stack
-into one js/wasm module: SQLite (transpiled to Go) plus the GoogleSQL
-analyzer, which is itself an embedded wasm module run through wazero.
+into one js/wasm module: the pure-Go DuckDB engine (transpiled to Go)
+plus the GoogleSQL analyzer, which is itself an embedded wasm module
+run through wazero.
 The uncompressed binary exceeds GitHub's 100 MB per-file limit, but it
 is never deployed: the worker fetches the gzip-compressed
 `googlesqlite.wasm.gz` (tens of MB) and decompresses it in the browser,
 and `make build/page` drops the uncompressed copy from `dist/`. The
 same release workflow also attaches `googlesqlite.wasm` to the GitHub
 release as a downloadable asset.
+
+## Wasm mode (fully in-browser, no server)
+
+`make dev` (the default path) runs everything in the tab: the pure-Go DuckDB
+engine, the BigQuery dialect, and the GoogleSQL analyzer compiled into one
+`googlesqlite.wasm`. The database is **in-memory and resets on reload**
+(query history persists via OPFS). Server mode (`VITE_ENGINE=server make dev`)
+remains the fast path for big data.
+
+Measured (node26/V8, M-series):
+
+| metric | value |
+|---|---|
+| module size | 708 MB raw / **123 MB gzipped** |
+| instantiate | ~0.4 s |
+| one-time engine+analyzer init | ~7 s |
+| first analysis | ~216 ms |
+| repeat query (analysis cache) | **~22 ms** |
+| CREATE / INSERT / aggregate | 0.1-0.4 s |
+| memory | ~4.8 GB RSS |
+
+Build it with `make build/wasm` (or let `make dev` do it). Requires node 26
+(`/opt/homebrew/opt/node/bin` on this box; node@22 is broken).

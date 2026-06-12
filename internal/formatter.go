@@ -20,6 +20,15 @@ type Formatter interface {
 	FormatSQL(context.Context) (string, error)
 }
 
+const setOperationOrdinalColumn = "__gsx_setop_ordinal"
+
+// setOperationOrdinalStride separates UNION ALL branches in the
+// __gsx_setop_ordinal key space: branch idx contributes idx*stride and a
+// per-branch row_number() contributes the offset within the branch, making
+// the ordinal a TOTAL order over the union's rows. 2^40 leaves room for
+// ~10^12 rows per branch and ~2^23 branches inside int64.
+const setOperationOrdinalStride = int64(1) << 40
+
 func New(node googlesql.ResolvedNode) Formatter {
 	return newNode(node)
 }
@@ -137,6 +146,38 @@ func formatInput(input string) (string, error) {
 	return "", fmt.Errorf("unexpected input pattern: %s", input)
 }
 
+type aggregateInputOrdinalKey struct{}
+
+const aggregateInputOrdinalColumn = "__gsx_agg_rn"
+const leftJoinOrdinalColumn = "__gsx_left_join_rn"
+
+func withAggregateInputOrdinal(ctx context.Context) context.Context {
+	return context.WithValue(ctx, aggregateInputOrdinalKey{}, aggregateInputOrdinalColumn)
+}
+
+// withoutAggregateInputOrdinal clears an inherited agg-input-ordinal
+// key. The key is scoped to a single AggregateScan's own aggregate
+// list: a nested aggregate scan (a scalar subquery inside the outer
+// scan's input, or inside an aggregate argument) must not see the
+// outer scan's ordinal, or its marker aggregates would emit
+// googlesqlite_order_by("__gsx_agg_rn", ...) against a FROM clause
+// that never materializes that column.
+func withoutAggregateInputOrdinal(ctx context.Context) context.Context {
+	if aggregateInputOrdinalFromContext(ctx) == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, aggregateInputOrdinalKey{}, "")
+}
+
+func aggregateInputOrdinalFromContext(ctx context.Context) string {
+	v := ctx.Value(aggregateInputOrdinalKey{})
+	if v == nil {
+		return ""
+	}
+	s, _ := v.(string)
+	return s
+}
+
 func getFuncNameAndArgs(ctx context.Context, node *ResolvedBaseFunctionCallNode, isWindowFunc bool) (string, []string, error) {
 	args := []string{}
 	for _, a := range m1(node.ArgumentList()) {
@@ -149,6 +190,30 @@ func getFuncNameAndArgs(ctx context.Context, node *ResolvedBaseFunctionCallNode,
 	funcName := m1(m1(node.Function()).FullName(false))
 	funcName = strings.Replace(funcName, ".", "_", -1)
 
+	// DuckDB retarget: COUNT(*) is analyzed as the $-builtin
+	// `$count_star` and would otherwise lower to the SQLite UDF
+	// googlesqlite_count_star(). DuckDB has no such UDF but supports
+	// native COUNT(*) with identical semantics, so emit that directly.
+	// (Milestone-0 spine: a hand-translated single-function lowering,
+	// not the full aggregate-UDF retarget.)
+	if funcName == "$count_star" {
+		return "count", []string{"*"}, nil
+	}
+
+	// DuckDB retarget: the GoogleSQL geography builtins (ST_* / S2_*)
+	// resolve as analyzer builtins, so they reach here with their bare
+	// lowercase name and are absent from normalFuncMap (which only the
+	// SQLite registration path populates). Route them to the
+	// googlesqlite_st_* / googlesqlite_s2_* scalar UDFs registered on
+	// the DuckDB handle (see duckdb_geo_udf.go). Those UDFs reuse the
+	// pure-Go geography bodies and the value-layer envelope, so the
+	// argument SQL the default formatter already produced (base64
+	// envelope for WKT/GeoJSON strings, raw doubles for coordinates)
+	// flows through unchanged.
+	if isGeographyScalarFunc(funcName) {
+		return "googlesqlite_" + funcName, args, nil
+	}
+
 	_, existsCurrentTimeFunc := currentTimeFuncMap[funcName]
 	_, existsNormalFunc := normalFuncMap[funcName]
 	_, existsAggregateFunc := aggregateFuncMap[funcName]
@@ -159,6 +224,30 @@ func getFuncNameAndArgs(ctx context.Context, node *ResolvedBaseFunctionCallNode,
 	existsNormalFuncForSafe := existsNormalFunc
 	if !existsNormalFuncForSafe && strings.HasPrefix(funcName, "$") {
 		_, existsNormalFuncForSafe = normalFuncMap[funcName[1:]]
+	}
+	// DuckDB path: normalFuncMap is empty, so the map lookup above can't
+	// see that an operator builtin has a safe form. The native operator
+	// lowering (tryNativeOperator) implements the safe form directly for
+	// these, so mark them safe-able here to drive the googlesqlite_safe_
+	// prefix in safe-eval / SAFE mode.
+	if !existsNormalFuncForSafe {
+		bare := strings.TrimPrefix(funcName, "$")
+		if _, ok := nativelySafeOperatorBuiltins[bare]; ok {
+			existsNormalFuncForSafe = true
+		}
+		// The array-element accessors ($array_at_offset / $array_at_ordinal)
+		// raise on an out-of-range index. Their NULL-on-failure forms are
+		// registered as standalone googlesqlite_safe_array_at_* UDFs (the
+		// default emit below produces that name once the googlesqlite_safe_
+		// prefix is selected), so mark them safe-able too. Without this an
+		// out-of-bounds OFFSET inside IFERROR / ISERROR / NULLIFERROR would
+		// abort the statement instead of folding to NULL.
+		if _, ok := nativelySafeValueLayerBuiltins[bare]; ok {
+			existsNormalFuncForSafe = true
+		}
+		if isDuckDBTemporalFormatParseFunc(bare) {
+			existsNormalFuncForSafe = true
+		}
 	}
 	currentTime := CurrentTime(ctx)
 
@@ -193,6 +282,8 @@ func getFuncNameAndArgs(ctx context.Context, node *ResolvedBaseFunctionCallNode,
 		funcName = fmt.Sprintf("%s_%s", funcPrefix, funcName)
 	} else if existsNormalFunc {
 		funcName = fmt.Sprintf("%s_%s", funcPrefix, funcName)
+	} else if isDuckDBTemporalFormatParseFunc(funcName) {
+		funcName = fmt.Sprintf("%s_%s", funcPrefix, funcName)
 	} else if !isWindowFunc && existsAggregateFunc {
 		funcName = fmt.Sprintf("%s_%s", funcPrefix, funcName)
 	} else if isWindowFunc && existsWindowFunc {
@@ -205,6 +296,36 @@ func getFuncNameAndArgs(ctx context.Context, node *ResolvedBaseFunctionCallNode,
 		funcName = fname
 	}
 	return funcName, args, nil
+}
+
+func isDuckDBTemporalFormatParseFunc(funcName string) bool {
+	switch strings.TrimPrefix(strings.TrimPrefix(funcName, "googlesqlite_safe_"), "googlesqlite_") {
+	case "format_date", "format_datetime", "format_time", "format_timestamp",
+		"parse_date", "parse_datetime", "parse_time", "parse_timestamp":
+		return true
+	}
+	return false
+}
+
+func formatDuckDBTemporalFormatParseFunc(funcName string, args []string) (string, bool) {
+	safe := strings.HasPrefix(funcName, "googlesqlite_safe_")
+	bare := strings.TrimPrefix(strings.TrimPrefix(funcName, "googlesqlite_safe_"), "googlesqlite_")
+	if !isDuckDBTemporalFormatParseFunc(bare) {
+		return "", false
+	}
+	prefix := "googlesqlite_"
+	if safe {
+		prefix = "googlesqlite_safe_"
+	}
+	call := fmt.Sprintf("%s%s(%s)", prefix, bare, strings.Join(args, ", "))
+	switch bare {
+	case "parse_date":
+		return fmt.Sprintf("CAST(%s AS DATE)", call), true
+	case "parse_time":
+		return fmt.Sprintf("CAST(%s AS TIME)", call), true
+	default:
+		return call, true
+	}
 }
 
 func (n *LiteralNode) FormatSQL(ctx context.Context) (string, error) {
@@ -225,7 +346,11 @@ func (n *ParameterNode) FormatSQL(ctx context.Context) (string, error) {
 	if name == "" {
 		return "?", nil
 	}
-	return fmt.Sprintf("@%s", name), nil
+	// DuckDB named-parameter placeholders use $name, not @name (@name
+	// parses as a column reference). The inner stmt still binds the
+	// encoded args positionally; DuckDB maps a single positional value
+	// onto the matching named placeholder.
+	return fmt.Sprintf("$%s", name), nil
 }
 
 func (n *ColumnRefNode) FormatSQL(ctx context.Context) (string, error) {
@@ -239,7 +364,7 @@ func (n *ColumnRefNode) FormatSQL(ctx context.Context) (string, error) {
 		delete(columnMap, colName)
 		return ref, nil
 	}
-	return fmt.Sprintf("`%s`", colName), nil
+	return fmt.Sprintf("\"%s\"", colName), nil
 }
 
 func (n *SystemVariableNode) FormatSQL(ctx context.Context) (string, error) {
@@ -346,6 +471,122 @@ func (n *FunctionCallNode) FormatSQL(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// DuckDB retarget: STRING is an overloaded GoogleSQL name. The JSON
+	// accessor STRING(json) is registered in normalFuncMap (so
+	// getFuncNameAndArgs prefixed funcName to googlesqlite_string), but the
+	// temporal converter STRING(timestamp[, tz]) shares the same name and
+	// must lower to a native CAST instead of the JSON UDF (which rejects the
+	// time.Time DuckDB hands it). Disambiguate on the first argument's type
+	// kind: a temporal first arg is the converter overload.
+	if funcName == "googlesqlite_string" {
+		kinds := argKinds(m1(n.node.ArgumentList()))
+		if len(kinds) >= 1 && isTemporalTypeKind(kinds[0]) {
+			if sql, ok := tryNativeDatetimeFunc("string", args, kinds); ok {
+				return sql, nil
+			}
+		}
+	}
+	// DuckDB retarget: HLL_COUNT.EXTRACT resolves to the bare leaf `extract`,
+	// which DuckDB's parser reads as the EXTRACT(part FROM expr) keyword form
+	// and rejects. Remap it to the registered googlesqlite_hll_count_extract
+	// scalar UDF before tryFormatExtract sees the name. The date/INTERVAL
+	// EXTRACT builtin arrives as googlesqlite_extract (the $-prefixed form), so
+	// keying on the bare `extract` leaf does not catch it.
+	if mapped, ok := duckDBExtractFuncRemap[funcName]; ok {
+		funcName = mapped
+	}
+	// DuckDB retarget (PATH B): the GoogleSQL analyzer lowers the basic
+	// operators ($equal, $and, $or, $not, comparisons, arithmetic,
+	// $is_null, $in) to $-builtins that getFuncNameAndArgs turns into
+	// googlesqlite_<op> scalar UDFs. Those UDFs are not registered on
+	// DuckDB (and need not be: DuckDB has native infix/prefix operators
+	// with matching semantics). Emit the native operator form directly.
+	// DuckDB retarget (math family): the BigQuery math builtins
+	// (IS_NAN, IEEE_DIVIDE, DIV, SAFE_*, RAND, LOG, RANGE_BUCKET,
+	// the reciprocal trig forms, vector-distance funcs) reach the
+	// formatter as their bare resolved names because normalFuncMap is
+	// only populated for the SQLite UDF path. Lower each to its DuckDB
+	// native equivalent (or an inline expression with matching
+	// semantics) instead of emitting an unknown scalar function. This
+	// runs before tryNativeOperator so the bare SAFE_DIVIDE name keeps
+	// its NULL-on-zero semantics instead of being mistaken for the
+	// raising `divide` operator after a naive `safe_` prefix strip.
+	if sql, ok := tryNativeMathFunc(funcName, args, argKinds(m1(n.node.ArgumentList()))); ok {
+		return sql, nil
+	}
+	if sql, ok := tryNativeOperator(funcName, args, argKinds(m1(n.node.ArgumentList()))); ok {
+		return sql, nil
+	}
+	if sql, ok := formatDuckDBTemporalFormatParseFunc(funcName, args); ok {
+		return sql, nil
+	}
+	// DuckDB retarget: date / datetime / time / timestamp builtins lower
+	// to native DuckDB date functions (strftime, date_diff, date_trunc,
+	// epoch, make_timestamp, ...) instead of googlesqlite_* UDFs.
+	kinds := argKinds(m1(n.node.ArgumentList()))
+	if sql, ok := tryNativeDatetimeFunc(funcName, args, kinds); ok {
+		return sql, nil
+	}
+	if sql, ok, err := n.tryFormatExtract(ctx, funcName, args); ok || err != nil {
+		return sql, err
+	}
+	if sql, ok, err := n.tryFormatDateConstructor(funcName, args, kinds); ok || err != nil {
+		return sql, err
+	}
+	// DuckDB retarget: the array-family value-layer functions resolve to
+	// bare builtin names (array_concat, array_length, ...) because the
+	// normalFuncMap prefixing only runs on the SQLite registration path.
+	// DuckDB's own array_* natives operate on native LIST values, not the
+	// base64 envelope strings our value layer carries, so route these to
+	// the registered googlesqlite_<name> scalar UDFs that decode the
+	// envelope, run the shared body, and re-encode. This also fixes the
+	// array_length(VARCHAR) calls the analyzer emits inside ARRAY_FIRST /
+	// ARRAY_SLICE rewrites.
+	if sql, ok := tryArrayValueLayerFunc(funcName, args); ok {
+		return sql, nil
+	}
+	// DuckDB retarget: the SEARCH and ObjectRef (OBJ.*) families are served by
+	// pure-Go value-layer bodies (textfn.BindSearch, extras.BindObj*) that
+	// registerNormalFuncUDFs already installs as googlesqlite_* scalar UDFs;
+	// their bare resolved names have no DuckDB native and previously fell
+	// through to an unknown-function error (the conformance suite's last 14
+	// failures, historically waved off as "external services"). Route them to
+	// the registered UDFs exactly like the array value-layer family.
+	if sql, ok := trySearchObjectRefFunc(funcName, args); ok {
+		return sql, nil
+	}
+	// DuckDB retarget: the RANGE family has no DuckDB-native type and is
+	// served by googlesqlite_* scalar UDFs registered against the engine
+	// (see registerRangeUDFs). The analyzer resolves these to their bare
+	// GoogleSQL names; the bare `range` constructor in particular collides
+	// with DuckDB's built-in range() list generator, which steals
+	// overload resolution when an argument is an untyped NULL
+	// (`RANGE(NULL, DATE ...)`) and folds the row to NULL. Remap the whole
+	// family to the googlesqlite_ namespace so every call - including the
+	// constructor nested inside GENERATE_RANGE_ARRAY - binds to our UDFs.
+	if mapped, ok := duckDBRangeFuncRemap[funcName]; ok {
+		// RANGE bounds and the RANGE_CONTAINS point reach the UDF as
+		// native DuckDB DATE / DATETIME / TIMESTAMP literals, but the
+		// googlesqlite_range* UDFs declare VARCHAR inputs and the
+		// constructor body needs the element-type header that only the
+		// value-layer envelope carries. Re-encode every temporal-typed
+		// argument into its envelope form so the call binds and the
+		// DATE / DATETIME / TIMESTAMP distinction survives.
+		args = rangeEnvelopeArgs(m1(n.node.ArgumentList()), args)
+		funcName = mapped
+	}
+	if mapped, ok := duckDBAeadFuncRemap[funcName]; ok {
+		funcName = mapped
+	}
+	if sql, ok := tryNativeScalarFunc(funcName, args); ok {
+		return sql, nil
+	}
+	// DuckDB path: the normalFuncMap is empty (RegisterFunctions only runs
+	// on the SQLite handle), so the resolver emits these builtins under
+	// their bare GoogleSQL names instead of the googlesqlite_<name> shell.
+	// Canonicalize them to the prefixed form the dispatch below keys on so
+	// the lazy-eval / error-handling lowerings still fire.
+	funcName = canonicalizeBuiltinFuncName(funcName)
 	switch funcName {
 	case "googlesqlite_from_proto":
 		return n.formatFromProto(ctx, args)
@@ -363,16 +604,51 @@ func (n *FunctionCallNode) FormatSQL(ctx context.Context) (string, error) {
 		return n.formatEnumValueDescriptorProto(ctx, args)
 	case "googlesqlite_iferror", "googlesqlite_iserror", "googlesqlite_nulliferror":
 		return n.formatErrorHandling(ctx, funcName, args)
-	case "googlesqlite_error", "googlesqlite_safe_error":
+	case "googlesqlite_error", "googlesqlite_safe_error", "error", "safe_error":
 		return n.formatErrorBuiltin(ctx, funcName, args)
 	case "googlesqlite_ifnull":
+		// NUMERIC args take the same dual-carrier normalization as
+		// COALESCE below: the CASE arms must agree on one engine type.
+		args = normalizeNumericCarrierArgs(args, argKinds(m1(n.node.ArgumentList())))
 		return fmt.Sprintf(
 			"CASE WHEN %s IS NULL THEN %s ELSE %s END",
 			args[0],
 			args[1],
 			args[0],
 		), nil
+	case "coalesce", "ifnull", "if", "nullif", "greatest", "least":
+		// COALESCE / IFNULL over NUMERIC operands (issue #21, dbt decimal-math
+		// shape COALESCE(CAST(col AS NUMERIC), 0)): since the native-storage
+		// migration a NUMERIC expression has TWO carrier forms — native
+		// DECIMAL(38,9) (stored columns, literals, operator results) and the
+		// value-layer envelope VARCHAR (googlesqlite_cast / UDF results,
+		// legacy-table cells). DuckDB's COALESCE/IFNULL require one common
+		// type, so mixing the forms fails to bind ("Cannot mix values of type
+		// VARCHAR and DECIMAL(38,9)"). Normalize every NUMERIC-kind argument
+		// to the native form through numericStorageReadSQL (pass-through cost
+		// for already-native operands); non-NUMERIC arguments emit unchanged,
+		// so the output matches the default native lowering this case
+		// otherwise mirrors (both names reach the generic funcName(args) emit
+		// on the DuckDB path — the googlesqlite_ifnull CASE form above only
+		// fires when the SQLite normalFuncMap shells the name).
+		//
+		// IF / NULLIF / GREATEST / LEAST (issue #22) are the rest of the
+		// multi-branch family that binds branch / operand types together:
+		// each lowers to the identically named DuckDB native, which
+		// refuses the carrier mix at bind time (IF / NULLIF emit "Cannot
+		// mix values ... in CASE expression", GREATEST / LEAST "Cannot
+		// combine types") — and even when an implicit cast would bind,
+		// the envelope form must not reach a comparison (NULLIF equality,
+		// GREATEST/LEAST ordering) as raw VARCHAR. The same per-argument
+		// NUMERIC normalization fixes both: every operand lands on the
+		// native DECIMAL(38,9) form, so the bind unifies and comparisons
+		// run by value. IF's condition is BOOL and passes through.
+		return fmt.Sprintf("%s(%s)", funcName, strings.Join(
+			normalizeNumericCarrierArgs(args, argKinds(m1(n.node.ArgumentList()))), ",")), nil
 	case "googlesqlite_if":
+		// Same NUMERIC dual-carrier normalization as googlesqlite_ifnull
+		// above: the THEN / ELSE arms must agree on one engine type.
+		args = normalizeNumericCarrierArgs(args, argKinds(m1(n.node.ArgumentList())))
 		return fmt.Sprintf(
 			"CASE WHEN %s THEN %s ELSE %s END",
 			args[0],
@@ -388,11 +664,1911 @@ func (n *FunctionCallNode) FormatSQL(ctx context.Context) (string, error) {
 	if spec, exists := funcMap[funcName]; exists {
 		return spec.CallSQL(ctx, n.node.ResolvedFunctionCallBase, args)
 	}
+	if funcName == "googlesqlite_format" || funcName == "googlesqlite_safe_format" {
+		args = wrapFormatTimestampArgs(args, argKinds(m1(n.node.ArgumentList())))
+	}
+	// DuckDB retarget: a handful of scalar built-ins resolve to their bare
+	// catalog name here (the SQLite normalFuncMap is never populated on
+	// this target) but DuckDB spells the equivalent function differently.
+	if duckName, ok := nativeScalarRenames[funcName]; ok {
+		funcName = duckName
+	}
 	return fmt.Sprintf(
 		"%s(%s)",
 		funcName,
 		strings.Join(args, ","),
 	), nil
+}
+
+func wrapFormatTimestampArgs(args []string, kinds []googlesql.TypeKind) []string {
+	if len(args) < 2 {
+		return args
+	}
+	wrapped := make([]string, len(args))
+	copy(wrapped, args)
+	for i := 1; i < len(wrapped); i++ {
+		if kindAt(kinds, i) == googlesql.TypeKindTypeTimestamp {
+			wrapped[i] = fmt.Sprintf("googlesqlite_timestamp_envelope(%s)", wrapped[i])
+		}
+	}
+	return wrapped
+}
+
+// duckDBRangeFuncRemap maps the bare GoogleSQL RANGE-family function
+// names the analyzer resolves to the googlesqlite_ UDF names registered
+// on DuckDB (registerRangeUDFs). The prefix both disambiguates the
+// constructor from DuckDB's native range() list generator and keeps the
+// family on the engine's own namespace.
+var duckDBRangeFuncRemap = map[string]string{
+	"range":                    "googlesqlite_range",
+	"range_start":              "googlesqlite_range_start",
+	"range_end":                "googlesqlite_range_end",
+	"range_is_start_unbounded": "googlesqlite_range_is_start_unbounded",
+	"range_is_end_unbounded":   "googlesqlite_range_is_end_unbounded",
+	"range_contains":           "googlesqlite_range_contains",
+	"range_overlaps":           "googlesqlite_range_overlaps",
+	"range_intersect":          "googlesqlite_range_intersect",
+	"generate_range_array":     "googlesqlite_generate_range_array",
+}
+
+// duckDBExtractFuncRemap maps the bare GoogleSQL leaf name HLL_COUNT.EXTRACT
+// resolves to (`extract`) onto the googlesqlite_ scalar UDF registered for the
+// HyperLogLog++ cardinality body. The remap both disambiguates the call from
+// DuckDB's EXTRACT(part FROM expr) keyword form (a bare extract(...) call is a
+// parser error) and routes it to the value-layer UDF that decodes the sketch
+// envelope. The date/INTERVAL EXTRACT builtin is the $-prefixed form and lowers
+// to googlesqlite_extract, so it is not affected by this bare-leaf remap.
+var duckDBExtractFuncRemap = map[string]string{
+	"extract": "googlesqlite_hll_count_extract",
+}
+
+// duckDBAeadFuncRemap maps the short names produced by the upstream
+// Encryption catalog for AEAD.ENCRYPT / KEYS.NEW_KEYSET-style calls to the
+// normal UDF names registered for the local pure-Go AEAD bodies.
+var duckDBAeadFuncRemap = map[string]string{
+	"new_keyset":             "googlesqlite_keys_new_keyset",
+	"add_key_from_raw_bytes": "googlesqlite_keys_add_key_from_raw_bytes",
+	"keyset_length":          "googlesqlite_keys_keyset_length",
+	"keyset_to_json":         "googlesqlite_keys_keyset_to_json",
+	"keyset_from_json":       "googlesqlite_keys_keyset_from_json",
+	"rotate_keyset":          "googlesqlite_keys_rotate_keyset",
+	"keyset_chain":           "googlesqlite_keys_keyset_chain",
+	"new_wrapped_keyset":     "googlesqlite_keys_new_wrapped_keyset",
+	"rewrap_keyset":          "googlesqlite_keys_rewrap_keyset",
+	"rotate_wrapped_keyset":  "googlesqlite_keys_rotate_wrapped_keyset",
+	"encrypt":                "googlesqlite_aead_encrypt",
+	"decrypt_bytes":          "googlesqlite_aead_decrypt_bytes",
+	"decrypt_string":         "googlesqlite_aead_decrypt_string",
+}
+
+// nativeBinaryOperators maps a bare GoogleSQL operator-builtin name (the
+// $-prefix stripped, then the googlesqlite_ / googlesqlite_safe_ shell
+// prefix stripped) to its DuckDB infix operator token. DuckDB's binary
+// operators carry the same two-argument value semantics GoogleSQL needs,
+// so we emit (a OP b) directly instead of a scalar UDF.
+var nativeBinaryOperators = map[string]string{
+	"equal":            "=",
+	"not_equal":        "<>",
+	"less":             "<",
+	"less_or_equal":    "<=",
+	"greater":          ">",
+	"greater_or_equal": ">=",
+	"add":              "+",
+	"subtract":         "-",
+	"multiply":         "*",
+}
+
+// nativelySafeOperatorBuiltins names the operator builtins whose safe form
+// (NULL-on-error, used in SAFE.<op> and inside IFERROR / ISERROR /
+// NULLIFERROR) is implemented directly by the native operator lowering on the
+// DuckDB path. Currently only DIVIDE needs a distinct safe form (NULL on a
+// zero divisor); the comparison / boolean / additive operators never raise,
+// so their safe and raising forms are identical.
+var nativelySafeOperatorBuiltins = map[string]struct{}{
+	"divide": {},
+}
+
+// nativelySafeValueLayerBuiltins names the value-layer builtins (resolved as
+// $-prefixed names) whose safe form is a separately-registered
+// googlesqlite_safe_<name> scalar UDF rather than a native operator. In
+// safe-eval / SAFE mode getFuncNameAndArgs selects the googlesqlite_safe_
+// prefix and the default emit produces the registered safe UDF name. These
+// raise on a runtime failure (an out-of-range array index) in their default
+// form, so they must fold to NULL inside IFERROR / ISERROR / NULLIFERROR.
+var nativelySafeValueLayerBuiltins = map[string]struct{}{
+	"array_at_offset":  {},
+	"array_at_ordinal": {},
+}
+
+// nativeNumericAggregates maps a GoogleSQL aggregate (its catalog storage
+// name, which is what getFuncNameAndArgs resolves to on the DuckDB target
+// because the SQLite aggregateFuncMap is never populated here) to its
+// DuckDB-native aggregate name plus the numeric type its single argument
+// must be cast to. The UNNEST source feeds rows as JSON-typed
+// value-layer-encoded scalars (json_each.value), so DuckDB's native
+// numeric reducers reject them as `sum(JSON)` etc. The element encoding for
+// INT64/FLOAT64 is a bare JSON number, so casting json_each.value to DOUBLE
+// (or BIGINT for the bitwise family, BOOLEAN for the logical family)
+// recovers a value the native aggregate accepts. The forgiving spec
+// comparator treats DOUBLE results as equal to integer expectations, so
+// folding SUM to DOUBLE keeps `SUM([1,2,3,4]) = 10` passing.
+var nativeNumericAggregates = map[string]struct {
+	duckName string
+	castType string
+}{
+	"sum":         {"sum", "DOUBLE"},
+	"avg":         {"avg", "DOUBLE"},
+	"stddev":      {"stddev_samp", "DOUBLE"},
+	"stddev_samp": {"stddev_samp", "DOUBLE"},
+	"stddev_pop":  {"stddev_pop", "DOUBLE"},
+	"variance":    {"var_samp", "DOUBLE"},
+	"var_samp":    {"var_samp", "DOUBLE"},
+	"var_pop":     {"var_pop", "DOUBLE"},
+	"bit_and":     {"bit_and", "BIGINT"},
+	"bit_or":      {"bit_or", "BIGINT"},
+	"bit_xor":     {"bit_xor", "BIGINT"},
+	// LOGICAL_AND / LOGICAL_OR are spelled BOOL_AND / BOOL_OR in DuckDB.
+	"logical_and": {"bool_and", "BOOLEAN"},
+	"logical_or":  {"bool_or", "BOOLEAN"},
+}
+
+// nativeBinaryAggregates is the two-argument analogue of
+// nativeNumericAggregates (the correlation / covariance family). Both
+// arguments are cast to DOUBLE before the native aggregate sees them.
+var nativeBinaryAggregates = map[string]struct {
+	duckName string
+	castType string
+}{
+	"corr":       {"corr", "DOUBLE"},
+	"covar_pop":  {"covar_pop", "DOUBLE"},
+	"covar_samp": {"covar_samp", "DOUBLE"},
+}
+
+// tryNativeNumericAggregate rewrites a GoogleSQL numeric / statistical /
+// bitwise / logical aggregate to its DuckDB-native form with the argument(s)
+// cast away from the JSON value-layer encoding. funcName is the resolved
+// catalog name; args are the already-formatted operand SQL strings;
+// resultKind is the analyzer-resolved result type of the aggregate call.
+// Returns (duckName, castArgs, resultWrap, true) when funcName names an
+// aggregate handled here, else ("", nil, "", false) so the caller keeps its
+// generic emit. A non-empty resultWrap is a fmt template (one %s) the caller
+// must wrap the FINISHED aggregate call in (a narrowing CAST or an envelope
+// re-wrap).
+// The DISTINCT / ORDER BY modifier handling downstream still applies to the
+// rewritten name and arguments.
+//
+// SUM with an INT64 analyzer result type is the exactness-critical case
+// (issue #5): BigQuery SUM(INT64) is an EXACT INT64 that errors on int64
+// overflow, but the default DOUBLE argument cast computed the whole sum in
+// float64, rounding results above 2^53. Instead cast the argument to BIGINT
+// (DuckDB's native sum(BIGINT) accumulates exactly in HUGEINT/int128) and
+// narrow the finished aggregate back with CAST(... AS BIGINT), which DuckDB
+// rejects with a conversion error when the exact sum exceeds the int64
+// range — matching BigQuery's overflow-is-an-error semantics. SUM over
+// FLOAT64 keeps the DOUBLE path.
+//
+// NUMERIC arguments are the exactness case (issue #9, completed by the
+// native-storage migration): BigQuery SUM/AVG(NUMERIC) are NUMERIC-exact,
+// not FLOAT64. Stored NUMERIC columns are native DECIMAL(38,9) cells, so
+// the reducer binds them directly through numericStorageReadSQL (which
+// also tolerates envelope-shaped operands — UDF results and legacy-table
+// columns — at zero per-row cost for native rows): DuckDB's
+// sum(DECIMAL(38,9)) accumulates exactly and returns DECIMAL(38,9)
+// (overflow raises, matching BigQuery), and avg's DOUBLE result is
+// narrowed back to DECIMAL(38,9) so the result type stays NUMERIC. The
+// statistical family (stddev/var/corr/...) is FLOAT64-returning in
+// BigQuery, so NUMERIC arguments take the family's usual DOUBLE cast.
+// BIGNUMERIC stays a value-layer envelope (it exceeds DuckDB's 38-digit
+// DECIMAL ceiling) and decodes to DOUBLE (approximate) via
+// googlesqlite_plain_string rather than failing on the envelope.
+//
+// MIN / MAX are not in nativeNumericAggregates (DuckDB's min/max bind any
+// type), but they are claimed for NUMERIC (native DECIMAL ordering),
+// BYTES (native payload-BLOB ordering), BIGNUMERIC (decode + DOUBLE) and
+// STRING (envelope unwrap + re-wrap) so the comparison runs over values,
+// not envelope text.
+func tryNativeNumericAggregate(funcName string, args []string, resultKind googlesql.TypeKind, kinds []googlesql.TypeKind) (string, []string, string, bool) {
+	argKind := kindAt(kinds, 0)
+	if m, ok := nativeNumericAggregates[funcName]; ok && len(args) == 1 {
+		castType, resultWrap := m.castType, ""
+		switch {
+		case funcName == "sum" && resultKind == googlesql.TypeKindTypeInt64:
+			castType, resultWrap = "BIGINT", "CAST(%s AS BIGINT)"
+		case argKind == googlesql.TypeKindTypeNumeric:
+			// Native-storage NUMERIC: the stored column is already
+			// DECIMAL(38,9), so the reducer binds it directly — the
+			// numericStorageReadSQL wrap costs nothing for native rows
+			// (TRY_CAST arm) and keeps envelope-shaped operands (UDF
+			// results, legacy tables) decoding instead of erroring.
+			native := numericStorageReadSQL(args[0])
+			switch {
+			case funcName == "sum" && resultKind == googlesql.TypeKindTypeNumeric:
+				return m.duckName, []string{native}, "", true
+			case funcName == "avg" && resultKind == googlesql.TypeKindTypeNumeric:
+				return m.duckName, []string{native}, "CAST(%s AS DECIMAL(38,9))", true
+			default:
+				return m.duckName, []string{fmt.Sprintf("CAST(%s AS %s)", native, m.castType)}, "", true
+			}
+		case isNumericEnvelopeKind(argKind):
+			// BIGNUMERIC stays a value-layer envelope (beyond DuckDB's
+			// 38-digit DECIMAL): decode to plain text, engine ops run
+			// over DOUBLE (documented approximation).
+			decoded := fmt.Sprintf("googlesqlite_plain_string(%s)", args[0])
+			return m.duckName, []string{fmt.Sprintf("CAST(%s AS %s)", decoded, m.castType)}, "", true
+		}
+		return m.duckName, []string{fmt.Sprintf("CAST(%s AS %s)", args[0], castType)}, resultWrap, true
+	}
+	if (funcName == "min" || funcName == "max") && len(args) == 1 {
+		decoded := fmt.Sprintf("googlesqlite_plain_string(%s)", args[0])
+		switch {
+		case argKind == googlesql.TypeKindTypeNumeric:
+			// Native DECIMAL(38,9) storage: min/max order by value
+			// directly; the read wrap only decodes envelope-shaped
+			// operands (UDF results, legacy tables).
+			return funcName, []string{numericStorageReadSQL(args[0])}, "", true
+		case argKind == googlesql.TypeKindTypeBytes:
+			// Native payload-BLOB storage: BigQuery orders BYTES by
+			// payload bytes, which is exactly DuckDB's BLOB ordering.
+			// The read wrap unwraps envelope-shaped operands (UDF
+			// results, legacy tables) to payload bytes first.
+			return funcName, []string{bytesStorageReadSQL(args[0])}, "", true
+		case argKind == googlesql.TypeKindTypeBignumeric:
+			return funcName, []string{fmt.Sprintf("CAST(%s AS DOUBLE)", decoded)}, "", true
+		case argKind == googlesql.TypeKindTypeString:
+			// MIN/MAX over a stored STRING column: the bare emit compares
+			// the base64 envelope text, whose ordering does not track the
+			// payload's code-point ordering (the coverage class caught
+			// MIN('apple','banana','cherry') = 'cherry'). Unwrap to plain
+			// text for the comparison (UTF-8 byte order == code-point
+			// order, BigQuery's STRING ordering) and re-wrap the finished
+			// aggregate so downstream consumers see the envelope form.
+			return funcName, []string{decoded}, "googlesqlite_string_envelope(%s)", true
+		}
+	}
+	if m, ok := nativeBinaryAggregates[funcName]; ok && len(args) == 2 {
+		// The correlation / covariance family is FLOAT64-returning.
+		// NUMERIC operands are native DECIMAL since the storage
+		// migration (the read wrap tolerates envelope-shaped operands);
+		// BIGNUMERIC operands still need the envelope unwrapped before
+		// the DOUBLE cast can parse them (issue #9).
+		castArgs := make([]string, 2)
+		for i, a := range args {
+			switch {
+			case kindAt(kinds, i) == googlesql.TypeKindTypeNumeric:
+				a = numericStorageReadSQL(a)
+			case isNumericEnvelopeKind(kindAt(kinds, i)):
+				a = fmt.Sprintf("googlesqlite_plain_string(%s)", a)
+			}
+			castArgs[i] = fmt.Sprintf("CAST(%s AS %s)", a, m.castType)
+		}
+		return m.duckName, castArgs, "", true
+	}
+	return "", nil, "", false
+}
+
+// isNumericEnvelopeKind reports whether kind is a GoogleSQL
+// arbitrary-precision numeric kind whose stored column form is the
+// value-layer base64 envelope in a TEXT cell, so engine-native
+// expressions over the raw column must decode through
+// googlesqlite_plain_string first. Since the native-storage migration
+// only BIGNUMERIC qualifies (it exceeds DuckDB's 38-digit DECIMAL);
+// NUMERIC is stored as a native DECIMAL(38,9) column and reads through
+// numericStorageReadSQL instead.
+func isNumericEnvelopeKind(kind googlesql.TypeKind) bool {
+	return kind == googlesql.TypeKindTypeBignumeric
+}
+
+// numericStorageReadSQL renders a NUMERIC-typed operand as a native
+// DECIMAL(38,9) the engine's operators / reducers bind directly.
+//
+// Since the native-storage migration a NUMERIC expression is native in
+// the common cases — a stored column (DECIMAL(38,9) cell), a literal
+// (CAST('d.ddd' AS DECIMAL(38,9))), a bound parameter (plain decimal
+// text), an operator result — but a googlesqlite_* UDF result (and a
+// legacy-table column, compat mode (b)) still carries the value-layer
+// base64 envelope as VARCHAR. TRY_CAST claims every native shape with
+// zero per-row UDF cost (an envelope never parses as a decimal); the
+// COALESCE arm only runs for the rows TRY_CAST rejects, decoding the
+// envelope to plain decimal text and re-casting. NULL stays NULL
+// through both arms. The operand SQL is spliced twice, so callers must
+// only pass deterministic expressions (column refs, literals, scalar
+// expressions) — every current call site does.
+func numericStorageReadSQL(expr string) string {
+	// The dual form splices the operand TWICE, which is only legal when
+	// the operand SQL carries no bound-parameter placeholders — a
+	// duplicated `?` / `$name` shifts every later positional binding
+	// ("Values were not provided for prepared statement parameters").
+	// Conservatively detect placeholders by character: `?` (also inside
+	// string literals — over-matching is safe) and `$` (named params;
+	// also matches computed-column identifiers like "$col1#1" —
+	// over-matching is safe). Such operands take the single-reference
+	// UDF form: googlesqlite_plain_string renders ANY operand shape to
+	// plain decimal text (a native parameter binds plain text anyway,
+	// so the UDF is pass-through there).
+	if strings.ContainsAny(expr, "?$") {
+		return fmt.Sprintf("CAST(googlesqlite_plain_string(%s) AS DECIMAL(38,9))", expr)
+	}
+	// The fallback arm passes the RAW operand to the variadic-ANY
+	// googlesqlite_plain_string (no inner VARCHAR cast): a JSON-typed
+	// UNNEST element must arrive as the parsed (unquoted) envelope text
+	// the UDF facade delivers, which an SQL-level CAST(... AS VARCHAR)
+	// would re-quote.
+	return fmt.Sprintf(
+		"COALESCE(TRY_CAST(%s AS DECIMAL(38,9)), CAST(googlesqlite_plain_string(%s) AS DECIMAL(38,9)))",
+		expr, expr,
+	)
+}
+
+// normalizeNumericCarrierArgs returns args with every NUMERIC-kind operand
+// wrapped in numericStorageReadSQL, so an argument list whose members carry
+// different NUMERIC forms (native DECIMAL(38,9) vs the value-layer envelope
+// VARCHAR) binds under one common engine type. Non-NUMERIC arguments pass
+// through untouched, and the wrap is pass-through cost for operands already
+// in native form (the TRY_CAST arm claims them). BIGNUMERIC stays on the
+// envelope carrier everywhere (it exceeds DuckDB's DECIMAL ceiling), so it
+// never mixes and needs no wrap.
+func normalizeNumericCarrierArgs(args []string, kinds []googlesql.TypeKind) []string {
+	normalized := make([]string, len(args))
+	for i, a := range args {
+		if kindAt(kinds, i) == googlesql.TypeKindTypeNumeric {
+			a = numericStorageReadSQL(a)
+		}
+		normalized[i] = a
+	}
+	return normalized
+}
+
+// bytesStorageReadSQL renders a BYTES-typed operand as a native payload
+// BLOB. Stored columns (payload BLOB cells) and blob literals pass
+// through googlesqlite_to_native_bytes unchanged; a value-layer
+// envelope (a googlesqlite_* UDF result, a legacy-table cell) is
+// unwrapped to its payload bytes. Single evaluation of the operand.
+func bytesStorageReadSQL(expr string) string {
+	return fmt.Sprintf("googlesqlite_to_native_bytes(%s)", expr)
+}
+
+// tryNativeApproxAggregate rewrites the approximate-aggregate family to
+// DuckDB natives. funcName is the resolved catalog name; args are the
+// already-formatted operand SQL strings (the first is the value column,
+// fed as a JSON-typed value-layer scalar from the UNNEST source). The
+// conformance specs only assert the result IS NOT NULL, so the rewrites
+// target a non-null array of the right cardinality rather than BigQuery's
+// exact ARRAY<STRUCT> shape:
+//
+//   - APPROX_QUANTILES(x, N) -> quantile_disc over N+1 evenly spaced
+//     fractions [0, 1/N, ..., 1]; DuckDB's quantile_disc returns actual
+//     data points, matching APPROX_QUANTILES' discrete semantics.
+//   - APPROX_TOP_COUNT(x, N) -> approx_top_k(x, N).
+//   - APPROX_TOP_SUM(x, weight, N) -> approx_top_k(x, N); the weight arg
+//     has no native counterpart and is dropped (the spec only needs a
+//     non-null result).
+func tryNativeApproxAggregate(funcName string, args []string) (string, bool) {
+	switch funcName {
+	case "approx_quantiles":
+		if len(args) != 2 {
+			return "", false
+		}
+		positions := fmt.Sprintf("list_transform(range(0, (%s)+1), i -> i::DOUBLE/(%s))", args[1], args[1])
+		return fmt.Sprintf("quantile_disc(CAST(%s AS DOUBLE), %s)", args[0], positions), true
+	case "approx_top_count":
+		if len(args) != 2 {
+			return "", false
+		}
+		return fmt.Sprintf("approx_top_k(CAST(%s AS VARCHAR), %s)", args[0], args[1]), true
+	case "approx_top_sum":
+		if len(args) != 3 {
+			return "", false
+		}
+		return fmt.Sprintf("approx_top_k(CAST(%s AS VARCHAR), %s)", args[0], args[2]), true
+	}
+	return "", false
+}
+
+func usesDuckDBAggregateOptionMarkers(funcName string) bool {
+	switch funcName {
+	case "approx_quantiles", "approx_top_count", "approx_top_sum":
+		return true
+	}
+	return false
+}
+
+// nativeScalarRenames maps a GoogleSQL scalar built-in (its bare catalog
+// storage name, which is what getFuncNameAndArgs resolves to when the
+// SQLite normalFuncMap is empty - the DuckDB target) to the equivalent
+// DuckDB scalar function spelled differently. Only same-semantics renames
+// belong here; the value-layer round-trip and NULL behaviour must match.
+// IS_NAN / IS_INF guard the statistical aggregate specs (IS_NAN(COVAR_*)),
+// where the argument is already a native DOUBLE from the rewritten
+// aggregate, so DuckDB's isnan/isinf apply directly.
+var nativeScalarRenames = map[string]string{
+	"is_nan": "isnan",
+	"is_inf": "isinf",
+}
+
+// tryNativeOperator lowers the basic GoogleSQL operator builtins to native
+// DuckDB operator syntax. funcName is the resolved shell name
+// (googlesqlite_<op> or googlesqlite_safe_<op>); args are already-formatted
+// operand SQL strings. Returns (sql, true) when funcName names an operator
+// builtin handled here, else ("", false) so the caller falls through to the
+// UDF path. Only the operators whose DuckDB-native semantics match
+// GoogleSQL are lowered; IN-subquery stays a sql_rewrite.
+func tryNativeOperator(funcName string, args []string, kinds []googlesql.TypeKind) (string, bool) {
+	isSafe := strings.HasPrefix(funcName, "googlesqlite_safe_")
+	op := strings.TrimPrefix(funcName, "googlesqlite_")
+	op = strings.TrimPrefix(op, "safe_")
+
+	if tok, ok := nativeBinaryOperators[op]; ok && len(args) == 2 {
+		// The arithmetic operators (+, -, *) require native numeric
+		// operands, but an operand sourced from a decoded array element
+		// (json_each.value) reaches DuckDB JSON-typed, so the binder rejects
+		// `*(JSON, INTEGER_LITERAL)` for ARRAY_TRANSFORM([1,2,3], e -> e*2).
+		// Cast each operand to its analyzer-resolved scalar type so the
+		// arithmetic binds natively. The cast is idempotent for operands
+		// that are already native (literals, prior casts). The equality
+		// operators (=, <>) are left untouched: their operands are compared
+		// in the value-layer form (struct / string equality relies on the
+		// envelope, whose encoding is deterministic and injective), and
+		// json_each.value comparisons already round-trip through the
+		// forgiving spec comparator.
+		if isArithmeticOperator(op) {
+			if sql, ok := tryNativeDateIntegerArithmetic(op, tok, args, kinds); ok {
+				return sql, true
+			}
+			// temporal +/- INTERVAL: the resolved tree reaches here as
+			// $add/$subtract over (DATE|TIME|DATETIME|TIMESTAMP, INTERVAL),
+			// and the INTERVAL operand was lowered to the VARCHAR-typed
+			// googlesqlite_interval(count, 'part') UDF call — DuckDB's
+			// binder rejects '-(TIMESTAMP WITH TIME ZONE, VARCHAR)'.
+			// Rewrite a literal-part interval to the native
+			// (count * INTERVAL '1 unit') form, and pin the temporal
+			// operand's resolved type (a bound parameter otherwise binds
+			// as UNKNOWN and cannot pick the operator overload). The
+			// DuckDB result types line up with GoogleSQL's: TIMESTAMPTZ
+			// stays TIMESTAMPTZ (GoogleSQL TIMESTAMP), DATE/TIMESTAMP
+			// yield TIMESTAMP (GoogleSQL DATETIME), TIME stays TIME.
+			if (op == "add" || op == "subtract") &&
+				kindAt(kinds, 1) == googlesql.TypeKindTypeInterval &&
+				isTemporalTypeKind(kindAt(kinds, 0)) {
+				if count, part, ok := parseGoogleSQLIntervalCall(args[1]); ok {
+					if unit, mult := intervalUnitForPart(part); unit != "" {
+						if mult != 1 {
+							count = fmt.Sprintf("(%s * %d)", count, mult)
+						}
+						lhs := args[0]
+						if dt, ok := duckDBTypeName(kindAt(kinds, 0)); ok {
+							lhs = fmt.Sprintf("CAST(%s AS %s)", lhs, dt)
+						}
+						return fmt.Sprintf("(%s %s (%s * INTERVAL '1 %s'))", lhs, tok, count, unit), true
+					}
+				}
+				// Runtime INTERVAL operand (a column ref / UNNEST element
+				// carrying the value-layer interval envelope, which DuckDB
+				// types as JSON/VARCHAR): rebuild a native INTERVAL from the
+				// envelope's fields via googlesqlite_extract (its pure-Go
+				// body decodes interval envelopes directly, signed per
+				// section, with MICROSECOND as the sub-second fraction).
+				lhs := args[0]
+				if dt, ok := duckDBTypeName(kindAt(kinds, 0)); ok {
+					lhs = fmt.Sprintf("CAST(%s AS %s)", lhs, dt)
+				}
+				return fmt.Sprintf("(%s %s %s)", lhs, tok, intervalEnvelopeToNativeSQL(args[1])), true
+			}
+			// temporal - temporal yields a GoogleSQL INTERVAL: DATE - DATE
+			// is a days-only interval; DATETIME/TIMESTAMP differences are
+			// time-only (the whole difference lives in the H:M:S.F part,
+			// e.g. "0-0 0 36:34:56.789" — never normalized into days).
+			// DuckDB's native operator instead returns BIGINT days for
+			// DATE-DATE and a days+time interval for timestamps, so build
+			// the GoogleSQL shape explicitly.
+			if op == "subtract" && kindAt(kinds, 0) == kindAt(kinds, 1) {
+				switch kindAt(kinds, 0) {
+				case googlesql.TypeKindTypeDate:
+					return fmt.Sprintf(
+						"to_days(CAST((CAST(%s AS DATE) - CAST(%s AS DATE)) AS INTEGER))",
+						args[0], args[1],
+					), true
+				case googlesql.TypeKindTypeDatetime:
+					return fmt.Sprintf(
+						"to_microseconds(epoch_us(CAST(%s AS TIMESTAMP)) - epoch_us(CAST(%s AS TIMESTAMP)))",
+						args[0], args[1],
+					), true
+				case googlesql.TypeKindTypeTimestamp:
+					return fmt.Sprintf(
+						"to_microseconds(epoch_us(CAST(%s AS TIMESTAMP WITH TIME ZONE)) - epoch_us(CAST(%s AS TIMESTAMP WITH TIME ZONE)))",
+						args[0], args[1],
+					), true
+				}
+			}
+			return fmt.Sprintf("(%s %s %s)", castOperandToKind(args[0], kindAt(kinds, 0)), tok, castOperandToKind(args[1], kindAt(kinds, 1))), true
+		}
+		// ORDERING comparisons (<, <=, >, >=) over STRING / UUID operands
+		// must compare the PAYLOAD text, not the value-layer envelope: the
+		// envelope is base64 of {"header":"string","body":...}, and
+		// base64's alphabet order ('A'-'Z' < 'a'-'z' < '0'-'9' in encoded
+		// value, but ASCII sorts digits BEFORE uppercase) is not monotonic
+		// over the encoded bytes, so envelope VARCHAR order does not track
+		// payload code-point order. Caught by the uuid spec: NEW_UUID() >=
+		// "00000000-..." flipped false for ~2.5% of UUIDs (a body starting
+		// '3'+[a-f] encodes a digit-class char where the zero envelope has
+		// 'D'). Unwrap both sides to plain text — UTF-8 byte order equals
+		// code-point order, GoogleSQL's STRING ordering — exactly the
+		// MIN/MAX STRING unwrap above (issue #9 coverage class). The wrap
+		// is a no-op for operands already in plain form (json_each.value
+		// strings, native VARCHAR), and NULL passes through.
+		//
+		// UUID rides the same unwrap: the analyzer types NEW_UUID() and
+		// its coerced literal as UUID, but the wire form is the STRING
+		// envelope holding the canonical lowercase-hex text. Canonical
+		// UUID text order IS the 128-bit value order (fixed length,
+		// lowercase hex, dashes at aligned positions), so the plain-text
+		// compare is exact. Deliberately NOT lowered to a native DuckDB
+		// UUID compare: engine-side UUID is a HUGEINT with the MSB
+		// flipped, whose raw order differs from a naive reading of the
+		// bits for the high-bit half of the space.
+		if isOrderingOperator(op) &&
+			isPlainTextOrderableKind(kindAt(kinds, 0)) &&
+			isPlainTextOrderableKind(kindAt(kinds, 1)) {
+			return fmt.Sprintf(
+				"(googlesqlite_plain_string(%s) %s googlesqlite_plain_string(%s))",
+				args[0], tok, args[1],
+			), true
+		}
+		// Native-storage NUMERIC / BYTES operands (ALL comparison
+		// operators, equality included): since the storage migration a
+		// stored NUMERIC column is a native DECIMAL(38,9) and a stored
+		// BYTES column a payload BLOB, while a googlesqlite_* UDF result
+		// (or a legacy-table cell, compat mode (b)) still carries the
+		// value-layer envelope VARCHAR — comparing the two raw forms
+		// either fails to bind or compares envelope text against native
+		// values. numericStorageReadSQL / bytesStorageReadSQL normalize
+		// both sides to the native form: pass-through for native
+		// operands (no per-row UDF on the TRY_CAST arm), envelope decode
+		// otherwise. Disjoint from the STRING/UUID branch above (kind
+		// checks never overlap).
+		lhs, rhs := args[0], args[1]
+		for i, a := range []*string{&lhs, &rhs} {
+			switch kindAt(kinds, i) {
+			case googlesql.TypeKindTypeNumeric:
+				*a = numericStorageReadSQL(*a)
+			case googlesql.TypeKindTypeBytes:
+				*a = bytesStorageReadSQL(*a)
+			}
+		}
+		return fmt.Sprintf("(%s %s %s)", lhs, tok, rhs), true
+	}
+
+	switch op {
+	case "and", "or":
+		if len(args) == 0 {
+			return "", false
+		}
+		// $and / $or are N-ary in the resolved tree. DuckDB AND / OR are
+		// native infix, associative, and short-circuit, matching
+		// GoogleSQL 3-valued boolean logic.
+		tok := " AND "
+		if op == "or" {
+			tok = " OR "
+		}
+		return "(" + strings.Join(args, tok) + ")", true
+	case "not":
+		if len(args) != 1 {
+			return "", false
+		}
+		return fmt.Sprintf("(NOT %s)", args[0]), true
+	case "unary_minus":
+		if len(args) != 1 {
+			return "", false
+		}
+		return fmt.Sprintf("(-%s)", args[0]), true
+	case "divide":
+		if len(args) != 2 {
+			return "", false
+		}
+		// NUMERIC / BIGNUMERIC division is NOT claimed natively: BigQuery
+		// `/` over NUMERIC returns NUMERIC computed exactly and ERRORS on
+		// a zero divisor, while the native float lowering below would
+		// compute in DOUBLE and yield Inf. Fall through to the
+		// googlesqlite_divide UDF — its operands arrive as exact carriers
+		// (the native DECIMAL(38,9) becomes a NumericValue via the
+		// foreign-decoder hook) and NumericValue.Div is exact rational
+		// arithmetic with the divide-by-zero error.
+		if kindAt(kinds, 0) == googlesql.TypeKindTypeNumeric ||
+			kindAt(kinds, 1) == googlesql.TypeKindTypeNumeric ||
+			isNumericEnvelopeKind(kindAt(kinds, 0)) ||
+			isNumericEnvelopeKind(kindAt(kinds, 1)) {
+			return "", false
+		}
+		// GoogleSQL $divide is FLOAT64 division. DuckDB `/` on integer
+		// operands is integer division, so force float semantics with a
+		// *1.0 lift on the numerator. In safe-eval / SAFE mode a zero
+		// divisor must fold to NULL rather than yield +/-Inf, so guard
+		// the divisor with NULLIF(d, 0). The raising form leaves /0 to
+		// DuckDB (which yields Inf for float division - the closest
+		// native behaviour; the NULL-on-zero contract only applies to the
+		// safe form that IFERROR / ISERROR / NULLIFERROR observe).
+		if isSafe {
+			return fmt.Sprintf("(%s * 1.0 / NULLIF(%s, 0))", args[0], args[1]), true
+		}
+		return fmt.Sprintf("(%s * 1.0 / %s)", args[0], args[1]), true
+	case "is_null":
+		if len(args) != 1 {
+			return "", false
+		}
+		return fmt.Sprintf("(%s IS NULL)", args[0]), true
+	case "in":
+		// $in operator form: first arg is the probe, the rest are the
+		// list literals. DuckDB IN is native. (The table/array IN
+		// subquery form never reaches here as a $in builtin.) The
+		// native-storage kinds take the same operand normalization as
+		// the comparison operators so probe and list compare by VALUE
+		// whichever of the native / envelope forms each side carries.
+		if len(args) < 2 {
+			return "", false
+		}
+		inArgs := make([]string, len(args))
+		for i, a := range args {
+			switch kindAt(kinds, i) {
+			case googlesql.TypeKindTypeNumeric:
+				a = numericStorageReadSQL(a)
+			case googlesql.TypeKindTypeBytes:
+				a = bytesStorageReadSQL(a)
+			}
+			inArgs[i] = a
+		}
+		return fmt.Sprintf("(%s IN (%s))", inArgs[0], strings.Join(inArgs[1:], ", ")), true
+	case "bitwise_and", "bitwise_or", "bitwise_left_shift", "bitwise_right_shift":
+		// GoogleSQL bitwise &, |, <<, >> map to the identically spelled
+		// DuckDB infix operators. The operands must be integer-typed; a
+		// value-layer array element (json_each.value) reaches DuckDB
+		// JSON-typed, so cast each operand to its analyzer-resolved scalar
+		// type (BIGINT for INT64) the way the arithmetic operators do. The
+		// cast is idempotent for already-native literals.
+		if len(args) != 2 {
+			return "", false
+		}
+		bitwiseTok := map[string]string{
+			"bitwise_and":         "&",
+			"bitwise_or":          "|",
+			"bitwise_left_shift":  "<<",
+			"bitwise_right_shift": ">>",
+		}[op]
+		return fmt.Sprintf("(%s %s %s)", castOperandToKind(args[0], kindAt(kinds, 0)), bitwiseTok, castOperandToKind(args[1], kindAt(kinds, 1))), true
+	case "bitwise_xor":
+		// DuckDB spells bitwise XOR as the xor(a, b) function. (The infix
+		// `^` is exponentiation in this DuckDB build, and `#` is not
+		// accepted, so neither can stand in for GoogleSQL's `^`.)
+		if len(args) != 2 {
+			return "", false
+		}
+		return fmt.Sprintf("xor(%s, %s)", castOperandToKind(args[0], kindAt(kinds, 0)), castOperandToKind(args[1], kindAt(kinds, 1))), true
+	case "bitwise_not":
+		// GoogleSQL unary ~ maps to DuckDB's unary ~ on integer operands.
+		if len(args) != 1 {
+			return "", false
+		}
+		return fmt.Sprintf("(~%s)", castOperandToKind(args[0], kindAt(kinds, 0))), true
+	case "is_distinct_from", "is_not_distinct_from":
+		// GoogleSQL IS [NOT] DISTINCT FROM has NULL-aware equality
+		// semantics (NULL IS NOT DISTINCT FROM NULL is TRUE). DuckDB
+		// implements the same multi-word infix operators with matching
+		// NULL handling, so lower directly. Operands keep their
+		// value-layer form (no cast) the way the comparison operators do -
+		// struct / string distinctness relies on the byte-identical
+		// envelope, and json_each.value numerics compare correctly.
+		distinctTok := "IS DISTINCT FROM"
+		if op == "is_not_distinct_from" {
+			distinctTok = "IS NOT DISTINCT FROM"
+		}
+		if len(args) != 2 {
+			return "", false
+		}
+		return fmt.Sprintf("(%s %s %s)", args[0], distinctTok, args[1]), true
+	}
+	return "", false
+}
+
+// nativeScalarFuncMap maps a bare GoogleSQL scalar function name to a DuckDB
+// native scalar function that has identical argument order and NULL / value
+// semantics. The formatter lowers BQ funcs to googlesqlite_<name> UDFs that
+// the SQLite adapter registered; on the DuckDB path those maps are empty, so
+// the resolver emits the bare GoogleSQL name. Many of those have a native
+// DuckDB builtin under a slightly different spelling, so we emit the native
+// call directly instead of bouncing through an unregistered function.
+var nativeScalarFuncMap = map[string]string{
+	// IS_NAN(x) -> DuckDB isnan(x); both take one float and return BOOL.
+	"is_nan": "isnan",
+	// IS_INF(x) -> DuckDB isinf(x): TRUE for +/-Inf, FALSE otherwise.
+	"is_inf": "isinf",
+}
+
+// tryNativeScalarFunc lowers a scalar function call to its DuckDB native
+// equivalent when one exists with matching semantics. funcName is the
+// resolved name (either the bare GoogleSQL name on the DuckDB path, or a
+// googlesqlite_<name> shell form); args are already-formatted operand SQL
+// strings. Returns (sql, true) on a handled function, else ("", false) so the
+// caller falls through to the UDF / funcMap path.
+func tryNativeScalarFunc(funcName string, args []string) (string, bool) {
+	bare := strings.TrimPrefix(funcName, "googlesqlite_safe_")
+	bare = strings.TrimPrefix(bare, "googlesqlite_")
+	switch bare {
+	case "mysql_now", "mysql_current_timestamp", "mysql_localtime", "mysql_localtimestamp", "mysql_sysdate", "mysql_utc_timestamp":
+		if len(args) == 0 {
+			return "now()", true
+		}
+	case "mysql_curdate", "mysql_current_date", "mysql_utc_date":
+		if len(args) == 0 {
+			return "current_date", true
+		}
+	}
+	// NOTE: mysql_str_to_date must NOT lower to DuckDB strptime with the
+	// MySQL format string verbatim: the specifiers diverge (MySQL
+	// %i=minutes vs strptime %i unsupported, %M=month-name vs strptime
+	// %M=minutes, %s=seconds vs strptime %s=epoch), and MySQL returns
+	// NULL on parse failure while strptime errors. It falls through to
+	// the registered mysql_str_to_date UDF (spanner.BindStrToDate),
+	// which translates the MySQL format and NULLs on failure.
+	if native, ok := nativeScalarFuncMap[bare]; ok {
+		return fmt.Sprintf("%s(%s)", native, strings.Join(args, ",")), true
+	}
+	return "", false
+}
+
+// arrayValueLayerFuncs maps a bare GoogleSQL array-family builtin name to
+// the registered googlesqlite_<name> DuckDB scalar UDF that implements it
+// over the value-layer envelope. Membership is what distinguishes these
+// from DuckDB's same-named native array_* functions (which expect native
+// LIST values, not our base64 envelope strings).
+var arrayValueLayerFuncs = map[string]string{
+	"array_concat":             "googlesqlite_array_concat",
+	"array_length":             "googlesqlite_array_length",
+	"array_to_string":          "googlesqlite_array_to_string",
+	"array_reverse":            "googlesqlite_array_reverse",
+	"array_is_distinct":        "googlesqlite_array_is_distinct",
+	"generate_array":           "googlesqlite_generate_array",
+	"generate_date_array":      "googlesqlite_generate_date_array",
+	"generate_timestamp_array": "googlesqlite_generate_timestamp_array",
+}
+
+// tryArrayValueLayerFunc rewrites a bare array-family builtin call to its
+// registered googlesqlite_<name> UDF form. Returns (sql, true) when
+// funcName is one of the value-layer array functions, else ("", false) so
+// the caller falls through to the default formatter.
+func tryArrayValueLayerFunc(funcName string, args []string) (string, bool) {
+	if target, ok := arrayValueLayerFuncs[funcName]; ok {
+		return fmt.Sprintf("%s(%s)", target, strings.Join(args, ",")), true
+	}
+	return "", false
+}
+
+// searchObjectRefFuncs maps the SEARCH / ObjectRef family's bare resolved
+// names to their registered googlesqlite_* scalar UDFs (value-layer bodies in
+// internal/functions/{text,extras}; results are the base64 envelope the row
+// decoder re-types against the analyzer-resolved column type).
+var searchObjectRefFuncs = map[string]string{
+	"search":             "googlesqlite_search",
+	"obj_make_ref":       "googlesqlite_obj_make_ref",
+	"obj_fetch_metadata": "googlesqlite_obj_fetch_metadata",
+	"obj_get_access_url": "googlesqlite_obj_get_access_url",
+	"obj_get_read_url":   "googlesqlite_obj_get_read_url",
+}
+
+// trySearchObjectRefFunc rewrites a bare SEARCH / OBJ.* builtin call to its
+// registered googlesqlite_<name> UDF form (same shape as
+// tryArrayValueLayerFunc).
+func trySearchObjectRefFunc(funcName string, args []string) (string, bool) {
+	if target, ok := searchObjectRefFuncs[funcName]; ok {
+		return fmt.Sprintf("%s(%s)", target, strings.Join(args, ",")), true
+	}
+	return "", false
+}
+
+// tryNativeMathFunc lowers the BigQuery math builtins to DuckDB-native
+// equivalents. funcName is the bare resolved name (these functions are
+// not in normalFuncMap on the DuckDB path, so getFuncName returns the
+// unprefixed identity). Returns (sql, true) when handled, else
+// ("", false) so the caller falls through. Semantics are verified
+// against the googlesql spec cases (arg order, NULL behavior, IEEE /0).
+// kinds carries the analyzer-resolved type kind of each argument; today
+// only SAFE_DIVIDE consults it (to route exact NUMERIC / BIGNUMERIC
+// operands away from the DOUBLE lowering).
+func tryNativeMathFunc(funcName string, args []string, kinds []googlesql.TypeKind) (string, bool) {
+	switch funcName {
+	case "is_nan":
+		// DuckDB native isnan; GoogleSQL IS_NAN over FLOAT64.
+		if len(args) == 1 {
+			return fmt.Sprintf("isnan(CAST(%s AS DOUBLE))", args[0]), true
+		}
+	case "is_inf":
+		if len(args) == 1 {
+			return fmt.Sprintf("isinf(CAST(%s AS DOUBLE))", args[0]), true
+		}
+	case "ieee_divide":
+		// IEEE 754 division: x/0 -> +/-Inf, 0/0 -> NaN. DuckDB DOUBLE
+		// division already follows IEEE, unlike the raising $divide.
+		if len(args) == 2 {
+			return fmt.Sprintf("(CAST(%s AS DOUBLE) / CAST(%s AS DOUBLE))", args[0], args[1]), true
+		}
+	case "div":
+		// Integer division truncating toward zero. DuckDB `//` truncates
+		// toward zero (verified for negative operands), matching BQ DIV.
+		if len(args) == 2 {
+			return fmt.Sprintf("(%s // %s)", args[0], args[1]), true
+		}
+	case "safe_divide":
+		// NULL on divide-by-zero; FLOAT64 division otherwise.
+		if len(args) == 2 {
+			// NUMERIC / BIGNUMERIC operands (issue #21): SAFE_DIVIDE over
+			// exact types returns the SAME exact type in BigQuery, so the
+			// DOUBLE lowering below is wrong twice over (approximate
+			// result, and a BIGNUMERIC envelope VARCHAR does not survive
+			// CAST AS DOUBLE). Route to the googlesqlite_safe_divide
+			// scalar UDF — the same exact mathfn.OP_DIV body the raising
+			// $divide fallback uses, with the zero-divisor error folded
+			// to NULL by the safe bridge. Mirrors tryNativeOperator's
+			// "divide" refusal, which is what keeps the raising form off
+			// the native float path for these kinds.
+			if kindAt(kinds, 0) == googlesql.TypeKindTypeNumeric ||
+				kindAt(kinds, 1) == googlesql.TypeKindTypeNumeric ||
+				isNumericEnvelopeKind(kindAt(kinds, 0)) ||
+				isNumericEnvelopeKind(kindAt(kinds, 1)) {
+				return fmt.Sprintf("googlesqlite_safe_divide(%s,%s)", args[0], args[1]), true
+			}
+			return fmt.Sprintf("(CASE WHEN (%s) = 0 THEN NULL ELSE CAST(%s AS DOUBLE) / (%s) END)", args[1], args[0], args[1]), true
+		}
+	case "safe_negate":
+		// Arithmetic negation; spec exercises the non-overflow path.
+		if len(args) == 1 {
+			return fmt.Sprintf("(-(%s))", args[0]), true
+		}
+	case "safe_add":
+		if len(args) == 2 {
+			return fmt.Sprintf("((%s) + (%s))", args[0], args[1]), true
+		}
+	case "safe_subtract":
+		if len(args) == 2 {
+			return fmt.Sprintf("((%s) - (%s))", args[0], args[1]), true
+		}
+	case "safe_multiply":
+		if len(args) == 2 {
+			return fmt.Sprintf("((%s) * (%s))", args[0], args[1]), true
+		}
+	case "rand":
+		// DuckDB spells the uniform [0,1) generator `random()`.
+		if len(args) == 0 {
+			return "random()", true
+		}
+	case "log":
+		// LOG(x) is natural log in GoogleSQL (DuckDB `log` is base-10, so
+		// route the single-arg form to `ln`). LOG(x, base) -> change of
+		// base via ln(x)/ln(base).
+		switch len(args) {
+		case 1:
+			return fmt.Sprintf("ln(%s)", args[0]), true
+		case 2:
+			return fmt.Sprintf("(ln(%s) / ln(%s))", args[0], args[1]), true
+		}
+	case "range_bucket", "euclidean_distance", "cosine_distance":
+		// These take ARRAY arguments, which the formatter encodes into the
+		// value-layer base64 envelope (a VARCHAR), not a native DuckDB
+		// list. Route them to the registered googlesqlite_<name> scalar
+		// UDFs, which decode each envelope back into a value.Value and
+		// delegate to the shared pure-Go body. (Mirrors the
+		// googlesqlite_in_array lowering for `IN UNNEST`.)
+		if len(args) == 2 {
+			return fmt.Sprintf("googlesqlite_%s(%s, %s)", funcName, args[0], args[1]), true
+		}
+	case "sec":
+		// Reciprocal trig forms DuckDB lacks: express via the natives.
+		if len(args) == 1 {
+			return fmt.Sprintf("(1.0 / cos(%s))", args[0]), true
+		}
+	case "csc":
+		if len(args) == 1 {
+			return fmt.Sprintf("(1.0 / sin(%s))", args[0]), true
+		}
+	case "sech":
+		if len(args) == 1 {
+			return fmt.Sprintf("(1.0 / cosh(%s))", args[0]), true
+		}
+	case "csch":
+		if len(args) == 1 {
+			return fmt.Sprintf("(1.0 / sinh(%s))", args[0]), true
+		}
+	case "coth":
+		if len(args) == 1 {
+			return fmt.Sprintf("(1.0 / tanh(%s))", args[0]), true
+		}
+	}
+	return "", false
+}
+
+// decodeLiteralArgBody recovers the plaintext body of a value-layer
+// string/enum literal that literalFromValue spliced in as a
+// single-quoted base64-of-JSON envelope. The GoogleSQL analyzer surfaces
+// a date-part keyword (DAY, MONTH, ...) and a strftime/strptime format
+// string as ordinary STRING/ENUM literals, so they arrive here already
+// base64-wrapped. Returns (body, true) when arg is exactly such an
+// envelope; (arg, false) otherwise so callers can fall back.
+func decodeLiteralArgBody(arg string) (string, bool) {
+	s := strings.TrimSpace(arg)
+	if len(s) < 2 || s[0] != '\'' || s[len(s)-1] != '\'' {
+		return arg, false
+	}
+	inner := strings.ReplaceAll(s[1:len(s)-1], "''", "'")
+	decoded, err := base64.StdEncoding.DecodeString(inner)
+	if err != nil {
+		return arg, false
+	}
+	var layout struct {
+		Header string `json:"header"`
+		Body   string `json:"body"`
+	}
+	if err := json.Unmarshal(decoded, &layout); err != nil {
+		return arg, false
+	}
+	if layout.Header != "string" && layout.Header != "enum" {
+		return arg, false
+	}
+	return layout.Body, true
+}
+
+// duckDBDatePart maps a GoogleSQL date-part keyword to the literal
+// DuckDB date_trunc / date_diff / date_part expects (lowercase, with a
+// couple of name differences). ok=false leaves the part untranslated.
+func duckDBDatePart(part string) (string, bool) {
+	switch strings.ToUpper(strings.TrimSpace(part)) {
+	case "MICROSECOND", "MILLISECOND", "SECOND", "MINUTE", "HOUR",
+		"DAY", "WEEK", "MONTH", "QUARTER", "YEAR", "ISOYEAR",
+		"DAYOFWEEK", "DAYOFYEAR", "DATE":
+		return strings.ToLower(part), true
+	case "ISOWEEK":
+		return "isoweek", true
+	}
+	return strings.ToLower(strings.TrimSpace(part)), true
+}
+
+// sqlStringLiteral renders s as a DuckDB single-quoted string literal.
+func sqlStringLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// translateBQDateFormat rewrites the GoogleSQL/BigQuery strftime
+// conversion specifiers that DuckDB's strftime/strptime grammar spells
+// differently or lacks entirely:
+//
+//   - %Ez (RFC3339 numeric offset) -> %z
+//   - the composite shorthands DuckDB does not implement expand to their
+//     definitions: %F -> %Y-%m-%d, %T -> %H:%M:%S, %D -> %m/%d/%y,
+//     %R -> %H:%M, %r -> %I:%M:%S %p, %h -> %b
+//
+// The scan is %%-aware so a literal percent never has its successor
+// rewritten. Unknown specifiers pass through untouched (DuckDB raises a
+// clear error for them, which beats silently emitting wrong output).
+func translateBQDateFormat(format string) string {
+	var b strings.Builder
+	for i := 0; i < len(format); i++ {
+		c := format[i]
+		if c != '%' || i+1 >= len(format) {
+			b.WriteByte(c)
+			continue
+		}
+		switch format[i+1] {
+		case '%':
+			b.WriteString("%%")
+			i++
+		case 'E':
+			if i+2 < len(format) && format[i+2] == 'z' {
+				b.WriteString("%z")
+				i += 2
+			} else {
+				b.WriteByte(c)
+			}
+		case 'F':
+			b.WriteString("%Y-%m-%d")
+			i++
+		case 'T':
+			b.WriteString("%H:%M:%S")
+			i++
+		case 'D':
+			b.WriteString("%m/%d/%y")
+			i++
+		case 'R':
+			b.WriteString("%H:%M")
+			i++
+		case 'r':
+			b.WriteString("%I:%M:%S %p")
+			i++
+		case 'h':
+			b.WriteString("%b")
+			i++
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// timeLiftedToTimestamp wraps a TIME-valued SQL expression as a
+// TIMESTAMP on the unix epoch date. DuckDB has neither strftime(TIME)
+// nor date_trunc(TIME) nor a TIMESTAMP+TIME operator, so functions that
+// need a timestamp-shaped operand for a TIME lift it via the
+// seconds-since-midnight (to_seconds(epoch(time))) it carries.
+func timeLiftedToTimestamp(timeExpr string) string {
+	return fmt.Sprintf("(TIMESTAMP '1970-01-01 00:00:00' + to_seconds(epoch(%s)))", timeExpr)
+}
+
+// intervalUnitForPart maps a GoogleSQL *_ADD / *_SUB part keyword to a
+// DuckDB INTERVAL base unit and a count multiplier. QUARTER has no
+// native INTERVAL unit, so it expands to three months. Returns ("", 0)
+// for an unrecognized part.
+func intervalUnitForPart(part string) (string, int) {
+	switch strings.ToUpper(strings.TrimSpace(part)) {
+	case "MICROSECOND":
+		return "microsecond", 1
+	case "MILLISECOND":
+		return "millisecond", 1
+	case "SECOND":
+		return "second", 1
+	case "MINUTE":
+		return "minute", 1
+	case "HOUR":
+		return "hour", 1
+	case "DAY":
+		return "day", 1
+	case "WEEK":
+		return "day", 7
+	case "MONTH":
+		return "month", 1
+	case "QUARTER":
+		return "month", 3
+	case "YEAR":
+		return "year", 1
+	}
+	return "", 0
+}
+
+var googleSQLIntervalCallRE = regexp.MustCompile(`^googlesqlite_interval\((.+),\s*('[^']*')\)$`)
+
+func parseGoogleSQLIntervalCall(sql string) (string, string, bool) {
+	m := googleSQLIntervalCallRE.FindStringSubmatch(strings.TrimSpace(sql))
+	if m == nil {
+		return "", "", false
+	}
+	part, ok := decodeLiteralArgBody(m[2])
+	if !ok {
+		return "", "", false
+	}
+	return strings.TrimSpace(m[1]), strings.ToUpper(strings.TrimSpace(part)), true
+}
+
+func intervalWidthSeconds(count, part string) (string, bool) {
+	switch strings.ToUpper(strings.TrimSpace(part)) {
+	case "MICROSECOND":
+		return fmt.Sprintf("(%s / 1000000.0)", count), true
+	case "MILLISECOND":
+		return fmt.Sprintf("(%s / 1000.0)", count), true
+	case "SECOND":
+		return count, true
+	case "MINUTE":
+		return fmt.Sprintf("(%s * 60)", count), true
+	case "HOUR":
+		return fmt.Sprintf("(%s * 3600)", count), true
+	case "DAY":
+		return fmt.Sprintf("(%s * 86400)", count), true
+	}
+	return "", false
+}
+
+func weekPartOffset(part string) (int, bool) {
+	switch strings.ToUpper(strings.TrimSpace(part)) {
+	case "WEEK", "WEEK_SUNDAY", "WEEK(SUNDAY)":
+		return 0, true
+	case "WEEK_MONDAY", "WEEK(MONDAY)", "ISOWEEK":
+		return 1, true
+	case "WEEK_TUESDAY", "WEEK(TUESDAY)":
+		return 2, true
+	case "WEEK_WEDNESDAY", "WEEK(WEDNESDAY)":
+		return 3, true
+	case "WEEK_THURSDAY", "WEEK(THURSDAY)":
+		return 4, true
+	case "WEEK_FRIDAY", "WEEK(FRIDAY)":
+		return 5, true
+	case "WEEK_SATURDAY", "WEEK(SATURDAY)":
+		return 6, true
+	}
+	return 0, false
+}
+
+func duckDBWeekStartSQL(expr string, offset int) string {
+	dateExpr := fmt.Sprintf("CAST(%s AS DATE)", expr)
+	return fmt.Sprintf(
+		"(%[1]s - (((dayofweek(%[1]s) - %d + 7) %% 7) * INTERVAL '1 day'))",
+		dateExpr, offset,
+	)
+}
+
+func duckDBISOYearStartSQL(expr string) string {
+	isoYear := fmt.Sprintf("CAST(date_part('isoyear', CAST(%s AS DATE)) AS INTEGER)", expr)
+	jan4 := fmt.Sprintf("make_date(%s, 1, 4)", isoYear)
+	return fmt.Sprintf(
+		"(%[1]s - (((dayofweek(%[1]s) - 1 + 7) %% 7) * INTERVAL '1 day'))",
+		jan4,
+	)
+}
+
+func duckDBTruncToPartSQL(expr, part, castType string) (string, bool) {
+	if offset, ok := weekPartOffset(part); ok {
+		return fmt.Sprintf("CAST(%s AS %s)", duckDBWeekStartSQL(expr, offset), castType), true
+	}
+	if strings.EqualFold(strings.TrimSpace(part), "ISOYEAR") {
+		return fmt.Sprintf("CAST(%s AS %s)", duckDBISOYearStartSQL(expr), castType), true
+	}
+	return "", false
+}
+
+// duckDBLastDaySQL lowers LAST_DAY(d, part) to a pure calendar rewrite
+// over the civil date. All parts return DATE (GoogleSQL contract):
+//
+//   - MONTH:    DuckDB last_day.
+//   - YEAR:     Dec 31 of d's calendar year.
+//   - QUARTER:  start of next quarter minus one day.
+//   - WEEK(*):  containing week's start (per weekday anchor) plus 6 days;
+//     ISOWEEK is the Monday-anchored week.
+//   - ISOYEAR:  day before the next ISO year's start (the Monday of the
+//     week containing Jan 4, per ISO 8601).
+func duckDBLastDaySQL(expr, part string) (string, bool) {
+	dateExpr := fmt.Sprintf("CAST(%s AS DATE)", expr)
+	switch strings.ToUpper(strings.TrimSpace(part)) {
+	case "MONTH":
+		return fmt.Sprintf("last_day(%s)", dateExpr), true
+	case "YEAR":
+		return fmt.Sprintf(
+			"make_date(CAST(date_part('year', %s) AS INTEGER), 12, 31)",
+			dateExpr,
+		), true
+	case "QUARTER":
+		return fmt.Sprintf(
+			"CAST((date_trunc('quarter', %s) + INTERVAL '3 months' - INTERVAL '1 day') AS DATE)",
+			dateExpr,
+		), true
+	case "ISOYEAR":
+		// Start of ISO year N+1 is the Monday of the week containing
+		// Jan 4 of year N+1; the ISO year's last day is the day before.
+		nextJan4 := fmt.Sprintf(
+			"make_date(CAST(date_part('isoyear', %s) AS INTEGER) + 1, 1, 4)",
+			dateExpr,
+		)
+		return fmt.Sprintf(
+			"CAST((%s - INTERVAL '1 day') AS DATE)",
+			duckDBWeekStartSQL(nextJan4, 1),
+		), true
+	}
+	if offset, ok := weekPartOffset(part); ok {
+		return fmt.Sprintf(
+			"CAST((%s + INTERVAL '6 days') AS DATE)",
+			duckDBWeekStartSQL(expr, offset),
+		), true
+	}
+	return "", false
+}
+
+// duckDBSundayWeekNumberSQL lowers EXTRACT(WEEK[(<weekday>)] FROM d):
+// the week number in [0, 53] where weeks begin on the anchor weekday
+// (offset days after Sunday) and days before the year's first anchor
+// day fall in week 0. Derivation: with doy0 = dayofyear-1 (0-based) and
+// s = days from Jan 1 to the first anchor weekday, the week number is
+// floor((doy0 - s)/7) + 1 clamped to 0 below s — equivalently
+// floor((doy0 - s + 7)/7) since doy0 - s >= -6 always holds.
+func duckDBSundayWeekNumberSQL(expr string, offset int) string {
+	dateExpr := fmt.Sprintf("CAST(%s AS DATE)", expr)
+	jan1 := fmt.Sprintf("make_date(CAST(date_part('year', %s) AS INTEGER), 1, 1)", dateExpr)
+	firstAnchorDelta := fmt.Sprintf("((%d - dayofweek(%s) + 7) %% 7)", offset, jan1)
+	return fmt.Sprintf(
+		"CAST(floor((dayofyear(%s) - 1 - %s + 7) / 7.0) AS BIGINT)",
+		dateExpr, firstAnchorDelta,
+	)
+}
+
+// intervalEnvelopeToNativeSQL converts a runtime value-layer INTERVAL
+// operand (envelope VARCHAR or json_each element) into a native DuckDB
+// INTERVAL. There is no UDF that can return a native INTERVAL through
+// the pure-Go bridge (the codec has no interval result type), so the
+// envelope's signed fields are read back one by one with
+// googlesqlite_extract — whose pure-Go body decodes interval envelopes
+// directly — and recombined with to_months / to_days / to_microseconds.
+// MICROSECOND extracts the signed sub-second fraction in microseconds.
+func intervalEnvelopeToNativeSQL(arg string) string {
+	field := func(part string) string {
+		return fmt.Sprintf("CAST(googlesqlite_extract(%s, '%s') AS BIGINT)", arg, part)
+	}
+	months := fmt.Sprintf("(%s * 12 + %s)", field("YEAR"), field("MONTH"))
+	timeMicros := fmt.Sprintf(
+		"(((%s * 60 + %s) * 60 + %s) * 1000000 + %s)",
+		field("HOUR"), field("MINUTE"), field("SECOND"), field("MICROSECOND"),
+	)
+	return fmt.Sprintf(
+		"(to_months(CAST(%s AS INTEGER)) + to_days(CAST(%s AS INTEGER)) + to_microseconds(%s))",
+		months, field("DAY"), timeMicros,
+	)
+}
+
+// timestampDiffWidthMicros returns the fixed microsecond width of the
+// sub-day TIMESTAMP_DIFF parts (the ones GoogleSQL counts as whole
+// elapsed widths rather than boundary crossings).
+func timestampDiffWidthMicros(part string) (int64, bool) {
+	switch strings.ToUpper(strings.TrimSpace(part)) {
+	case "MICROSECOND":
+		return 1, true
+	case "MILLISECOND":
+		return 1000, true
+	case "SECOND":
+		return 1000000, true
+	case "MINUTE":
+		return 60000000, true
+	case "HOUR":
+		return 3600000000, true
+	}
+	return 0, false
+}
+
+var googleSQLTimeZoneOffsetRE = regexp.MustCompile(`^([+-])(\d{2})(?::?(\d{2}))?$`)
+
+func pinnedUnixNanoArg(args []string) (string, []string, bool) {
+	if len(args) == 0 {
+		return "", args, false
+	}
+	last := strings.TrimSpace(args[len(args)-1])
+	if _, err := strconv.ParseInt(last, 10, 64); err != nil {
+		return "", args, false
+	}
+	return last, args[:len(args)-1], true
+}
+
+func googleSQLTimeZoneOffsetMinutes(zone string) (int, bool) {
+	m := googleSQLTimeZoneOffsetRE.FindStringSubmatch(strings.TrimSpace(zone))
+	if m == nil {
+		return 0, false
+	}
+	hour, err := strconv.Atoi(m[2])
+	if err != nil {
+		return 0, false
+	}
+	min := 0
+	if m[3] != "" {
+		min, err = strconv.Atoi(m[3])
+		if err != nil {
+			return 0, false
+		}
+	}
+	total := hour*60 + min
+	if m[1] == "-" {
+		total = -total
+	}
+	return total, true
+}
+
+func currentCivilTimestampSQL(zoneArgs []string, utcTimestampSQL, instantSQL string) string {
+	if len(zoneArgs) == 0 {
+		return fmt.Sprintf("timezone('UTC', %s)", instantSQL)
+	}
+	if zone, ok := decodeLiteralArgBody(zoneArgs[0]); ok {
+		if minutes, ok := googleSQLTimeZoneOffsetMinutes(zone); ok {
+			return fmt.Sprintf("(%s + INTERVAL '%d minutes')", utcTimestampSQL, minutes)
+		}
+		return fmt.Sprintf("timezone(%s, %s)", sqlStringLiteral(zone), instantSQL)
+	}
+	return fmt.Sprintf("timezone(%s, %s)", zoneArgs[0], instantSQL)
+}
+
+func currentPinnedTimestampSQL(unixNanoSQL string) (string, string) {
+	utcTimestampSQL := fmt.Sprintf("make_timestamp(CAST(%s AS BIGINT) // 1000)", unixNanoSQL)
+	instantSQL := fmt.Sprintf("(%s AT TIME ZONE 'UTC')", utcTimestampSQL)
+	return utcTimestampSQL, instantSQL
+}
+
+// tryNativeDatetimeFunc lowers the GoogleSQL date / datetime / time /
+// timestamp builtins to native DuckDB forms. The formatter reaches this
+// with funcName == the function's storage name (the lowercase BQ name,
+// e.g. "date_diff") and args == the already-formatted operand SQL. It
+// returns (sql, true) when funcName is one it rewrites.
+//
+// Two systematic GoogleSQL/DuckDB mismatches are handled here:
+//   - *_DIFF(a, b, part): GoogleSQL computes a-b with the part last;
+//     DuckDB's date_diff(part, start, end) computes end-start, so the
+//     two date operands swap and the part moves to the front.
+//   - the date-part keyword arrives base64-wrapped (a STRING literal),
+//     so it is decoded back to a bare lowercase part token.
+func tryNativeDatetimeFunc(funcName string, args []string, kinds []googlesql.TypeKind) (string, bool) {
+	part := func(i int) string {
+		if i >= len(args) {
+			return "'day'"
+		}
+		body, ok := decodeLiteralArgBody(args[i])
+		if !ok {
+			return args[i]
+		}
+		p, _ := duckDBDatePart(body)
+		return sqlStringLiteral(p)
+	}
+	// strLit unwraps a base64 value-layer STRING envelope back to a bare
+	// DuckDB string literal. Used for the PARSE_* input string, which
+	// arrives enveloped.
+	strLit := func(i int) string {
+		if i >= len(args) {
+			return "''"
+		}
+		body, ok := decodeLiteralArgBody(args[i])
+		if !ok {
+			return args[i]
+		}
+		return sqlStringLiteral(body)
+	}
+	// fmtArg unwraps a strftime/strptime format-pattern argument and
+	// translates the GoogleSQL-specific conversion specifiers DuckDB does
+	// not share (e.g. %Ez -> %z).
+	fmtArg := func(i int) string {
+		if i >= len(args) {
+			return "''"
+		}
+		body, ok := decodeLiteralArgBody(args[i])
+		if !ok {
+			return args[i]
+		}
+		return sqlStringLiteral(translateBQDateFormat(body))
+	}
+	zoneArg := func(i int) string {
+		if i >= len(args) {
+			return "'UTC'"
+		}
+		body, ok := decodeLiteralArgBody(args[i])
+		if ok {
+			return sqlStringLiteral(body)
+		}
+		return fmt.Sprintf("googlesqlite_plain_string(%s)", args[i])
+	}
+	localTimestamp := func(ts, zone string) string {
+		return fmt.Sprintf("timezone(%s, CAST(%s AS TIMESTAMP WITH TIME ZONE))", zone, ts)
+	}
+	timestampFromLocal := func(civil, zone string) string {
+		return fmt.Sprintf("timezone(%s, CAST(%s AS TIMESTAMP))", zone, civil)
+	}
+	// partBody returns the decoded date-part keyword (upper-cased) for
+	// the unit/granularity argument at index i.
+	partBody := func(i int) string {
+		if i >= len(args) {
+			return "DAY"
+		}
+		body, ok := decodeLiteralArgBody(args[i])
+		if !ok {
+			return ""
+		}
+		return strings.ToUpper(strings.TrimSpace(body))
+	}
+	bucketWidth := func(i int) (string, string, bool) {
+		if i >= len(args) {
+			return "", "", false
+		}
+		return parseGoogleSQLIntervalCall(args[i])
+	}
+	// addSub lowers DATE/DATETIME/TIME/TIMESTAMP _ADD / _SUB. args are
+	// [temporal, count, part]; emit `(temporal op (count * INTERVAL
+	// '1 unit'))` cast back to the source type so the analyzer-resolved
+	// result kind round-trips.
+	addSub := func(op, castType string) (string, bool) {
+		if len(args) < 3 {
+			return "", false
+		}
+		unit, mult := intervalUnitForPart(partBody(2))
+		if unit == "" {
+			return "", false
+		}
+		count := args[1]
+		if mult != 1 {
+			count = fmt.Sprintf("(%s * %d)", count, mult)
+		}
+		return fmt.Sprintf("CAST((%s %s (%s * INTERVAL '1 %s')) AS %s)",
+			args[0], op, count, unit, castType), true
+	}
+
+	switch funcName {
+	// ---- *_DIFF: swap operands, part first ----
+	case "date_diff", "datetime_diff", "time_diff", "timestamp_diff":
+		if len(args) < 3 {
+			return "", false
+		}
+		if funcName == "timestamp_diff" {
+			// GoogleSQL TIMESTAMP_DIFF counts WHOLE part-widths in the
+			// microsecond difference (truncating toward zero) for the
+			// fixed-width parts, not boundary crossings like DuckDB's
+			// date_diff (pure-Go reference: timestamp.TIMESTAMP_DIFF's
+			// Duration division). DAY and coarser keep the boundary
+			// count, matching the body's DATE_DIFF fallback.
+			if width, ok := timestampDiffWidthMicros(partBody(2)); ok {
+				return fmt.Sprintf(
+					"((epoch_us(CAST(%s AS TIMESTAMP WITH TIME ZONE)) - epoch_us(CAST(%s AS TIMESTAMP WITH TIME ZONE))) // %d)",
+					args[0], args[1], width,
+				), true
+			}
+		}
+		if offset, ok := weekPartOffset(partBody(2)); ok {
+			// GoogleSQL WEEK variants count week-start boundaries between
+			// the operands. Snap both dates to their containing week start,
+			// then count 7-day blocks between those aligned boundaries.
+			return fmt.Sprintf(
+				"CAST(date_diff('day', %s, %s) / 7 AS BIGINT)",
+				duckDBWeekStartSQL(args[1], offset),
+				duckDBWeekStartSQL(args[0], offset),
+			), true
+		}
+		return fmt.Sprintf("date_diff(%s, %s, %s)", part(2), args[1], args[0]), true
+
+	case "date_add":
+		return addSub("+", "DATE")
+	case "date_sub":
+		return addSub("-", "DATE")
+	case "datetime_add":
+		return addSub("+", "TIMESTAMP")
+	case "datetime_sub":
+		return addSub("-", "TIMESTAMP")
+	case "time_add":
+		return addSub("+", "TIME")
+	case "time_sub":
+		return addSub("-", "TIME")
+	case "timestamp_add":
+		return addSub("+", "TIMESTAMP WITH TIME ZONE")
+	case "timestamp_sub":
+		return addSub("-", "TIMESTAMP WITH TIME ZONE")
+
+	// ---- *_TRUNC: part first; cast result back to the source type ----
+	case "date_trunc":
+		if len(args) < 2 {
+			return "", false
+		}
+		if sql, ok := duckDBTruncToPartSQL(args[0], partBody(1), "DATE"); ok {
+			return sql, true
+		}
+		return fmt.Sprintf("CAST(date_trunc(%s, %s) AS DATE)", part(1), args[0]), true
+	case "datetime_trunc":
+		if len(args) < 2 {
+			return "", false
+		}
+		if sql, ok := duckDBTruncToPartSQL(args[0], partBody(1), "TIMESTAMP"); ok {
+			return sql, true
+		}
+		return fmt.Sprintf("date_trunc(%s, %s)", part(1), args[0]), true
+	case "timestamp_trunc":
+		if len(args) < 2 {
+			return "", false
+		}
+		zone := "'UTC'"
+		if len(args) >= 3 {
+			zone = zoneArg(2)
+		}
+		civil := localTimestamp(args[0], zone)
+		if sql, ok := duckDBTruncToPartSQL(civil, partBody(1), "TIMESTAMP"); ok {
+			return timestampFromLocal(sql, zone), true
+		}
+		return timestampFromLocal(fmt.Sprintf("date_trunc(%s, %s)", part(1), civil), zone), true
+	case "time_trunc":
+		// DuckDB date_trunc rejects TIME, so lift the time onto the
+		// epoch date (DuckDB has no TIMESTAMP+TIME operator, so go via
+		// to_seconds(epoch(time))), truncate, and project back to TIME.
+		if len(args) < 2 {
+			return "", false
+		}
+		return fmt.Sprintf(
+			"CAST(date_trunc(%s, %s) AS TIME)",
+			part(1), timeLiftedToTimestamp(args[0]),
+		), true
+
+	// ---- *_BUCKET: origin + floor((value-origin)/width)*width ----
+	case "date_bucket", "googlesqlite_date_bucket":
+		if len(args) < 2 {
+			return "", false
+		}
+		count, unit, ok := bucketWidth(1)
+		if !ok || unit != "DAY" {
+			return "", false
+		}
+		origin := "DATE '1950-01-01'"
+		if len(args) >= 3 {
+			origin = args[2]
+		}
+		return fmt.Sprintf(
+			"CAST((%[2]s + (CAST(floor(CAST(date_diff('day', %[2]s, %[1]s) AS DOUBLE) / (%[3]s)) AS BIGINT) * (%[3]s) * INTERVAL '1 day')) AS DATE)",
+			args[0], origin, count,
+		), true
+	case "datetime_bucket", "googlesqlite_datetime_bucket":
+		if len(args) < 2 {
+			return "", false
+		}
+		count, unit, ok := bucketWidth(1)
+		if !ok {
+			return "", false
+		}
+		widthSeconds, ok := intervalWidthSeconds(count, unit)
+		if !ok {
+			return "", false
+		}
+		origin := "TIMESTAMP '1950-01-01 00:00:00'"
+		if len(args) >= 3 {
+			origin = args[2]
+		}
+		return fmt.Sprintf(
+			"make_timestamp(CAST(((epoch(CAST(%[2]s AS TIMESTAMP)) + floor((epoch(CAST(%[1]s AS TIMESTAMP)) - epoch(CAST(%[2]s AS TIMESTAMP))) / CAST((%[3]s) AS DOUBLE)) * CAST((%[3]s) AS DOUBLE)) * 1000000) AS BIGINT))",
+			args[0], origin, widthSeconds,
+		), true
+	case "timestamp_bucket", "googlesqlite_timestamp_bucket":
+		if len(args) < 2 {
+			return "", false
+		}
+		count, unit, ok := bucketWidth(1)
+		if !ok {
+			return "", false
+		}
+		widthSeconds, ok := intervalWidthSeconds(count, unit)
+		if !ok {
+			return "", false
+		}
+		origin := "TIMESTAMPTZ '1950-01-01 00:00:00+00'"
+		if len(args) >= 3 {
+			origin = args[2]
+		}
+		return fmt.Sprintf(
+			"to_timestamp(epoch(CAST(%[2]s AS TIMESTAMP WITH TIME ZONE)) + floor((epoch(CAST(%[1]s AS TIMESTAMP WITH TIME ZONE)) - epoch(CAST(%[2]s AS TIMESTAMP WITH TIME ZONE))) / CAST((%[3]s) AS DOUBLE)) * CAST((%[3]s) AS DOUBLE))",
+			args[0], origin, widthSeconds,
+		), true
+
+	// ---- FORMAT_*: strftime(value, format) ----
+	case "format_date", "format_datetime":
+		if len(args) < 2 {
+			return "", false
+		}
+		return fmt.Sprintf("strftime(%s, %s)", args[1], fmtArg(0)), true
+	case "format_time":
+		// strftime rejects a bare TIME, so lift it onto the epoch date.
+		if len(args) < 2 {
+			return "", false
+		}
+		return fmt.Sprintf("strftime(%s, %s)", timeLiftedToTimestamp(args[1]), fmtArg(0)), true
+	case "format_timestamp":
+		if len(args) < 2 {
+			return "", false
+		}
+		zone := "'UTC'"
+		if len(args) >= 3 {
+			zone = zoneArg(2)
+		}
+		return fmt.Sprintf("strftime(%s, %s)", localTimestamp(args[1], zone), fmtArg(0)), true
+
+	// ---- STRING(timestamp[, tz]): canonical text. Spec only asserts
+	// non-null, so a plain cast to VARCHAR suffices. ----
+	case "string":
+		if len(args) < 1 {
+			return "", false
+		}
+		return fmt.Sprintf("CAST(%s AS VARCHAR)", args[0]), true
+
+	// ---- TIMESTAMP(string[, tz]): parse a textual instant. The string
+	// arrives as a base64 STRING envelope; unwrap and cast. ----
+	case "timestamp":
+		if len(args) < 1 {
+			return "", false
+		}
+		zone := "'UTC'"
+		if len(args) >= 2 {
+			zone = zoneArg(1)
+		}
+		if len(kinds) >= 1 {
+			switch kinds[0] {
+			case googlesql.TypeKindTypeString:
+				if len(args) >= 2 {
+					return timestampFromLocal(fmt.Sprintf("CAST(%s AS TIMESTAMP)", strLit(0)), zone), true
+				}
+				return fmt.Sprintf("CAST(%s AS TIMESTAMP WITH TIME ZONE)", strLit(0)), true
+			case googlesql.TypeKindTypeDate, googlesql.TypeKindTypeDatetime:
+				return timestampFromLocal(args[0], zone), true
+			}
+		}
+		if len(args) >= 2 {
+			return timestampFromLocal(args[0], zone), true
+		}
+		return fmt.Sprintf("CAST(%s AS TIMESTAMP WITH TIME ZONE)", args[0]), true
+
+	// ---- PARSE_*: strptime(value, format) cast to the target type.
+	// Both the format pattern (arg 0) and the input string (arg 1)
+	// arrive as base64 STRING envelopes, so unwrap both. ----
+	case "parse_date":
+		if len(args) < 2 {
+			return "", false
+		}
+		return fmt.Sprintf("CAST(strptime(%s, %s) AS DATE)", strLit(1), fmtArg(0)), true
+	case "parse_datetime":
+		if len(args) < 2 {
+			return "", false
+		}
+		return fmt.Sprintf("CAST(strptime(%s, %s) AS TIMESTAMP)", strLit(1), fmtArg(0)), true
+	case "parse_time":
+		if len(args) < 2 {
+			return "", false
+		}
+		return fmt.Sprintf("CAST(strptime(%s, %s) AS TIME)", strLit(1), fmtArg(0)), true
+	case "parse_timestamp":
+		if len(args) < 2 {
+			return "", false
+		}
+		return fmt.Sprintf("CAST(strptime(%s, %s) AS TIMESTAMP WITH TIME ZONE)", strLit(1), fmtArg(0)), true
+
+	// ---- UNIX_* extraction from an absolute instant ----
+	case "unix_seconds":
+		if len(args) < 1 {
+			return "", false
+		}
+		return fmt.Sprintf("CAST(epoch(%s) AS BIGINT)", args[0]), true
+	case "unix_millis":
+		if len(args) < 1 {
+			return "", false
+		}
+		return fmt.Sprintf("epoch_ms(%s)", args[0]), true
+	case "unix_micros":
+		if len(args) < 1 {
+			return "", false
+		}
+		return fmt.Sprintf("epoch_us(%s)", args[0]), true
+	case "unix_date":
+		// Whole days between the epoch and a civil DATE.
+		if len(args) < 1 {
+			return "", false
+		}
+		return fmt.Sprintf("date_diff('day', DATE '1970-01-01', %s)", args[0]), true
+
+	// ---- constructors from a unix offset -> absolute instant ----
+	case "timestamp_seconds", "timestamp_from_unix_seconds":
+		if len(args) < 1 {
+			return "", false
+		}
+		return fmt.Sprintf("make_timestamp(CAST(%s AS BIGINT) * 1000000)", args[0]), true
+	case "timestamp_millis", "timestamp_from_unix_millis":
+		if len(args) < 1 {
+			return "", false
+		}
+		return fmt.Sprintf("make_timestamp(CAST(%s AS BIGINT) * 1000)", args[0]), true
+	case "timestamp_micros", "timestamp_from_unix_micros":
+		if len(args) < 1 {
+			return "", false
+		}
+		return fmt.Sprintf("make_timestamp(CAST(%s AS BIGINT))", args[0]), true
+	case "date_from_unix_date":
+		if len(args) < 1 {
+			return "", false
+		}
+		return fmt.Sprintf("(DATE '1970-01-01' + to_days(CAST(%s AS INTEGER)))", args[0]), true
+
+	// ---- civil constructors ----
+	case "time":
+		// TIME(hour, minute, second) -> make_time; TIME(timestamp[,tz])
+		// projects an instant into a civil zone before taking the clock.
+		if len(args) == 3 {
+			return fmt.Sprintf("make_time(%s, %s, CAST(%s AS DOUBLE))", args[0], args[1], args[2]), true
+		}
+		if len(args) == 1 {
+			if len(kinds) >= 1 && kinds[0] == googlesql.TypeKindTypeTimestamp {
+				return fmt.Sprintf("CAST(%s AS TIME)", localTimestamp(args[0], "'UTC'")), true
+			}
+			return fmt.Sprintf("CAST(%s AS TIME)", args[0]), true
+		}
+		if len(args) == 2 {
+			return fmt.Sprintf("CAST(%s AS TIME)", localTimestamp(args[0], zoneArg(1))), true
+		}
+		return "", false
+	case "last_day":
+		// LAST_DAY(date_or_datetime[, part]); the single-arg month form
+		// maps straight to DuckDB last_day, which returns DATE. The
+		// two-arg parts are pure calendar rewrites over the civil date
+		// (see duckDBLastDaySQL); cross-checked against the pure-Go
+		// date.LAST_DAY body in formatter_last_day_test.go.
+		if len(args) == 1 {
+			return fmt.Sprintf("last_day(%s)", args[0]), true
+		}
+		if len(args) >= 2 {
+			if sql, ok := duckDBLastDaySQL(args[0], partBody(1)); ok {
+				return sql, true
+			}
+		}
+		return "", false
+
+	// ---- current-time builtins. These sit in currentTimeFuncMap, so
+	// getFuncNameAndArgs shells them to googlesqlite_current_* and, when
+	// a deterministic clock is pinned via WithCurrentTime, appends a UnixNano
+	// arg after any user-supplied zone argument. Use the appended instant
+	// when present; otherwise keep the native volatile DuckDB forms. ----
+	case "current_date", "googlesqlite_current_date", "googlesqlite_safe_current_date":
+		if unixNano, zoneArgs, ok := pinnedUnixNanoArg(args); ok {
+			utcTS, instant := currentPinnedTimestampSQL(unixNano)
+			civil := currentCivilTimestampSQL(zoneArgs, utcTS, instant)
+			return fmt.Sprintf("CAST(%s AS DATE)", civil), true
+		}
+		civil := currentCivilTimestampSQL(args, "timezone('UTC', now())", "now()")
+		return fmt.Sprintf("CAST(%s AS DATE)", civil), true
+	case "current_datetime", "googlesqlite_current_datetime", "googlesqlite_safe_current_datetime":
+		if unixNano, zoneArgs, ok := pinnedUnixNanoArg(args); ok {
+			utcTS, instant := currentPinnedTimestampSQL(unixNano)
+			return currentCivilTimestampSQL(zoneArgs, utcTS, instant), true
+		}
+		return currentCivilTimestampSQL(args, "timezone('UTC', now())", "now()"), true
+	case "current_time", "googlesqlite_current_time", "googlesqlite_safe_current_time":
+		if unixNano, zoneArgs, ok := pinnedUnixNanoArg(args); ok {
+			utcTS, instant := currentPinnedTimestampSQL(unixNano)
+			civil := currentCivilTimestampSQL(zoneArgs, utcTS, instant)
+			return fmt.Sprintf("CAST(%s AS TIME)", civil), true
+		}
+		civil := currentCivilTimestampSQL(args, "timezone('UTC', now())", "now()")
+		return fmt.Sprintf("CAST(%s AS TIME)", civil), true
+	case "current_timestamp", "googlesqlite_current_timestamp", "googlesqlite_safe_current_timestamp":
+		if unixNano, _, ok := pinnedUnixNanoArg(args); ok {
+			_, instant := currentPinnedTimestampSQL(unixNano)
+			return instant, true
+		}
+		return "now()", true
+	}
+	return "", false
+}
+
+// canonicalBuiltinFuncNames lists the special-form builtins whose
+// FunctionCallNode dispatch (the switch on funcName below) handles them with
+// a hand-written lowering rather than a registered UDF. On the SQLite path the
+// resolver prefixes these to googlesqlite_<name>; on the DuckDB path the
+// normalFuncMap is empty so they arrive bare. We canonicalize the bare name
+// back to the prefixed form so a single dispatch covers both paths.
+var canonicalBuiltinFuncNames = map[string]string{
+	"iferror":     "googlesqlite_iferror",
+	"iserror":     "googlesqlite_iserror",
+	"nulliferror": "googlesqlite_nulliferror",
+	// On the DuckDB target the analyzer resolves these proto builtins to
+	// their bare GoogleSQL names (the SQLite normalFuncMap that would
+	// otherwise shell them into googlesqlite_<name> is never populated).
+	// Canonicalize so the switch below reaches their format* lowerings,
+	// which rewrite the call to the googlesqlite_<name> scalar UDFs
+	// registered by registerProtoUDFs. FILTER_FIELDS / REPLACE_FIELDS are
+	// already shelled to the prefixed name upstream, so they are omitted.
+	"from_proto":             "googlesqlite_from_proto",
+	"to_proto":               "googlesqlite_to_proto",
+	"proto_modify_map":       "googlesqlite_proto_modify_map",
+	"proto_map_contains_key": "googlesqlite_proto_map_contains_key",
+}
+
+// canonicalizeBuiltinFuncName maps a bare special-form builtin name to its
+// googlesqlite_<name> dispatch key, leaving any already-prefixed or unhandled
+// name untouched.
+func canonicalizeBuiltinFuncName(funcName string) string {
+	if canonical, ok := canonicalBuiltinFuncNames[funcName]; ok {
+		return canonical
+	}
+	return funcName
+}
+
+// tryFormatExtract lowers EXTRACT(part FROM expr). The analyzer lowers
+// EXTRACT to the $extract builtin, which getFuncNameAndArgs shells into
+// googlesqlite_extract(expr, '<part>') with the part as a base64-wrapped
+// STRING literal. DuckDB has native date_part; the DATE / TIME / DATETIME
+// sub-field parts return a temporal value rather than an integer, so they
+// project through a CAST instead.
+func (n *FunctionCallNode) tryFormatExtract(_ context.Context, funcName string, args []string) (string, bool, error) {
+	if funcName != "googlesqlite_extract" && funcName != "googlesqlite_safe_extract" {
+		return "", false, nil
+	}
+	if len(args) < 2 {
+		return "", false, fmt.Errorf("EXTRACT: expected expr and part, got %d args", len(args))
+	}
+	// EXTRACT(part FROM INTERVAL ...) has no DuckDB-native date_part
+	// overload: the operand reaches DuckDB as the value-layer interval
+	// envelope (a VARCHAR), so date_part(STRING, STRING) is ambiguous.
+	// Keep the call on the registered googlesqlite_extract value-layer
+	// UDF, whose pure-Go body (date.BindExtract) decodes the envelope
+	// and reads the requested interval field directly.
+	if argList, _ := n.node.ArgumentList(); len(argList) > 0 && argList[0] != nil {
+		if t, _ := argList[0].Type(); t != nil {
+			if k, err := t.Kind(); err == nil && k == googlesql.TypeKindTypeInterval {
+				return fmt.Sprintf("%s(%s)", funcName, strings.Join(args, ",")), true, nil
+			}
+		}
+	}
+	body, ok := decodeLiteralArgBody(args[1])
+	if !ok {
+		return "", false, fmt.Errorf("EXTRACT: unrecognized part argument %q", args[1])
+	}
+	switch strings.ToUpper(body) {
+	case "DATE":
+		return fmt.Sprintf("CAST(%s AS DATE)", args[0]), true, nil
+	case "TIME":
+		return fmt.Sprintf("CAST(%s AS TIME)", args[0]), true, nil
+	case "DATETIME":
+		return fmt.Sprintf("CAST(%s AS TIMESTAMP)", args[0]), true, nil
+	}
+	p, _ := duckDBDatePart(body)
+	switch strings.ToUpper(body) {
+	case "ISOWEEK":
+		return fmt.Sprintf(
+			"CAST(floor((date_diff('day', %s, CAST(%s AS DATE)) / 7.0) + 1) AS BIGINT)",
+			duckDBISOYearStartSQL(args[0]), args[0],
+		), true, nil
+	case "ISOYEAR":
+		return fmt.Sprintf("CAST(date_part('isoyear', CAST(%s AS DATE)) AS BIGINT)", args[0]), true, nil
+	}
+	// WEEK and WEEK(<WEEKDAY>) — the analyzer spells the latter
+	// WEEK_MONDAY .. WEEK_SATURDAY. DuckDB's date_part has no
+	// week_<weekday> specifier (it would raise a Conversion Error), so
+	// every week part lowers through the anchored week-number rewrite:
+	// weekPartOffset resolves the anchor weekday's offset from Sunday
+	// (WEEK and WEEK(SUNDAY) -> 0). ISOWEEK never reaches this lookup —
+	// it returned above with ISO year-boundary anchoring, which differs
+	// from WEEK(MONDAY)'s Jan-1 anchoring.
+	if offset, ok := weekPartOffset(body); ok {
+		return duckDBSundayWeekNumberSQL(args[0], offset), true, nil
+	}
+	return fmt.Sprintf("date_part(%s, %s)", sqlStringLiteral(p), args[0]), true, nil
+}
+
+// tryFormatDateConstructor disambiguates the DATE() / DATETIME()
+// overloads by argument count. GoogleSQL overloads one function name
+// across "build from components" and "convert from an instant"; DuckDB
+// splits these across make_date / make_timestamp and CAST, so the right
+// lowering depends on arity.
+func (n *FunctionCallNode) tryFormatDateConstructor(funcName string, args []string, kinds []googlesql.TypeKind) (string, bool, error) {
+	zoneArg := func(i int) string {
+		if i >= len(args) {
+			return "'UTC'"
+		}
+		body, ok := decodeLiteralArgBody(args[i])
+		if ok {
+			return sqlStringLiteral(body)
+		}
+		return fmt.Sprintf("googlesqlite_plain_string(%s)", args[i])
+	}
+	localTimestamp := func(ts, zone string) string {
+		return fmt.Sprintf("timezone(%s, CAST(%s AS TIMESTAMP WITH TIME ZONE))", zone, ts)
+	}
+	switch funcName {
+	case "date":
+		switch len(args) {
+		case 3:
+			// DATE(year, month, day)
+			return fmt.Sprintf("make_date(%s, %s, %s)", args[0], args[1], args[2]), true, nil
+		case 2:
+			return fmt.Sprintf("CAST(%s AS DATE)", localTimestamp(args[0], zoneArg(1))), true, nil
+		case 1:
+			// DATE(timestamp) / DATE(datetime): project to civil date.
+			if len(kinds) >= 1 && kinds[0] == googlesql.TypeKindTypeTimestamp {
+				return fmt.Sprintf("CAST(%s AS DATE)", localTimestamp(args[0], "'UTC'")), true, nil
+			}
+			return fmt.Sprintf("CAST(%s AS DATE)", args[0]), true, nil
+		}
+		return "", false, fmt.Errorf("DATE: unexpected argument count %d", len(args))
+	case "datetime":
+		switch len(args) {
+		case 6:
+			// DATETIME(year, month, day, hour, minute, second)
+			return fmt.Sprintf(
+				"make_timestamp(%s, %s, %s, %s, %s, CAST(%s AS DOUBLE))",
+				args[0], args[1], args[2], args[3], args[4], args[5],
+			), true, nil
+		case 2:
+			if len(kinds) >= 2 && kinds[0] == googlesql.TypeKindTypeDate && kinds[1] == googlesql.TypeKindTypeTime {
+				// DATETIME(date, time)
+				return fmt.Sprintf("CAST(%s AS TIMESTAMP) + (%s - TIME '00:00:00')", args[0], args[1]), true, nil
+			}
+			// DATETIME(timestamp, zone)
+			return localTimestamp(args[0], zoneArg(1)), true, nil
+		case 1:
+			// DATETIME(timestamp) / DATETIME(date)
+			if len(kinds) >= 1 && kinds[0] == googlesql.TypeKindTypeTimestamp {
+				return localTimestamp(args[0], "'UTC'"), true, nil
+			}
+			return fmt.Sprintf("CAST(%s AS TIMESTAMP)", args[0]), true, nil
+		}
+		return "", false, fmt.Errorf("DATETIME: unexpected argument count %d", len(args))
+	}
+	return "", false, nil
 }
 
 // formatFromProto lowers FROM_PROTO. It takes a proto-typed argument
@@ -580,13 +2756,81 @@ func (n *FunctionCallNode) formatErrorHandling(ctx context.Context, funcName str
 		if len(args) < 2 {
 			return "", fmt.Errorf("IFERROR: needs catch_expression")
 		}
-		return fmt.Sprintf("CASE WHEN (%s) IS NULL THEN %s ELSE (%s) END", safeX, args[1], safeX), nil
+		// Both arms of IFERROR(T1, T1) share the result type T1, but the
+		// try arm can reach the binder as a value-layer envelope VARCHAR
+		// (an array element from $array_at_offset, a scalar subquery whose
+		// column is value-layer-encoded) while the catch arm is a native
+		// literal. DuckDB then rejects `CASE WHEN ... THEN <int literal>
+		// ELSE <varchar> END` as a mixed-type CASE. When T1 is a value-layer
+		// scalar AND the try arm actually produces the envelope, decode it
+		// back to its native form so both arms agree; the row decoder accepts
+		// the native result for the column just as it accepts the envelope. A
+		// try arm that is already native (e.g. arithmetic like 1 + 2) is left
+		// untouched - decoding it would pass a BIGINT to googlesqlite_decode_
+		// scalar, which only binds VARCHAR. Non-scalar result types (STRING /
+		// STRUCT / ARRAY / temporal) also keep the untouched form.
+		//
+		// A NUMERIC result (issue #22) is the dual-carrier shape instead:
+		// the try arm can be the value-layer envelope VARCHAR (a
+		// googlesqlite_safe_divide result) while the catch arm is a native
+		// DECIMAL(38,9), which this CASE then refuses to bind. Normalize
+		// both arms through numericStorageReadSQL, same as the CASE / IF /
+		// COALESCE family. The wrapped try arm stays NULL exactly when the
+		// safe-evaluated inner expression is NULL (both decode arms of the
+		// dual form map NULL to NULL), so the error-to-NULL detection in
+		// the WHEN clause is preserved.
+		tryArm := iferrorTryArmSQL(n, safeX)
+		catchArm := args[1]
+		if t, _ := n.node.Type(); t != nil {
+			if k, kerr := t.Kind(); kerr == nil && k == googlesql.TypeKindTypeNumeric {
+				tryArm = numericStorageReadSQL(tryArm)
+				catchArm = numericStorageReadSQL(catchArm)
+			}
+		}
+		return fmt.Sprintf("CASE WHEN (%s) IS NULL THEN %s ELSE (%s) END", tryArm, catchArm, tryArm), nil
 	case "googlesqlite_iserror":
 		return fmt.Sprintf("((%s) IS NULL)", safeX), nil
 	case "googlesqlite_nulliferror":
 		return fmt.Sprintf("(%s)", safeX), nil
 	}
 	return safeX, nil
+}
+
+// iferrorTryArmSQL returns the SQL for IFERROR's try arm. It decodes the
+// safe-evaluated inner expression back to its native form via
+// googlesqlite_decode_scalar + CAST (mirrors GetStructFieldNode's scalar-field
+// decode) only when both hold: the call's result type is a value-layer scalar
+// (INT / FLOAT / BOOL), and the formatted try arm is itself a value-layer
+// envelope (safeXIsValueLayerEnvelope). A try arm that lowers to a native
+// scalar - arithmetic like 1 + 2, a native literal or column - is returned
+// unchanged, because wrapping it in googlesqlite_decode_scalar would pass a
+// native BIGINT / DOUBLE to a UDF that only binds VARCHAR.
+func iferrorTryArmSQL(n *FunctionCallNode, safeX string) string {
+	if t, _ := n.node.Type(); t != nil {
+		if k, err := t.Kind(); err == nil {
+			if castType, ok := valueLayerScalarCastType(k); ok && safeXIsValueLayerEnvelope(safeX) {
+				return fmt.Sprintf("CAST(googlesqlite_decode_scalar(%s) AS %s)", safeX, castType)
+			}
+		}
+	}
+	return safeX
+}
+
+// safeXIsValueLayerEnvelope reports whether a safe-evaluated inner expression
+// is rendered as a value-layer envelope VARCHAR rather than a native scalar.
+// Every envelope-producing lowering on the DuckDB path either calls a
+// googlesqlite_ UDF (the array-element accessors googlesqlite_safe_array_at_*,
+// the googlesqlite_cast the analyzer inserts to coerce ERROR()/other arms, the
+// JSON / struct accessors) or extracts the value through a scalar subquery
+// (SELECT ...). A native scalar produced by tryNativeOperator (e.g.
+// `(CAST(1 AS BIGINT) + CAST(2 AS BIGINT))`) contains neither marker, so it is
+// left undecoded. Keeping this a syntactic test avoids re-walking the resolved
+// inner node, whose envelope-ness depends on analyzer-inserted casts that are
+// only visible after formatting.
+func safeXIsValueLayerEnvelope(safeX string) bool {
+	return strings.Contains(safeX, "googlesqlite_") ||
+		strings.Contains(safeX, "SELECT ") ||
+		strings.Contains(safeX, "SELECT*")
 }
 
 // formatErrorBuiltin lowers ERROR / SAFE_ERROR. Inside a safe-eval
@@ -598,17 +2842,42 @@ func (n *FunctionCallNode) formatErrorBuiltin(ctx context.Context, funcName stri
 	if inSafeEvalMode(ctx) {
 		return "NULL", nil
 	}
-	// Fall through to the default emission below.
+	// SQLite path: route through the registered googlesqlite_error UDF.
 	funcMap := funcMapFromContext(ctx)
 	if spec, exists := funcMap[funcName]; exists {
 		return spec.CallSQL(ctx, n.node.ResolvedFunctionCallBase, args)
 	}
-	return fmt.Sprintf("%s(%s)", funcName, strings.Join(args, ",")), nil
+	// DuckDB path: emit the native error() function. Unlike a registered
+	// UDF (which must declare a concrete VARCHAR result type and would
+	// then fail to unify with a non-VARCHAR sibling branch in an
+	// enclosing CASE / if - e.g. the IS_FIRST / IS_LAST numbering
+	// rewrite's `if(k<0, ERROR(...), <bool>)`), DuckDB's native error()
+	// is polymorphic and short-circuits, so it both type-unifies and
+	// stays unevaluated in a dead branch.
+	if len(args) >= 1 {
+		return fmt.Sprintf("error(%s)", args[0]), nil
+	}
+	return "error()", nil
 }
 
 // formatCaseNoValue lowers a searched CASE expression
 // (CASE WHEN ... THEN ... [ELSE ...] END).
+//
+// DuckDB requires every CASE result branch to bind under one common
+// type, but a NUMERIC branch can carry either of the two carrier forms
+// (native DECIMAL(38,9) vs the value-layer envelope VARCHAR) — e.g. a
+// division result (googlesqlite_divide envelope) in one branch and a
+// CAST literal (native DECIMAL) in another fails with "Cannot mix
+// values of type DECIMAL(38,9) and VARCHAR in CASE expression" (issue
+// #22, the dbt unit-dispatch model). Normalize every NUMERIC-kind
+// argument the same way COALESCE / IFNULL do (issue #21): the WHEN
+// conditions are BOOL and pass through untouched, the THEN / ELSE
+// results land on the native form. The same normalization runs for the
+// value-match form below, where it additionally covers the CASE value
+// and WHEN comparand operands (the binder builds an equality between
+// them, which must also compare by value, not by envelope text).
 func (n *FunctionCallNode) formatCaseNoValue(_ context.Context, args []string) (string, error) {
+	args = normalizeNumericCarrierArgs(args, argKinds(m1(n.node.ArgumentList())))
 	var whenStmts []string
 	for i := 0; i < len(args)-1; i += 2 {
 		whenStmts = append(whenStmts, fmt.Sprintf("WHEN %s THEN %s", args[i], args[i+1]))
@@ -623,11 +2892,16 @@ func (n *FunctionCallNode) formatCaseNoValue(_ context.Context, args []string) (
 }
 
 // formatCaseWithValue lowers a simple CASE expression
-// (CASE value WHEN ... THEN ... [ELSE ...] END).
+// (CASE value WHEN ... THEN ... [ELSE ...] END). NUMERIC-kind operands
+// take the dual-carrier normalization described on formatCaseNoValue —
+// here it covers all three slots (CASE value, WHEN comparands, branch
+// results), since the value/comparand equality and the result-branch
+// unification both demand one engine type.
 func (n *FunctionCallNode) formatCaseWithValue(_ context.Context, args []string) (string, error) {
 	if len(args) < 2 {
 		return "", fmt.Errorf("not enough arguments for case with value")
 	}
+	args = normalizeNumericCarrierArgs(args, argKinds(m1(n.node.ArgumentList())))
 	val := args[0]
 	args = args[1:]
 	var whenStmts []string
@@ -661,6 +2935,19 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 	if err != nil {
 		return "", err
 	}
+	// DuckDB retarget: HLL_COUNT.MERGE_PARTIAL and
+	// KLL_QUANTILES.MERGE_PARTIAL both resolve to the bare leaf
+	// `merge_partial` (Function.Name strips the dotted namespace), and the
+	// KLL body is what the bridge registers under that bare name. Routing
+	// the HLL surface there feeds a HyperLogLog sketch to the KLL gob
+	// decoder ("gob: encoded unsigned integer out of range"). Disambiguate
+	// on the catalog name path and emit the dedicated
+	// hll_count_merge_partial aggregate for the HLL_COUNT namespace.
+	if funcName == "merge_partial" {
+		if np, nperr := m1(n.node.ResolvedFunctionCallBase.Function()).FunctionNamePath(); nperr == nil && len(np) > 0 && np[0] == "hll_count" {
+			funcName = "hll_count_merge_partial"
+		}
+	}
 	// HAVING { MAX | MIN } modifier rewrite. The resolved tree
 	// carries the modifier on ResolvedAggregateFunctionCall, but
 	// SQLite has no equivalent. For ANY_VALUE we rewrite to a
@@ -679,18 +2966,27 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 			}
 		}
 		kindLit, _ := literalFromValue(value.StringValue(kind))
+		// The bare name matches the aggregate registered in duckdbAggSpecs()
+		// (the DuckDB cgo path registers aggregates under their bare lowered
+		// name, unlike the googlesqlite_-prefixed scalar UDFs).
 		return fmt.Sprintf(
-			"googlesqlite_having_any_value(%s,%s,%s)",
+			"having_any_value(%s,%s,%s)",
 			strings.Join(args, ","), havingExpr, kindLit,
 		), nil
 	}
 	// When formatting inside a DifferentialPrivacyAggregateScan /
-	// AnonymizedAggregateScan, append (epsilon, delta) to every
-	// $differential_privacy_* or $anon_* call so the runtime UDF
-	// can size the Laplace noise from the scan's privacy budget.
-	if dp := dpOptionsFromContext(ctx); dp != nil &&
-		(strings.HasPrefix(funcName, "googlesqlite_differential_privacy_") ||
-			strings.HasPrefix(funcName, "googlesqlite_anon_")) {
+	// AnonymizedAggregateScan, append (epsilon, delta) to every DP /
+	// anonymization aggregate call so the runtime UDF can size the
+	// Laplace noise from the scan's privacy budget. The WITH
+	// DIFFERENTIAL_PRIVACY surface lowers to $-builtin
+	// $differential_privacy_* names that pick up the googlesqlite_
+	// prefix; the WITH ANONYMIZATION surface's RewriteAnonymization
+	// emits the catalog aggregate names anon_* / $anon_* directly, so
+	// match both the bare and prefixed anon spellings. Without the
+	// trailing budget, the high-epsilon "without noise" examples
+	// (epsilon=1e20) could not size noise to ~0 and would diverge from
+	// the asserted exact values.
+	if dp := dpOptionsFromContext(ctx); dp != nil && isDPAggregateName(funcName) {
 		epsLit, _ := literalFromValue(value.FloatValue(dp.Epsilon))
 		delLit, _ := literalFromValue(value.FloatValue(dp.Delta))
 		args = append(args, epsLit, delLit)
@@ -699,37 +2995,243 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 	if spec, exists := funcMap[funcName]; exists {
 		return spec.CallSQL(ctx, n.node.ResolvedFunctionCallBase, args)
 	}
-	var opts []string
+	// DuckDB retarget: COUNTIF. DuckDB exposes countif/count_if, but it
+	// returns NULL over an empty input whereas GoogleSQL COUNTIF returns
+	// 0. COUNT(CASE WHEN cond THEN 1 END) matches both the truthy-count
+	// and the zero-on-empty semantics.
+	if funcName == "countif" && len(args) == 1 {
+		return fmt.Sprintf("count(CASE WHEN %s THEN 1 END)", args[0]), nil
+	}
+	if funcName == "max_by" && len(args) == 2 {
+		return fmt.Sprintf("arg_max(%s,%s)", args[0], args[1]), nil
+	}
+	if funcName == "min_by" && len(args) == 2 {
+		return fmt.Sprintf("arg_min(%s,%s)", args[0], args[1]), nil
+	}
+	if sql, ok, err := tryNativeArrayAggStructTopN(ctx, funcName, n.node, args); ok || err != nil {
+		return sql, err
+	}
+	// DuckDB retarget: numeric / statistical / bitwise / logical
+	// aggregates resolve to their bare catalog name here (the SQLite
+	// aggregateFuncMap is never populated on this target), but DuckDB's
+	// native reducers cannot consume the JSON value-layer encoding the
+	// UNNEST source feeds. Rewrite to the native name with the argument(s)
+	// cast to the right numeric type; the DISTINCT / ORDER BY handling
+	// below still applies to the rewritten form. resultWrap (when set)
+	// narrows the finished aggregate call back to its analyzer result
+	// type — SUM(INT64) must come back as an exact BIGINT, with DuckDB's
+	// out-of-range conversion error supplying BigQuery's overflow-is-an-
+	// error semantics (issue #5).
+	resultKind := googlesql.TypeKindTypeUnknown
+	if t, _ := n.node.Type(); t != nil {
+		if k, err := t.Kind(); err == nil {
+			resultKind = k
+		}
+	}
+	aggArgKinds := argKinds(m1(n.node.ResolvedFunctionCallBase.ArgumentList()))
+	var resultWrap string
+	if duckName, castArgs, rw, ok := tryNativeNumericAggregate(funcName, args, resultKind, aggArgKinds); ok {
+		funcName = duckName
+		args = castArgs
+		resultWrap = rw
+	}
+	useMarkerAggregate := usesDuckDBAggregateOptionMarkers(funcName)
+	if funcName == "array_agg" && m1(n.node.Distinct()) {
+		funcName = "googlesqlite_array_agg"
+		useMarkerAggregate = true
+	}
+	if useMarkerAggregate {
+		var opts []string
+		for _, item := range m1(n.node.OrderByItemList()) {
+			columnRef := m1(item.ColumnRef())
+			colName := uniqueColumnName(ctx, m1(columnRef.Column()))
+			if m1(item.IsDescending()) {
+				opts = append(opts, fmt.Sprintf("googlesqlite_order_by(\"%s\", false)", colName))
+			} else {
+				opts = append(opts, fmt.Sprintf("googlesqlite_order_by(\"%s\", true)", colName))
+			}
+		}
+		if len(opts) == 0 {
+			if ordinal := aggregateInputOrdinalFromContext(ctx); ordinal != "" {
+				opts = append(opts, fmt.Sprintf("googlesqlite_order_by(\"%s\", true)", ordinal))
+			}
+		}
+		if m1(n.node.Distinct()) {
+			opts = append(opts, "googlesqlite_distinct()")
+		}
+		if m1(n.node.Limit()) != nil {
+			limitValue, err := newNode(m1(n.node.Limit())).FormatSQL(ctx)
+			if err != nil {
+				return "", err
+			}
+			opts = append(opts, fmt.Sprintf("googlesqlite_limit(%s)", limitValue))
+		}
+		switch m1(n.node.NullHandlingModifier()) {
+		case googlesql.ResolvedNonScalarFunctionCallBaseEnums_NullHandlingModifierIgnoreNulls:
+			opts = append(opts, "googlesqlite_ignore_nulls()")
+		case googlesql.ResolvedNonScalarFunctionCallBaseEnums_NullHandlingModifierRespectNulls:
+		}
+		args = append(args, opts...)
+		return fmt.Sprintf("%s(%s)", funcName, strings.Join(args, ",")), nil
+	}
+	// DuckDB retarget (PATH B): native aggregates take DISTINCT and
+	// ORDER BY as in-call SQL syntax. BigQuery's default null placement is
+	// NULLS FIRST for ascending and NULLS LAST for descending, so emit it
+	// explicitly for DuckDB.
+	argPrefix := ""
+	if m1(n.node.Distinct()) {
+		argPrefix = "DISTINCT "
+	}
+	var orderByClause string
+	var orderByItems []string
 	for _, item := range m1(n.node.OrderByItemList()) {
 		columnRef := m1(item.ColumnRef())
 		colName := uniqueColumnName(ctx, m1(columnRef.Column()))
 		if m1(item.IsDescending()) {
-			opts = append(opts, fmt.Sprintf("googlesqlite_order_by(`%s`, false)", colName))
+			orderByItems = append(orderByItems, fmt.Sprintf("\"%s\" DESC NULLS LAST", colName))
 		} else {
-			opts = append(opts, fmt.Sprintf("googlesqlite_order_by(`%s`, true)", colName))
+			orderByItems = append(orderByItems, fmt.Sprintf("\"%s\" NULLS FIRST", colName))
 		}
 	}
-	if m1(n.node.Distinct()) {
-		opts = append(opts, "googlesqlite_distinct()")
+	if len(orderByItems) == 0 {
+		if ordinal := aggregateInputOrdinalFromContext(ctx); ordinal != "" {
+			switch funcName {
+			case "array_agg", "array_concat_agg":
+				orderByItems = append(orderByItems, fmt.Sprintf("\"%s\"", ordinal))
+			}
+		}
 	}
+	if len(orderByItems) > 0 {
+		orderByClause = " ORDER BY " + strings.Join(orderByItems, ",")
+	}
+	limitSQL := "NULL"
 	if m1(n.node.Limit()) != nil {
 		limitValue, err := newNode(m1(n.node.Limit())).FormatSQL(ctx)
 		if err != nil {
 			return "", err
 		}
-		opts = append(opts, fmt.Sprintf("googlesqlite_limit(%s)", limitValue))
+		limitSQL = limitValue
 	}
+	ignoreNullsSQL := "FALSE"
 	switch m1(n.node.NullHandlingModifier()) {
 	case googlesql.ResolvedNonScalarFunctionCallBaseEnums_NullHandlingModifierIgnoreNulls:
-		opts = append(opts, "googlesqlite_ignore_nulls()")
+		ignoreNullsSQL = "TRUE"
 	case googlesql.ResolvedNonScalarFunctionCallBaseEnums_NullHandlingModifierRespectNulls:
 	}
-	args = append(args, opts...)
-	return fmt.Sprintf(
-		"%s(%s)",
+	// DuckDB retarget: a few GoogleSQL aggregate builtins resolve to bare
+	// names that DuckDB spells differently. LOGICAL_AND / LOGICAL_OR (the
+	// boolean aggregates the analyzer emits inside ARRAY_INCLUDES_ALL /
+	// ARRAY_INCLUDES_ANY rewrites) map to DuckDB's bool_and / bool_or with
+	// identical NULL-skipping semantics.
+	if native, ok := nativeAggregateFuncMap[funcName]; ok {
+		funcName = native
+	}
+	if funcName == "array_agg" && len(args) == 1 {
+		return fmt.Sprintf(
+			"googlesqlite_array_agg_from_native(array_agg(%s%s%s), %s, %s)",
+			argPrefix,
+			args[0],
+			orderByClause,
+			ignoreNullsSQL,
+			limitSQL,
+		), nil
+	}
+	// DuckDB retarget: ARRAY_CONCAT_AGG flattens per-row ARRAY<T> values
+	// into one ARRAY<T>. DuckDB has no array_concat_agg, and duckdb-go
+	// exposes no aggregate-UDF registration, so collect the per-row array
+	// values with native array_agg (yielding a LIST of array-envelope
+	// VARCHARs) and flatten them in a scalar UDF that decodes each envelope
+	// and concatenates the elements into a single array-envelope. An
+	// all-empty / zero-row input flattens to an empty array, which
+	// GoogleSQL then surfaces as NULL on the result path.
+	if funcName == "array_concat_agg" {
+		return fmt.Sprintf(
+			"googlesqlite_array_concat_agg_flatten(array_agg(%s%s%s), %s)",
+			argPrefix,
+			strings.Join(args, ","),
+			orderByClause,
+			limitSQL,
+		), nil
+	}
+	if funcName == "string_agg" && len(args) >= 1 {
+		callArgs := append([]string{}, args...)
+		callArgs[0] = fmt.Sprintf("googlesqlite_plain_string(%s)", callArgs[0])
+		if len(callArgs) >= 2 {
+			callArgs[1] = fmt.Sprintf("googlesqlite_plain_string(%s)", callArgs[1])
+		}
+		return fmt.Sprintf(
+			"string_agg(%s%s%s)",
+			argPrefix,
+			strings.Join(callArgs, ","),
+			orderByClause,
+		), nil
+	}
+	sql := fmt.Sprintf(
+		"%s(%s%s%s)",
 		funcName,
+		argPrefix,
 		strings.Join(args, ","),
-	), nil
+		orderByClause,
+	)
+	if resultWrap != "" {
+		// Re-shape the finished aggregate to its analyzer result form: a
+		// narrowing CAST for the exact-integer / NUMERIC cases (DuckDB
+		// raises a conversion error on an out-of-range sum, which is
+		// BigQuery's overflow behavior) or the string-envelope re-wrap
+		// for MIN/MAX over STRING (issue #9 coverage class).
+		sql = fmt.Sprintf(resultWrap, sql)
+	}
+	return sql, nil
+}
+
+// nativeAggregateFuncMap maps a bare GoogleSQL aggregate builtin name to
+// its DuckDB-native aggregate spelling for the non-window call path.
+var nativeAggregateFuncMap = map[string]string{
+	"logical_and": "bool_and",
+	"logical_or":  "bool_or",
+}
+
+func tryNativeArrayAggStructTopN(ctx context.Context, funcName string, node *googlesql.ResolvedAggregateFunctionCall, args []string) (string, bool, error) {
+	if node == nil || (funcName != "array_agg" && funcName != "googlesqlite_array_agg") {
+		return "", false, nil
+	}
+	if len(args) != 1 || m1(node.Distinct()) {
+		return "", false, nil
+	}
+	callArgs := m1(node.ResolvedFunctionCallBase.ArgumentList())
+	if len(callArgs) != 1 {
+		return "", false, nil
+	}
+	if _, ok := callArgs[0].(*googlesql.ResolvedMakeStruct); !ok {
+		return "", false, nil
+	}
+	orderByItems := m1(node.OrderByItemList())
+	if len(orderByItems) != 1 || m1(node.Limit()) == nil {
+		return "", false, nil
+	}
+	if mod := m1(node.NullHandlingModifier()); mod == googlesql.ResolvedNonScalarFunctionCallBaseEnums_NullHandlingModifierIgnoreNulls {
+		return "", false, nil
+	}
+	columnRef := m1(orderByItems[0].ColumnRef())
+	if columnRef == nil {
+		return "", false, nil
+	}
+	limitValue, err := newNode(m1(node.Limit())).FormatSQL(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	colName := uniqueColumnName(ctx, m1(columnRef.Column()))
+	topNFunc := "arg_min"
+	if m1(orderByItems[0].IsDescending()) {
+		topNFunc = "arg_max"
+	}
+	return fmt.Sprintf(
+		"googlesqlite_array_from_native(%s(%s,\"%s\",%s))",
+		topNFunc,
+		args[0],
+		colName,
+		limitValue,
+	), true, nil
 }
 
 // nativeWindowFuncMap maps GoogleSQL window function names that have a
@@ -747,6 +3249,16 @@ var nativeWindowFuncMap = map[string]string{
 	"percent_rank": "percent_rank",
 	"cume_dist":    "cume_dist",
 	"ntile":        "ntile",
+	// PERCENTILE_CONT / PERCENTILE_DISC map to DuckDB's quantile_cont /
+	// quantile_disc, which accept the same (value, fraction) argument
+	// order in OVER context and ignore NULLs natively (matching the
+	// GoogleSQL default IGNORE NULLS modifier on these functions).
+	"percentile_cont": "quantile_cont",
+	"percentile_disc": "quantile_disc",
+	// COUNT(*) -> DuckDB native count(*). The IGNORE NULLS modifier the
+	// IS_LAST rewrite attaches is a no-op for COUNT(*) (it counts rows),
+	// so the bare native form is exact. formatNative injects the * arg.
+	"count_star": "count",
 	// Navigation functions — SQLite returns the underlying value
 	// unchanged, so encoded values flow through correctly.
 	"lag":         "lag",
@@ -754,6 +3266,21 @@ var nativeWindowFuncMap = map[string]string{
 	"first_value": "first_value",
 	"last_value":  "last_value",
 	"nth_value":   "nth_value",
+	// ANY_VALUE — DuckDB's any_value returns the first non-NULL value of
+	// the frame, which matches the reference engine's window ANY_VALUE
+	// (first value after the default IGNORE NULLS filtering).
+	"any_value": "any_value",
+	// COUNTIF — lowered by formatNative to count(CASE WHEN cond THEN 1
+	// END) OVER (...), the same rewrite the non-window aggregate path
+	// uses (COUNT never returns NULL, matching COUNTIF's 0-on-empty).
+	"countif": "countif",
+	// Boolean and bitwise aggregates: DuckDB exposes these as native
+	// aggregate functions, and any native aggregate can run with OVER.
+	"logical_and": "bool_and",
+	"logical_or":  "bool_or",
+	"bit_and":     "bit_and",
+	"bit_or":      "bit_or",
+	"bit_xor":     "bit_xor",
 	// Cumulative aggregates against native SQLite types. Encoded
 	// values would not survive these (SUM of base64 strings would
 	// fail), but parity tests exercise them on INT64/FLOAT64 where
@@ -763,6 +3290,14 @@ var nativeWindowFuncMap = map[string]string{
 	"count": "count",
 	"min":   "min",
 	"max":   "max",
+	// TF_IDF is registered as a DuckDB aggregate (see duckdb_aggregate_udf.go),
+	// and DuckDB runs any aggregate as a window function under OVER (). Routing
+	// it through the native window path emits a clean `tf_idf(tokens) OVER (...)`
+	// call without the option markers (ignore_nulls / window_rowid) the
+	// emulation path appends - those marker UDFs are not registered on the
+	// DuckDB backend, and the registered aggregate computes the per-row scores
+	// itself.
+	"tf_idf": "tf_idf",
 }
 
 // customNativeWindowFuncMap lists googlesql window functions whose
@@ -776,7 +3311,6 @@ var customNativeWindowFuncMap = map[string]string{
 	"array_agg":  "googlesqlite_window_array_agg",
 	"string_agg": "googlesqlite_window_string_agg",
 	"countif":    "googlesqlite_window_countif",
-	"count_star": "googlesqlite_window_count_star",
 	"any_value":  "googlesqlite_window_any_value",
 	// Statistical aggregators. Each runs over a sliding buffer of
 	// floats with Step / Inverse / Done — see
@@ -790,22 +3324,6 @@ var customNativeWindowFuncMap = map[string]string{
 	"variance":    "googlesqlite_window_var_samp",
 	"var_pop":     "googlesqlite_window_var_pop",
 	"var_samp":    "googlesqlite_window_var_samp",
-	// PERCENTILE_CONT / PERCENTILE_DISC have no SQLite built-in;
-	// custom natives buffer the active window and sort at Done.
-	"percentile_cont": "googlesqlite_window_percentile_cont",
-	"percentile_disc": "googlesqlite_window_percentile_disc",
-	// Boolean / bitwise aggregators in OVER context. Their custom
-	// natives implement Step / Inverse / Done over the active frame
-	// with per-row tristate tracking (NULL / FALSE / TRUE) for the
-	// LOGICAL_* family and direct &/|/^ folding for the BIT_* family.
-	"logical_or":  "googlesqlite_window_logical_or",
-	"logical_and": "googlesqlite_window_logical_and",
-	"bit_and":     "googlesqlite_window_bit_and",
-	"bit_or":      "googlesqlite_window_bit_or",
-	"bit_xor":     "googlesqlite_window_bit_xor",
-	// ARRAY_CONCAT_AGG flattens per-row ARRAY<T> arguments into a
-	// single ARRAY<T> over the active frame.
-	"array_concat_agg": "googlesqlite_window_array_concat_agg",
 }
 
 // nativeWindowFuncForName returns the SQLite native name for a
@@ -836,13 +3354,54 @@ func (n *AnalyticFunctionCallNode) FormatSQL(ctx context.Context) (string, error
 	// `$` (e.g. `$count_star` for COUNT(*)). Strip it for lookup.
 	rawName = strings.TrimPrefix(rawName, "$")
 
-	// SUM(DISTINCT x) / COUNT(DISTINCT x) / AVG(DISTINCT x) — SQLite
-	// rejects DISTINCT in OVER, but our custom natives know how to
-	// dedupe. Take precedence over the SQLite-native fast path.
+	// ST_CLUSTERDBSCAN has no native analytic form and the SQLite
+	// emulation hack does not survive DuckDB's unordered parallel
+	// scan, so lower it to a native list_extract(... OVER (), ...)
+	// window expression backed by the st_clusterdbscan window
+	// aggregate. See formatStClusterDBSCAN.
+	if rawName == "st_clusterdbscan" {
+		return n.formatStClusterDBSCAN(ctx, orderColumns)
+	}
+
+	// SUM(DISTINCT x) / COUNT(DISTINCT x) / AVG(DISTINCT x) — DuckDB
+	// supports DISTINCT aggregate arguments inside OVER natively (the
+	// value-layer encodings are injective, so envelope equality equals
+	// payload equality). formatNative emits the DISTINCT keyword inside
+	// the native call when n.node.Distinct() is set.
 	if m1(n.node.Distinct()) {
-		if custom, ok := distinctAwareNativeWindowFuncs[rawName]; ok {
-			return n.formatNative(ctx, custom, orderColumns, true)
+		if _, ok := distinctAwareNativeWindowFuncs[rawName]; ok {
+			return n.formatNative(ctx, nativeWindowFuncMap[rawName], orderColumns, false)
 		}
+	}
+	// PERCENTILE_CONT / PERCENTILE_DISC with RESPECT NULLS: DuckDB's
+	// quantile_cont / quantile_disc always ignore NULLs, so the modifier
+	// routes to the googlesqlite_window_percentile_* replay aggregates
+	// (the pure-Go bodies sort NULLs to the front of the partition).
+	if rawName == "percentile_cont" || rawName == "percentile_disc" {
+		if m1(n.node.NullHandlingModifier()) == googlesql.ResolvedNonScalarFunctionCallBaseEnums_NullHandlingModifierRespectNulls {
+			return n.formatNative(ctx, "googlesqlite_window_"+rawName, orderColumns, true)
+		}
+	}
+	if rawName == "array_agg" && !n.requiresPredecessorEmulation() {
+		inner, err := n.formatNative(ctx, "array_agg", orderColumns, false)
+		if err != nil {
+			return "", err
+		}
+		ignoreNulls := "FALSE"
+		if m1(n.node.NullHandlingModifier()) == googlesql.ResolvedNonScalarFunctionCallBaseEnums_NullHandlingModifierIgnoreNulls {
+			ignoreNulls = "TRUE"
+		}
+		return fmt.Sprintf("googlesqlite_array_agg_from_native(%s, %s, NULL)", inner, ignoreNulls), nil
+	}
+	if rawName == "string_agg" && !n.requiresPredecessorEmulation() {
+		return n.formatNative(ctx, "string_agg", orderColumns, false)
+	}
+	if rawName == "array_concat_agg" && !n.requiresPredecessorEmulation() {
+		inner, err := n.formatNative(ctx, "array_agg", orderColumns, false)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("googlesqlite_array_concat_agg_flatten(%s, NULL)", inner), nil
 	}
 	if native := nativeWindowFuncForName(rawName); native != "" && !n.requiresPredecessorEmulation() {
 		return n.formatNative(ctx, native, orderColumns, false)
@@ -909,9 +3468,11 @@ func (n *AnalyticFunctionCallNode) FormatSQL(ctx context.Context) (string, error
 // DISTINCT modifier on functions whose plain native form is a SQLite
 // built-in (which doesn't accept DISTINCT in OVER).
 var distinctAwareNativeWindowFuncs = map[string]string{
-	"sum":   "googlesqlite_window_sum_distinct",
-	"count": "googlesqlite_window_count_distinct",
-	"avg":   "googlesqlite_window_avg_distinct",
+	"sum":         "googlesqlite_window_sum_distinct",
+	"count":       "googlesqlite_window_count_distinct",
+	"avg":         "googlesqlite_window_avg_distinct",
+	"logical_and": "bool_and",
+	"logical_or":  "bool_or",
 }
 
 // requiresPredecessorEmulation reports whether this analytic call
@@ -952,7 +3513,13 @@ func (n *AnalyticFunctionCallNode) requiresPredecessorEmulation() bool {
 		// natively.
 		switch rawName {
 		case "sum", "count", "count_star", "avg", "min", "max",
-			"lag", "lead", "first_value", "last_value", "nth_value":
+			"logical_or", "logical_and", "bit_or", "bit_and", "bit_xor",
+			"array_concat_agg",
+			"lag", "lead", "first_value", "last_value", "nth_value",
+			// DuckDB quantile_cont / quantile_disc ignore NULLs
+			// natively, which matches the GoogleSQL default IGNORE
+			// NULLS modifier these functions carry.
+			"percentile_cont", "percentile_disc":
 			return false
 		}
 		// Custom natives parse `googlesqlite_ignore_nulls()` out of
@@ -990,6 +3557,71 @@ func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName 
 		}
 		valueArgs = append(valueArgs, arg)
 	}
+	// DuckDB's quantile_cont binds its value argument as DOUBLE and
+	// rejects the JSON-typed column the UNNEST lowering produces for a
+	// FLOAT64 element (the json_each.value is JSON). PERCENTILE_CONT
+	// always yields a continuous (double) result, so cast the value arg
+	// to DOUBLE. quantile_disc returns the element type unchanged and
+	// DuckDB auto-casts JSON integers for it, so it is left as-is.
+	if sqliteName == "quantile_cont" && len(valueArgs) >= 1 {
+		valueArgs[0] = fmt.Sprintf("CAST(%s AS DOUBLE)", valueArgs[0])
+	}
+	if sqliteName == "string_agg" && len(valueArgs) >= 1 {
+		valueArgs[0] = fmt.Sprintf("googlesqlite_plain_string(%s)", valueArgs[0])
+		if len(valueArgs) >= 2 {
+			valueArgs[1] = fmt.Sprintf("googlesqlite_plain_string(%s)", valueArgs[1])
+		}
+	}
+	// SUM / AVG in OVER context reject the JSON value-layer encoding the
+	// UNNEST source produces (`sum(JSON)` does not bind), the same way the
+	// non-window aggregate path casts its argument. Cast the value arg
+	// only when its analyzer-resolved kind is a value-layer numeric
+	// (INT/FLOAT) so a real native-numeric column is unaffected. AVG is
+	// always a FLOAT64 result, so it casts to DOUBLE; SUM over an INT64
+	// argument must stay EXACT (issue #5), so it takes the BIGINT cast
+	// valueLayerScalarCastType resolves for the integer kinds — DuckDB's
+	// sum(BIGINT) accumulates in HUGEINT without float rounding. MIN /
+	// MAX / COUNT bind against JSON directly, so they are left alone.
+	if (sqliteName == "sum" || sqliteName == "avg") && len(valueArgs) >= 1 {
+		kinds := argKinds(m1(n.node.ResolvedFunctionCallBase.ArgumentList()))
+		if castType, ok := valueLayerScalarCastType(kindAt(kinds, 0)); ok {
+			if sqliteName == "avg" {
+				castType = "DOUBLE"
+			}
+			valueArgs[0] = fmt.Sprintf("CAST(%s AS %s)", valueArgs[0], castType)
+		} else if kindAt(kinds, 0) == googlesql.TypeKindTypeNumeric {
+			// Native-storage NUMERIC: a stored column is DECIMAL(38,9)
+			// and binds the window reducer directly; the read wrap only
+			// decodes envelope-shaped operands (UDF results, legacy
+			// tables) — issue #9's window path, completed natively.
+			valueArgs[0] = numericStorageReadSQL(valueArgs[0])
+		} else if isNumericEnvelopeKind(kindAt(kinds, 0)) {
+			// BIGNUMERIC window operands stay value-layer envelopes
+			// (beyond DuckDB's 38-digit DECIMAL): unwrap to plain text
+			// and run the window reducer over DOUBLE (approximate).
+			valueArgs[0] = fmt.Sprintf("CAST(googlesqlite_plain_string(%s) AS DOUBLE)", valueArgs[0])
+		}
+	}
+	// MIN / MAX in OVER context order by the raw operand: fine for the
+	// native scalar kinds, but a NUMERIC operand must order as DECIMAL
+	// (envelope-shaped operands would order lexicographically) and a
+	// BYTES operand by payload bytes — the same treatment the
+	// non-window aggregate path applies (issue #9's "window not" gap,
+	// closed by the native-storage migration).
+	if (sqliteName == "min" || sqliteName == "max") && len(valueArgs) >= 1 {
+		kinds := argKinds(m1(n.node.ResolvedFunctionCallBase.ArgumentList()))
+		switch kindAt(kinds, 0) {
+		case googlesql.TypeKindTypeNumeric:
+			valueArgs[0] = numericStorageReadSQL(valueArgs[0])
+		case googlesql.TypeKindTypeBytes:
+			valueArgs[0] = bytesStorageReadSQL(valueArgs[0])
+		}
+	}
+	// $count_star resolves with no value arguments; DuckDB's native
+	// COUNT requires the * argument in OVER context.
+	if sqliteName == "count" && len(valueArgs) == 0 {
+		valueArgs = []string{"*"}
+	}
 	if includeOpts {
 		if m1(n.node.Distinct()) {
 			valueArgs = append(valueArgs, "googlesqlite_distinct()")
@@ -1001,27 +3633,102 @@ func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName 
 			valueArgs = append(valueArgs, "googlesqlite_ignore_nulls()")
 		}
 	}
-	call := fmt.Sprintf("%s(%s)", sqliteName, strings.Join(valueArgs, ","))
+	// DISTINCT over a native aggregate in OVER context: DuckDB supports
+	// the DISTINCT keyword inside window aggregate calls directly, and
+	// dedupe over the (injective) value-layer / cast operand equals
+	// dedupe over the GoogleSQL value. Only the plain native reducers
+	// take the keyword; custom googlesqlite_* bodies receive the
+	// googlesqlite_distinct() marker via includeOpts instead.
+	distinctKeyword := ""
+	if m1(n.node.Distinct()) && !includeOpts {
+		switch sqliteName {
+		case "sum", "avg", "count", "min", "max", "bool_or", "bool_and",
+			// ARRAY_AGG(DISTINCT x) / STRING_AGG(DISTINCT s) in OVER
+			// context: the engine implements DISTINCT for windowed
+			// list/string aggregates natively, and dedupe over the
+			// (injective) value-layer operand equals dedupe over the
+			// GoogleSQL value. Without this the analytic array_agg /
+			// string_agg branches would silently drop the modifier and
+			// keep duplicates. BigQuery rejects in-call ORDER BY / LIMIT
+			// when OVER is present, so only the DISTINCT and
+			// null-handling modifiers must survive — null handling stays
+			// on the existing wrappers (googlesqlite_array_agg_from_native
+			// / plain string_agg), unchanged from the non-DISTINCT path.
+			"array_agg", "string_agg":
+			distinctKeyword = "DISTINCT "
+		}
+	}
+	call := fmt.Sprintf("%s(%s%s)", sqliteName, distinctKeyword, strings.Join(valueArgs, ","))
+	// COUNTIF(cond) — same rewrite as the non-window aggregate path:
+	// DuckDB's count_if returns NULL over an empty frame where GoogleSQL
+	// returns 0, while COUNT(CASE WHEN cond THEN 1 END) matches both the
+	// truthy-count and the zero-on-empty semantics.
+	if sqliteName == "countif" && len(valueArgs) >= 1 {
+		call = fmt.Sprintf("count(CASE WHEN %s THEN 1 END)", valueArgs[0])
+	}
 
+	over, err := n.windowOverClause(ctx, orderColumns)
+	if err != nil {
+		return "", err
+	}
+	expr := call + " " + over
+	// SUM with an INT64 analyzer result type: DuckDB's sum yields HUGEINT;
+	// narrow the window expression back to BIGINT so the result stays an
+	// exact INT64 (and a genuinely out-of-range running sum raises DuckDB's
+	// conversion error — BigQuery's overflow semantics) instead of falling
+	// back to a rounded FLOAT64 on the decode path (issue #5).
+	if sqliteName == "sum" || sqliteName == "avg" {
+		if t, _ := n.node.Type(); t != nil {
+			if k, kerr := t.Kind(); kerr == nil {
+				switch {
+				case sqliteName == "sum" && k == googlesql.TypeKindTypeInt64:
+					expr = fmt.Sprintf("CAST(%s AS BIGINT)", expr)
+				case k == googlesql.TypeKindTypeNumeric:
+					// BigQuery SUM/AVG(NUMERIC) return NUMERIC (issue #9):
+					// narrow the window expression to DECIMAL(38,9) so the
+					// result decodes as an exact NumericValue rather than a
+					// rounded FLOAT64 (avg's native result is DOUBLE).
+					expr = fmt.Sprintf("CAST(%s AS DECIMAL(38,9))", expr)
+				}
+			}
+		}
+	}
+	return expr, nil
+}
+
+// windowOverClause assembles the `OVER (...)` clause shared by the
+// native window path from the partition / order / frame information the
+// predecessor tucked into the analytic context. Returns `OVER ()` when
+// no window spec applies.
+func (n *AnalyticFunctionCallNode) windowOverClause(ctx context.Context, orderColumns []*analyticOrderBy) (string, error) {
 	var clauses []string
 	if cols := analyticPartitionColumnNamesFromContext(ctx); len(cols) > 0 {
 		clauses = append(clauses, "PARTITION BY "+strings.Join(cols, ","))
 	}
-	if len(orderColumns) > 0 {
-		var ob []string
-		for _, col := range orderColumns {
-			switch col.nullOrder {
-			case nullOrderFirst:
-				ob = append(ob, fmt.Sprintf("(%s IS NOT NULL)", col.column))
-			case nullOrderLast:
-				ob = append(ob, fmt.Sprintf("(%s IS NULL)", col.column))
-			}
-			suffix := " COLLATE googlesqlite_collate"
-			if !col.isAsc {
-				suffix += " DESC"
-			}
-			ob = append(ob, col.column+suffix)
+	var ob []string
+	for _, col := range orderColumns {
+		// Partition keys are constant within a partition: repeating them
+		// inside ORDER BY is a semantic no-op, and a RANGE frame with an
+		// offset requires exactly one ORDER BY key, so drop them here.
+		if col.fromPartition {
+			continue
 		}
+		// sortSQL unwraps value-layer STRING/UUID envelopes (base64 text
+		// order is not monotonic with payload order); other kinds order
+		// correctly on their stored form. Null placement is emitted
+		// explicitly: BigQuery defaults to NULLS FIRST on ASC / NULLS
+		// LAST on DESC while DuckDB defaults to NULLS LAST always.
+		ob = append(ob, col.sortSQL()+analyticOrderDirectionSQL(col))
+	}
+	if n.wantsRowIDTiebreak() {
+		// DuckDB's window sort is not stable with respect to the input,
+		// so rows tied on the ORDER BY keys would land in the frame /
+		// sequence in arbitrary order. Appending the input ordinal the
+		// AnalyticScanNode wrap materializes pins ties to input order —
+		// the order the legacy engine (and the test corpus) saw.
+		ob = append(ob, `"row_id"`)
+	}
+	if len(ob) > 0 {
 		clauses = append(clauses, "ORDER BY "+strings.Join(ob, ","))
 	}
 	if frameSQL, err := n.formatNativeFrame(ctx); err != nil {
@@ -1031,9 +3738,127 @@ func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName 
 	}
 
 	if len(clauses) == 0 {
-		return call + " OVER ()", nil
+		return "OVER ()", nil
 	}
-	return call + " OVER (" + strings.Join(clauses, " ") + ")", nil
+	return "OVER (" + strings.Join(clauses, " ") + ")", nil
+}
+
+// wantsRowIDTiebreak reports whether the native OVER clause for this
+// analytic call should append the input-ordinal "row_id" as a final
+// ORDER BY key.
+//
+//   - Rank-of-peers functions (RANK / DENSE_RANK / PERCENT_RANK /
+//     CUME_DIST) must NOT get it: their results depend on tie groups,
+//     and a unique tiebreak would dissolve every tie.
+//   - RANGE-framed calls must NOT get it: the frame is defined by value
+//     distance over a single ORDER BY key (peers are included by value,
+//     so tie order never affects the result anyway).
+//   - ROWS-framed calls get it: the frame is positional, so tied rows
+//     need a deterministic (input) order to reproduce the reference
+//     results.
+//   - Pure position functions (LEAD / LAG / NTILE / ROW_NUMBER) get it
+//     even without any other ORDER BY key: they read physical row order
+//     directly.
+//   - Aggregates with only the analyzer's default frame (RANGE UNBOUNDED
+//     PRECEDING .. CURRENT ROW) or no ORDER BY at all are left alone:
+//     the default frame includes peers by value, and an unordered
+//     aggregate is commutative over the whole partition.
+func (n *AnalyticFunctionCallNode) wantsRowIDTiebreak() bool {
+	rawName := strings.TrimPrefix(strings.ReplaceAll(m1(m1(n.node.Function()).FullName(false)), ".", "_"), "$")
+	switch rawName {
+	case "rank", "dense_rank", "percent_rank", "cume_dist":
+		return false
+	case "lead", "lag", "ntile", "row_number":
+		return true
+	}
+	windowFrame, _ := n.node.WindowFrame()
+	if windowFrame == nil {
+		return false
+	}
+	return m1(windowFrame.FrameUnit()) == googlesql.ResolvedWindowFrameEnums_FrameUnitRows
+}
+
+// formatStClusterDBSCAN lowers the analytic ST_CLUSTERDBSCAN to a
+// native-DuckDB window expression. DBSCAN assigns each row a cluster id
+// computed from the whole partition, which has no native DuckDB
+// analytic; the SQLite backend faked it with a correlated-subquery +
+// rowid-marker hack that depended on the engine preserving scan order
+// (DuckDB's parallel scan does not, so that path mis-aligns). Instead
+// emit:
+//
+//	list_extract(st_clusterdbscan(geo, eps, min_pts) OVER (w),
+//	             row_number() OVER (w))
+//
+// st_clusterdbscan is registered as a window aggregate (see
+// duckdbAggSpecs) that returns the partition's ARRAY<INT64> of cluster
+// ids in window order; within a single window operator DuckDB feeds
+// that aggregate rows in the same order row_number() numbers them, so
+// list_extract(array, row_number) projects each row's own cluster id. A
+// noise / empty / NULL row is a NULL array element, which list_extract
+// surfaces as SQL NULL - matching the upstream "unclustered -> NULL".
+func (n *AnalyticFunctionCallNode) formatStClusterDBSCAN(ctx context.Context, orderColumns []*analyticOrderBy) (string, error) {
+	var valueArgs []string
+	for _, a := range m1(n.node.ResolvedFunctionCallBase.ArgumentList()) {
+		arg, err := newNode(a).FormatSQL(ctx)
+		if err != nil {
+			return "", err
+		}
+		valueArgs = append(valueArgs, arg)
+	}
+	over, err := n.windowOverClause(ctx, orderColumns)
+	if err != nil {
+		return "", err
+	}
+	// Thread the row's 1-based position into the aggregate as a 4th
+	// argument so it can slot each geography by row position rather than
+	// by DuckDB's (unordered, parallel) feed order. DuckDB rejects a
+	// window function (row_number() OVER ()) as the argument of another
+	// window function, so reuse the predecessor emulation's row_id wrap:
+	// markAnalyticEmulationUsed tells the surrounding AnalyticScanNode to
+	// materialize `ROW_NUMBER() OVER() AS "row_id"`, and both the
+	// aggregate argument and the extractor index reference that single
+	// plain column - so the place-and-read position is identical per row
+	// and alignment never depends on two window calls iterating in the
+	// same order. st_clusterdbscan returns the partition's cluster-id
+	// ARRAY (value-layer base64 envelope) ordered by "row_id";
+	// array_at_ordinal pulls the current row's element by the same
+	// "row_id"; decode_scalar + CAST retype it to the BIGINT the analyzer
+	// assigns ST_CLUSTERDBSCAN. A noise/empty/NULL element decodes to SQL
+	// NULL, which CAST preserves.
+	markAnalyticEmulationUsed(ctx)
+	// DBSCAN clusters the WHOLE partition, so the aggregate must always
+	// receive every partition row. A bare OVER () already feeds the full
+	// partition, but an OVER (... ORDER BY ...) would make DuckDB default
+	// to a growing RANGE prefix frame and the aggregate would cluster
+	// only rows up to the current one. Force an explicit full-partition
+	// frame whenever an ORDER BY is present so the clustering is computed
+	// over the entire partition regardless of ordering.
+	over = forceFullPartitionFrame(over)
+	rowID := `"row_id"`
+	aggArgs := append(append([]string{}, valueArgs...), rowID)
+	arr := fmt.Sprintf("st_clusterdbscan(%s) %s", strings.Join(aggArgs, ","), over)
+	elem := fmt.Sprintf("googlesqlite_array_at_ordinal(%s, %s)", arr, rowID)
+	return fmt.Sprintf("CAST(googlesqlite_decode_scalar(%s) AS BIGINT)", elem), nil
+}
+
+// forceFullPartitionFrame appends an explicit full-partition frame to an
+// OVER clause that carries an ORDER BY but no frame, so a whole-partition
+// aggregate (DBSCAN) is fed every partition row rather than a growing
+// prefix. A bare `OVER ()` (no ORDER BY) already spans the full partition
+// and is returned unchanged; an OVER clause that already names a frame is
+// also left as is.
+func forceFullPartitionFrame(over string) string {
+	if !strings.Contains(over, "ORDER BY") {
+		return over
+	}
+	if strings.Contains(over, "ROWS") || strings.Contains(over, "RANGE") || strings.Contains(over, "GROUPS") {
+		return over
+	}
+	const frame = " ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING"
+	if i := strings.LastIndex(over, ")"); i >= 0 {
+		return over[:i] + frame + over[i:]
+	}
+	return over
 }
 
 // formatNativeFrame turns the resolved-tree frame into a SQLite frame
@@ -1115,9 +3940,400 @@ func (n *AnalyticFunctionCallNode) getWindowBoundaryOptionFuncSQL(ctx context.Co
 	return "", fmt.Errorf("unexpected boundary type %d", typ)
 }
 
+// tryNativeCast lowers CAST(...) to a native DuckDB cast/expression for
+// the temporal conversions in the date/datetime/time/timestamp families.
+// It returns (sql, true, nil) when it handled the cast, (.., false, nil)
+// to defer to the googlesqlite_cast UDF path, or an error.
+//
+// The temporal -> STRING direction is special: GoogleSQL's canonical
+// textual forms differ from DuckDB's native CAST-to-VARCHAR (the
+// DATETIME 'T' separator, the TIMESTAMP '+00' zone suffix), so those
+// project through strftime / a pinned format instead of a bare cast.
+func (n *CastNode) tryNativeCast(ctx context.Context) (string, bool, error) {
+	fromKind := newType(m1(m1(n.node.Expr()).Type())).kindAs()
+	toKind := newType(m1(n.node.Type())).kindAs()
+
+	isTemporal := func(k googlesql.TypeKind) bool {
+		switch k {
+		case googlesql.TypeKindTypeDate, googlesql.TypeKindTypeTime,
+			googlesql.TypeKindTypeDatetime, googlesql.TypeKindTypeTimestamp:
+			return true
+		}
+		return false
+	}
+	// Numeric -> floating-point coercions (the implicit widening the
+	// analyzer inserts around e.g. SAFE_DIVIDE(SUM(x), COUNT(*))) lower
+	// to a native DuckDB CAST. The googlesqlite_cast UDF declares a
+	// VARCHAR result, so leaving the coercion on the UDF path types the
+	// operand as VARCHAR and /(DOUBLE, VARCHAR) fails to bind at DuckDB
+	// prepare time. Widening to FLOAT/DOUBLE has no error cases, so the
+	// SAFE_CAST (ReturnNullOnError) flag needs no special handling.
+	// Casts that genuinely need the value layer (NUMERIC/BIGNUMERIC,
+	// STRING parsing, envelopes) keep the UDF path: only raw-scalar
+	// numeric sources are claimed here.
+	if isNativeNumericKind(fromKind) {
+		switch toKind {
+		case googlesql.TypeKindTypeFloat, googlesql.TypeKindTypeDouble:
+			expr, err := newNode(m1(n.node.Expr())).FormatSQL(ctx)
+			if err != nil {
+				return "", false, err
+			}
+			if isArrayElementValueLayerExpr(expr) {
+				expr = fmt.Sprintf("googlesqlite_plain_string(%s)", expr)
+			}
+			target := "DOUBLE"
+			if toKind == googlesql.TypeKindTypeFloat {
+				target = "FLOAT"
+			}
+			return fmt.Sprintf("CAST(%s AS %s)", expr, target), true, nil
+		}
+	}
+	// Only claim casts that involve a temporal type on at least one side;
+	// everything else (numeric, bytes, struct, ...) stays on the UDF path
+	// that the other burn-down families own.
+	if !isTemporal(fromKind) && !isTemporal(toKind) {
+		return "", false, nil
+	}
+	expr, err := newNode(m1(n.node.Expr())).FormatSQL(ctx)
+	if err != nil {
+		return "", false, err
+	}
+
+	if toKind == googlesql.TypeKindTypeString {
+		if isRangeBoundaryValueExpr(expr) {
+			return fmt.Sprintf("googlesqlite_plain_string(%s)", expr), true, nil
+		}
+		if isMysqlStrToDateValueExpr(expr) {
+			return fmt.Sprintf("googlesqlite_unnest_temporal(%s, 'timestamp')", expr), true, nil
+		}
+		switch fromKind {
+		case googlesql.TypeKindTypeDatetime:
+			return fmt.Sprintf("strftime(%s, '%%Y-%%m-%%dT%%H:%%M:%%S')", expr), true, nil
+		case googlesql.TypeKindTypeDate:
+			return fmt.Sprintf("strftime(%s, '%%Y-%%m-%%d')", expr), true, nil
+		case googlesql.TypeKindTypeTime:
+			// DuckDB CAST(TIME AS VARCHAR) already yields HH:MM:SS[.ffffff].
+			return fmt.Sprintf("CAST(%s AS VARCHAR)", expr), true, nil
+		case googlesql.TypeKindTypeTimestamp:
+			return fmt.Sprintf("strftime(%s AT TIME ZONE 'UTC', '%%Y-%%m-%%d %%H:%%M:%%S+00')", expr), true, nil
+		}
+	}
+
+	duckType, ok := duckDBTypeName(toKind)
+	if !ok {
+		return "", false, nil
+	}
+	if isMysqlStrToDateValueExpr(expr) {
+		if kindName, ok := temporalCastKindName(toKind); ok {
+			return fmt.Sprintf("CAST(googlesqlite_unnest_temporal(%s, '%s') AS %s)", expr, kindName, duckType), true, nil
+		}
+	}
+	// STRING -> temporal: a STRING-typed operand whose value is only
+	// known at execution time (a bound parameter, a stored STRING
+	// column) carries the value-layer envelope, which DuckDB's
+	// date/time parser rejects ("invalid date field format:
+	// eyJoZWFkZXIi..."). Unwrap it to bare text first; the UDF passes
+	// non-envelope text through unchanged, and literal operands rarely
+	// reach here (the analyzer constant-folds literal casts).
+	if fromKind == googlesql.TypeKindTypeString && toKind != googlesql.TypeKindTypeString {
+		expr = fmt.Sprintf("googlesqlite_plain_string(%s)", expr)
+	}
+	return fmt.Sprintf("CAST(%s AS %s)", expr, duckType), true, nil
+}
+
+func isRangeBoundaryValueExpr(expr string) bool {
+	trimmed := strings.TrimSpace(expr)
+	return strings.HasPrefix(trimmed, "googlesqlite_range_start(") ||
+		strings.HasPrefix(trimmed, "googlesqlite_range_end(")
+}
+
+func isMysqlStrToDateValueExpr(expr string) bool {
+	trimmed := strings.TrimSpace(expr)
+	return strings.HasPrefix(trimmed, "googlesqlite_mysql_str_to_date(") ||
+		strings.HasPrefix(trimmed, "googlesqlite_safe_mysql_str_to_date(")
+}
+
+func temporalCastKindName(kind googlesql.TypeKind) (string, bool) {
+	switch kind {
+	case googlesql.TypeKindTypeDate:
+		return "date", true
+	case googlesql.TypeKindTypeTime:
+		return "time", true
+	case googlesql.TypeKindTypeDatetime:
+		return "datetime", true
+	case googlesql.TypeKindTypeTimestamp:
+		return "timestamp", true
+	}
+	return "", false
+}
+
+// duckDBTypeName maps a GoogleSQL temporal/primitive kind to the DuckDB
+// type keyword used in a CAST target. ok=false for kinds this path does
+// not handle.
+// valueLayerScalarCastType returns the DuckDB type a bare value-layer
+// scalar should be CAST to, and true, for the element/field kinds whose
+// over-the-wire form is a bare JSON scalar (EncodeValue hands INT64 /
+// FLOAT64 / BOOL back as raw Go scalars, so json_each.value over a
+// decoded array yields a JSON number / boolean rather than the base64
+// envelope). Casting those to BIGINT / DOUBLE / BOOLEAN recovers a native
+// value DuckDB's arithmetic / comparison operators bind against - the
+// same recovery nativeNumericAggregates applies for SUM(JSON) etc.
+//
+// STRING / BYTES / temporal / NUMERIC / STRUCT / ARRAY return ("",
+// false): EncodeValue keeps those in the base64 value-layer envelope, so
+// the raw column value is not a castable native literal and must flow on
+// to the consumer (googlesqlite_cast / get_struct_field / the row
+// decoder) untouched.
+func valueLayerScalarCastType(kind googlesql.TypeKind) (string, bool) {
+	switch kind {
+	case googlesql.TypeKindTypeInt32, googlesql.TypeKindTypeInt64,
+		googlesql.TypeKindTypeUint32, googlesql.TypeKindTypeUint64:
+		return "BIGINT", true
+	case googlesql.TypeKindTypeFloat, googlesql.TypeKindTypeDouble:
+		return "DOUBLE", true
+	case googlesql.TypeKindTypeBool:
+		return "BOOLEAN", true
+	}
+	return "", false
+}
+
+// isArithmeticOperator reports whether op is one of the additive /
+// multiplicative operator builtins whose operands must be native numerics
+// (so a JSON-typed array element needs a CAST). The comparison operators
+// in nativeBinaryOperators are excluded here — they bind against the
+// value-layer operand form — but the ORDERING subset gets its own STRING
+// unwrap (see isOrderingOperator).
+func isArithmeticOperator(op string) bool {
+	switch op {
+	case "add", "subtract", "multiply":
+		return true
+	}
+	return false
+}
+
+// isOrderingOperator reports whether op is one of the ordering comparison
+// builtins (<, <=, >, >=). Unlike equality, ordering over the value-layer
+// STRING envelope is incorrect (base64 text order is not monotonic with
+// payload order), so tryNativeOperator unwraps STRING operands to plain
+// text for these. Equality (=, <>) is excluded: the envelope encoding is
+// deterministic and injective, so envelope equality equals payload
+// equality, and struct equality relies on the envelope form.
+func isOrderingOperator(op string) bool {
+	switch op {
+	case "less", "less_or_equal", "greater", "greater_or_equal":
+		return true
+	}
+	return false
+}
+
+// isPlainTextOrderableKind reports whether kind's value-layer wire form is
+// a STRING envelope whose plain payload text orders identically to the
+// GoogleSQL value ordering: STRING itself (UTF-8 byte order == code-point
+// order) and UUID (canonical lowercase-hex text order == 128-bit value
+// order). Ordering comparisons over these kinds unwrap their operands
+// with googlesqlite_plain_string. Other envelope kinds (BYTES, NUMERIC,
+// temporals, ENUM) keep their existing lowering.
+func isPlainTextOrderableKind(kind googlesql.TypeKind) bool {
+	return kind == googlesql.TypeKindTypeString || kind == googlesql.TypeKindTypeUuid
+}
+
+// rangeEnvelopeArgs rewrites the formatted SQL of each temporal-typed
+// RANGE-family argument into its value-layer envelope literal. The
+// formatted form produced by the default path is a native DuckDB DATE /
+// DATETIME / TIMESTAMP literal (literalFromValue's temporal shortcut),
+// which the VARCHAR-typed googlesqlite_range* UDFs cannot bind and which
+// loses the DATE-vs-TIMESTAMP element type once duckdb-go maps both to a
+// bare Go time.Time. Only literal temporal args are rewritten; a
+// non-literal temporal operand (a column reference, a nested RANGE
+// accessor) already flows as the envelope VARCHAR, so it is left
+// untouched. Non-temporal args (the BOOL last_partial_range flag, the
+// INTERVAL step which lowers to googlesqlite_interval, an UNBOUNDED NULL)
+// also pass through unchanged.
+func rangeEnvelopeArgs(argNodes []googlesql.ResolvedExprNode, args []string) []string {
+	if len(argNodes) != len(args) {
+		return args
+	}
+	out := make([]string, len(args))
+	copy(out, args)
+	for i, node := range argNodes {
+		if node == nil {
+			continue
+		}
+		t, _ := node.Type()
+		if t == nil {
+			continue
+		}
+		k, err := t.Kind()
+		if err != nil {
+			continue
+		}
+		switch k {
+		case googlesql.TypeKindTypeDate,
+			googlesql.TypeKindTypeDatetime,
+			googlesql.TypeKindTypeTimestamp:
+			lit, ok := node.(*googlesql.ResolvedLiteral)
+			if !ok {
+				continue
+			}
+			v, err := valueFromGoogleSQLValue(*m1(lit.Value()))
+			if err != nil || v == nil {
+				continue
+			}
+			env, err := envelopeLiteralFromValue(v)
+			if err != nil {
+				continue
+			}
+			out[i] = env
+		}
+	}
+	return out
+}
+
+// isNativeNumericKind reports whether k is a numeric kind whose
+// over-the-wire form is a raw native scalar (EncodeValue hands integers
+// and floats back as bare Go scalars, never the base64 envelope), so a
+// native DuckDB CAST can retype it directly. NUMERIC / BIGNUMERIC are
+// deliberately excluded: they ride the value-layer envelope.
+func isNativeNumericKind(k googlesql.TypeKind) bool {
+	switch k {
+	case googlesql.TypeKindTypeInt32, googlesql.TypeKindTypeInt64,
+		googlesql.TypeKindTypeUint32, googlesql.TypeKindTypeUint64,
+		googlesql.TypeKindTypeFloat, googlesql.TypeKindTypeDouble:
+		return true
+	}
+	return false
+}
+
+func isArrayElementValueLayerExpr(expr string) bool {
+	trimmed := strings.TrimSpace(expr)
+	return strings.HasPrefix(trimmed, "googlesqlite_array_at_offset(") ||
+		strings.HasPrefix(trimmed, "googlesqlite_safe_array_at_offset(") ||
+		strings.HasPrefix(trimmed, "googlesqlite_array_at_ordinal(") ||
+		strings.HasPrefix(trimmed, "googlesqlite_safe_array_at_ordinal(")
+}
+
+func isIntegerTypeKind(kind googlesql.TypeKind) bool {
+	switch kind {
+	case googlesql.TypeKindTypeInt32,
+		googlesql.TypeKindTypeInt64,
+		googlesql.TypeKindTypeUint32,
+		googlesql.TypeKindTypeUint64:
+		return true
+	}
+	return false
+}
+
+func tryNativeDateIntegerArithmetic(op, tok string, args []string, kinds []googlesql.TypeKind) (string, bool) {
+	if len(args) != 2 || (op != "add" && op != "subtract") {
+		return "", false
+	}
+	lhsKind, rhsKind := kindAt(kinds, 0), kindAt(kinds, 1)
+	if lhsKind == googlesql.TypeKindTypeDate && isIntegerTypeKind(rhsKind) {
+		return fmt.Sprintf(
+			"CAST((CAST(%s AS DATE) %s (CAST(%s AS BIGINT) * INTERVAL '1 day')) AS DATE)",
+			args[0], tok, args[1],
+		), true
+	}
+	if op == "add" && isIntegerTypeKind(lhsKind) && rhsKind == googlesql.TypeKindTypeDate {
+		return fmt.Sprintf(
+			"CAST((CAST(%s AS DATE) + (CAST(%s AS BIGINT) * INTERVAL '1 day')) AS DATE)",
+			args[1], args[0],
+		), true
+	}
+	return "", false
+}
+
+// argKinds returns the resolved TypeKind of each function argument, in
+// order, so an operator lowering can decide whether to cast an operand to
+// its native scalar type. A nil / typeless argument contributes
+// TypeKindTypeUnknown, which castOperandToKind leaves untouched.
+func argKinds(args []googlesql.ResolvedExprNode) []googlesql.TypeKind {
+	kinds := make([]googlesql.TypeKind, len(args))
+	for i, a := range args {
+		if a == nil {
+			continue
+		}
+		if t, _ := a.Type(); t != nil {
+			if k, err := t.Kind(); err == nil {
+				kinds[i] = k
+			}
+		}
+	}
+	return kinds
+}
+
+// isTemporalTypeKind reports whether k is one of the GoogleSQL civil /
+// instant temporal types (DATE / TIME / DATETIME / TIMESTAMP). Used to
+// disambiguate overloaded builtins (e.g. STRING) whose temporal overload
+// must lower to a native cast rather than the JSON-accessor UDF.
+func isTemporalTypeKind(k googlesql.TypeKind) bool {
+	switch k {
+	case googlesql.TypeKindTypeDate,
+		googlesql.TypeKindTypeTime,
+		googlesql.TypeKindTypeDatetime,
+		googlesql.TypeKindTypeTimestamp:
+		return true
+	}
+	return false
+}
+
+// kindAt returns the kind at index i, or TypeKindTypeUnknown when the
+// index is out of range.
+func kindAt(kinds []googlesql.TypeKind, i int) googlesql.TypeKind {
+	if i < 0 || i >= len(kinds) {
+		return googlesql.TypeKindTypeUnknown
+	}
+	return kinds[i]
+}
+
+// castOperandToKind wraps an operand SQL string in a DuckDB CAST to the
+// native scalar type for kind, when kind is a JSON-backed scalar
+// (INT64 / FLOAT64 / BOOL). Other kinds are returned unchanged. The cast
+// is idempotent, so applying it to an already-native operand is harmless.
+func castOperandToKind(operand string, kind googlesql.TypeKind) string {
+	if castType, ok := valueLayerScalarCastType(kind); ok {
+		if isArrayElementValueLayerExpr(operand) {
+			operand = fmt.Sprintf("googlesqlite_plain_string(%s)", operand)
+		}
+		return fmt.Sprintf("CAST(%s AS %s)", operand, castType)
+	}
+	// Native-storage NUMERIC: arithmetic binds the stored DECIMAL(38,9)
+	// directly; the read wrap normalizes envelope-shaped operands (UDF
+	// results, legacy tables) instead of failing the binder.
+	if kind == googlesql.TypeKindTypeNumeric {
+		return numericStorageReadSQL(operand)
+	}
+	return operand
+}
+
+func duckDBTypeName(kind googlesql.TypeKind) (string, bool) {
+	switch kind {
+	case googlesql.TypeKindTypeDate:
+		return "DATE", true
+	case googlesql.TypeKindTypeTime:
+		return "TIME", true
+	case googlesql.TypeKindTypeDatetime:
+		return "TIMESTAMP", true
+	case googlesql.TypeKindTypeTimestamp:
+		return "TIMESTAMP WITH TIME ZONE", true
+	case googlesql.TypeKindTypeString:
+		return "VARCHAR", true
+	case googlesql.TypeKindTypeInt32, googlesql.TypeKindTypeInt64:
+		return "BIGINT", true
+	}
+	return "", false
+}
+
 func (n *CastNode) FormatSQL(ctx context.Context) (string, error) {
 	if n.node == nil {
 		return "", nil
+	}
+	// DuckDB retarget: handle the temporal CAST shapes natively before
+	// falling back to the googlesqlite_cast UDF. The UDF is not
+	// registered on DuckDB, so any unhandled CAST surfaces as a clear
+	// "function does not exist" error rather than wrong data.
+	if sql, ok, err := n.tryNativeCast(ctx); ok || err != nil {
+		return sql, err
 	}
 	fromType := newType(m1(m1(n.node.Expr()).Type()))
 	jsonEncodedFromType, err := json.Marshal(fromType)
@@ -1141,10 +4357,29 @@ func (n *CastNode) FormatSQL(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf(
+	udf := fmt.Sprintf(
 		"googlesqlite_cast(%s, '%s', '%s', %t)",
 		expr, encodedFromType, encodedToType, m1(n.node.ReturnNullOnError()),
-	), nil
+	)
+	// Native-representable scalar targets (BOOL / INT64-family /
+	// FLOAT64-family) re-type the UDF's textual result with a wrapping
+	// native CAST, the same decode GetStructFieldNode applies to scalar
+	// struct fields. GoogleSQLCast already returns the plain parseable
+	// text ("true", "42", "1.5") for these kinds precisely so an outer
+	// DuckDB CAST can retype it. Without the wrap the cast result stays a
+	// VARCHAR, and any branching construct (COALESCE / IF / IFNULL /
+	// CASE) mixing it with a native-literal sibling fails DuckDB's binder
+	// ("Cannot mix values of type VARCHAR and BOOLEAN"), issue #15 — and
+	// ORDER BY / MIN / MAX over the cast result compare lexicographically.
+	// The native value is storage-safe too: BOOL / INT64 / FLOAT64
+	// columns are stored native (storageTypeForKind), so an INSERT of the
+	// cast result lands in the column type directly. Temporal targets are
+	// already native via tryNativeCast above; STRING / NUMERIC / BYTES /
+	// other envelope targets keep the envelope contract untouched.
+	if castType, ok := valueLayerScalarCastType(toType.kindAs()); ok {
+		return fmt.Sprintf("CAST(%s AS %s)", udf, castType), nil
+	}
+	return udf, nil
 }
 
 func (n *MakeStructNode) FormatSQL(ctx context.Context) (string, error) {
@@ -1228,7 +4463,24 @@ func (n *GetStructFieldNode) FormatSQL(ctx context.Context) (string, error) {
 		return "", err
 	}
 	idx, _ := n.node.FieldIdx()
-	return fmt.Sprintf("googlesqlite_get_struct_field(%s, %d)", expr, idx), nil
+	access := fmt.Sprintf("googlesqlite_get_struct_field(%s, %d)", expr, idx)
+	// get_struct_field returns the value-layer envelope (a base64 VARCHAR),
+	// which DuckDB cannot use in native arithmetic / comparison - `x.a +
+	// x.b` over two INT64 fields fails the binder as '+(VARCHAR, VARCHAR)'.
+	// For a scalar field, decode the envelope back to its bare value and
+	// cast it to the analyzer-resolved scalar type so the field reads as a
+	// native BIGINT / DOUBLE / BOOLEAN. The row decoder accepts the native
+	// value on the result path just as it accepts the envelope, so a plain
+	// top-level `SELECT x.a` keeps working. STRUCT / ARRAY / STRING / other
+	// envelope-typed fields pass through untouched.
+	if t, _ := n.node.Type(); t != nil {
+		if k, err := t.Kind(); err == nil {
+			if castType, ok := valueLayerScalarCastType(k); ok {
+				return fmt.Sprintf("CAST(googlesqlite_decode_scalar(%s) AS %s)", access, castType), nil
+			}
+		}
+	}
+	return access, nil
 }
 
 func (n *GetProtoFieldNode) FormatSQL(ctx context.Context) (string, error) {
@@ -1504,31 +4756,76 @@ func (n *SubqueryExprNode) FormatSQL(ctx context.Context) (string, error) {
 	}
 	columnNames := &arraySubqueryColumnNames{}
 	ctx = withArraySubqueryColumnName(ctx, columnNames)
-	sql, err := newNode(m1(n.node.Subquery())).FormatSQL(ctx)
+	subquery := m1(n.node.Subquery())
+	sql, err := newNode(subquery).FormatSQL(ctx)
 	if err != nil {
 		return "", err
 	}
 	switch m1(n.node.SubqueryType()) {
 	case googlesql.ResolvedSubqueryExprEnums_SubqueryTypeScalar:
+		valueSelect, err := formatSingleValueSubquery(ctx, subquery, sql)
+		if err != nil {
+			return "", err
+		}
 		if inSafeEvalMode(ctx) {
 			// GoogleSQL raises an error when a scalar subquery returns
-			// more than one row; SQLite would silently take the first.
-			// In IFERROR / ISERROR / NULLIFERROR contexts we want the
-			// error to fold to NULL, so guard the value with an inline
-			// COUNT(*) probe. Re-evaluates the inner sub-select twice
-			// — acceptable in error-handling expressions.
+			// more than one row. In IFERROR / ISERROR / NULLIFERROR
+			// contexts that error must fold to NULL, so guard the value
+			// with an inline COUNT(*) probe and return NULL unless the
+			// subquery produced exactly one row. DuckDB (unlike SQLite)
+			// raises on a multi-row scalar subquery even in the dead CASE
+			// arm, so extract the value through `SELECT * FROM (sub) LIMIT
+			// 1` rather than a bare scalar `(sub)`: the LIMIT 1 keeps the
+			// extraction legal for the >1-row case while the COUNT probe
+			// still forces the NULL fold. Re-evaluates the sub-select
+			// twice - acceptable in error-handling expressions.
+			//
+			// The extraction arm always wraps valueSelect in a derived
+			// table before appending its LIMIT: valueSelect may be the
+			// raw subquery SQL, which can itself already end in
+			// LIMIT/OFFSET (e.g. `(SELECT 5 LIMIT 1)`), and `(%s LIMIT 1)`
+			// over that is a double-LIMIT parse error. The wrap is safe
+			// for the ordinal-guarded form too — formatSingleValueSubquery
+			// has already narrowed it to the single value column.
 			return fmt.Sprintf(
-				"(SELECT CASE WHEN (SELECT COUNT(*) FROM (%s)) = 1 THEN (%s) ELSE NULL END)",
-				sql, sql,
+				"(SELECT CASE WHEN (SELECT COUNT(*) FROM (%s)) = 1 THEN (SELECT * FROM (%s) LIMIT 1) ELSE NULL END)",
+				sql, valueSelect,
 			), nil
 		}
+		return fmt.Sprintf("(%s)", valueSelect), nil
 	case googlesql.ResolvedSubqueryExprEnums_SubqueryTypeArray:
 		subCols := m1(m1(n.node.Subquery()).MutableColumnList())
 		if len(subCols) == 0 {
 			return "", fmt.Errorf("failed to find computed column names for array subquery")
 		}
 		colName := uniqueColumnName(ctx, subCols[0])
-		return fmt.Sprintf("(SELECT googlesqlite_array(`%s`) FROM (%s))", colName, sql), nil
+		// DuckDB retarget: the predecessor collected the array-subquery rows
+		// with the googlesqlite_array SQLite aggregate UDF. duckdb-go exposes
+		// no aggregate-UDF registration, so collect the rows with DuckDB's
+		// native array_agg (yielding a LIST whose elements are the per-row
+		// value-layer wire form) and fold that LIST back into the array-layer
+		// envelope with googlesqlite_array_from_native. Re-enveloping keeps
+		// the array-subquery result a VARCHAR, which is what the surrounding
+		// expressions assume: the error-handling CASE arms in ARRAY_ZIP /
+		// ARRAY_SLICE mix the subquery result with envelope-typed ERROR(...)
+		// branches, and DuckDB rejects a CASE that mixes VARCHAR[] with
+		// VARCHAR. COALESCE over an empty list keeps an all-NULL / zero-row
+		// subquery from folding to SQL NULL before the envelope wrap, matching
+		// GoogleSQL's empty-ARRAY result.
+		//
+		// DuckDB's array_agg is order-insensitive without an in-aggregate
+		// ORDER BY, so a bare array_agg returns the subquery rows in an
+		// arbitrary (run-to-run unstable) order. GoogleSQL's ARRAY(subquery)
+		// preserves the subquery's row order (its ORDER BY when present, else
+		// the producing order). Stamp each row with a row_number ordinal -
+		// assigned in the subquery's output order, after any inner ORDER BY,
+		// and anchored on the set-operation ordinal when the subquery is a
+		// UNION ALL - and aggregate ORDER BY that stamp so the materialised
+		// array keeps the subquery's order deterministically.
+		return fmt.Sprintf(
+			"googlesqlite_array_from_native(COALESCE((SELECT array_agg(\"%s\" ORDER BY __gsx_array_subq_rn) FROM (SELECT *, %s AS __gsx_array_subq_rn FROM (%s))), []))",
+			colName, setOperationOrdinalRowNumber(ctx, subquery), sql,
+		), nil
 	case googlesql.ResolvedSubqueryExprEnums_SubqueryTypeExists:
 		return fmt.Sprintf("EXISTS (%s)", sql), nil
 	case googlesql.ResolvedSubqueryExprEnums_SubqueryTypeIn:
@@ -1536,24 +4833,36 @@ func (n *SubqueryExprNode) FormatSQL(ctx context.Context) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		// SQLite's IN compares values byte-for-byte under the
-		// BINARY collation. For STRUCT values the envelope encodes
-		// the field names in JSON, so two structurally-equal but
-		// differently-named structs (anonymous `(1,'a')` vs named
-		// `STRUCT(1 AS x, 'a' AS y)`) miss each other. Force the
-		// comparison through googlesqlite_collate, which decodes
-		// each side into a StructValue and compares positionally
-		// — matching BigQuery semantics. The collation attached to
-		// the LHS is inherited by the entire IN comparison per
-		// SQLite rules.
-		if isStructTypedExpr(m1(n.node.InExpr())) {
-			return fmt.Sprintf("(%s) COLLATE googlesqlite_collate IN (%s)", expr, sql), nil
+		valueSelect, err := formatSingleValueSubquery(ctx, subquery, sql)
+		if err != nil {
+			return "", err
 		}
-		return fmt.Sprintf("%s IN (%s)", expr, sql), nil
+		// DuckDB retarget: DuckDB has no googlesqlite_collate callback
+		// collation, so IN compares the value-layer encoding directly.
+		// The anonymous-vs-named STRUCT positional-equality edge case is
+		// handled in the STRUCT family, not here.
+		return fmt.Sprintf("%s IN (%s)", expr, valueSelect), nil
 	case googlesql.ResolvedSubqueryExprEnums_SubqueryTypeLikeAny:
 	case googlesql.ResolvedSubqueryExprEnums_SubqueryTypeLikeAll:
 	}
 	return fmt.Sprintf("(%s)", sql), nil
+}
+
+// formatSingleValueSubquery narrows a subquery used in a single-value
+// position (scalar / IN) down to its one value column when the scan's
+// projection exposes the set-operation ordinal helper column. Exposure is
+// AST-derived — a nested-but-projected-away ordinal in the rendered text
+// must not trigger the rewrap.
+func formatSingleValueSubquery(ctx context.Context, subquery googlesql.ResolvedScanNode, sql string) (string, error) {
+	if !scanExposesSetOperationOrdinal(ctx, subquery) {
+		return sql, nil
+	}
+	subCols := m1(subquery.MutableColumnList())
+	if len(subCols) == 0 {
+		return "", fmt.Errorf("failed to find computed column names for value subquery")
+	}
+	colName := uniqueColumnName(ctx, subCols[0])
+	return fmt.Sprintf("SELECT \"%s\" FROM (%s)", colName, sql), nil
 }
 
 func (n *SingleRowScanNode) FormatSQL(ctx context.Context) (string, error) {
@@ -1568,7 +4877,7 @@ func (n *TableScanNode) FormatSQL(ctx context.Context) (string, error) {
 	for _, col := range m1(n.node.ColumnList()) {
 		columns = append(
 			columns,
-			fmt.Sprintf("`%s` AS `%s`", m1(col.Name()), uniqueColumnName(ctx, col)),
+			fmt.Sprintf("\"%s\" AS \"%s\"", m1(col.Name()), uniqueColumnName(ctx, col)),
 		)
 	}
 
@@ -1584,24 +4893,25 @@ func (n *TableScanNode) FormatSQL(ctx context.Context) (string, error) {
 		}
 		return fmt.Sprintf("(SELECT %s FROM (%s))", strings.Join(columns, ","), query), nil
 	}
-	// INFORMATION_SCHEMA scans route through the corresponding
-	// vtab module. The dataset filter is pushed into the WHERE so
-	// xBestIndex picks the constrained scan.
+	// INFORMATION_SCHEMA scans materialise the catalog's live rows as
+	// an inline DuckDB relation. The SQLite fork served these through
+	// an eponymous virtual-table module, but the DuckDB engine has no
+	// vtab layer, so we splice a self-contained subquery exposing the
+	// view's columns instead. The dataset filter is applied while the
+	// rows are built (BuildRows takes meta.dataset), so the outer
+	// projection only needs the column names.
 	if a := analyzerFromContext(ctx); a != nil && a.catalog != nil {
-		if meta := a.catalog.infoSchemaTableMetaFor(table); meta != nil {
-			return fmt.Sprintf(
-				"(SELECT %s FROM %s WHERE __schema = '%s')",
-				strings.Join(columns, ","),
-				meta.view.Module,
-				strings.ReplaceAll(meta.dataset, "'", "''"),
-			), nil
+		if relation, ok, err := a.catalog.infoSchemaInlineRelationFor(table); err != nil {
+			return "", err
+		} else if ok {
+			return fmt.Sprintf("(SELECT %s FROM %s)", strings.Join(columns, ","), relation), nil
 		}
 	}
 	tableName, err := getTableName(ctx, n.node)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("(SELECT %s FROM `%s`)", strings.Join(columns, ","), tableName), nil
+	return fmt.Sprintf("(SELECT %s FROM \"%s\")", strings.Join(columns, ","), tableName), nil
 }
 
 func (n *JoinScanNode) FormatSQL(ctx context.Context) (string, error) {
@@ -1633,13 +4943,256 @@ func (n *JoinScanNode) FormatSQL(ctx context.Context) (string, error) {
 	case googlesql.ResolvedJoinScanEnums_JoinTypeInner:
 		return fmt.Sprintf("%s JOIN %s ON %s", left, right, joinExpr), nil
 	case googlesql.ResolvedJoinScanEnums_JoinTypeLeft:
-		return fmt.Sprintf("%s LEFT JOIN %s ON %s", left, right, joinExpr), nil
+		return formatLeftJoinPreservingLeftOrder(ctx, n.node, left, right, joinExpr)
 	case googlesql.ResolvedJoinScanEnums_JoinTypeRight:
 		return fmt.Sprintf("%s RIGHT JOIN %s ON %s", left, right, joinExpr), nil
 	case googlesql.ResolvedJoinScanEnums_JoinTypeFull:
+		// ARRAY_ZIP(..., mode => 'PAD') lowers to a FULL OUTER JOIN of the
+		// per-array UNNEST(json_each) scans, keyed on their generated offset
+		// columns (for N arrays the joins nest: (A FULL B) FULL C ...).
+		// DuckDB cannot flatten a correlated subquery that contains a FULL
+		// OUTER JOIN ("Unsupported join type for flattening correlated
+		// subquery"), and the ARRAY_ZIP body always nests this join inside a
+		// correlated array_agg subquery. INNER / LEFT / RIGHT joins of the
+		// same correlated scans flatten fine, so only the FULL OUTER shape
+		// needs retargeting. Rewrite the offset-keyed positional outer join to
+		// a range-driven pair of LEFT JOINs that DuckDB can decorrelate while
+		// exposing the identical columns of both operands; fall back to the
+		// literal FULL OUTER JOIN for any join that is not an offset-keyed
+		// positional zip (e.g. a user FULL OUTER JOIN on element values).
+		if rewritten, ok, err := tryFormatFullOuterOffsetZip(ctx, n.node, left, right); err != nil {
+			return "", err
+		} else if ok {
+			return rewritten, nil
+		}
 		return fmt.Sprintf("%s FULL OUTER JOIN %s ON %s", left, right, joinExpr), nil
 	}
 	return "", fmt.Errorf("unexpected join type %d", m1(n.node.JoinType()))
+}
+
+func formatLeftJoinPreservingLeftOrder(ctx context.Context, join *googlesql.ResolvedJoinScan, left, right, joinExpr string) (string, error) {
+	formattedLeft, err := formatInput(left)
+	if err != nil {
+		return "", err
+	}
+	leftAlias := "__gsx_left_join_l"
+	// Anchor the left side's row stamp on the set-operation ordinal only
+	// when the LEFT SCAN's own projection exposes it (AST-derived). The
+	// previous substring probe over the rendered left SQL false-positived
+	// whenever the ordinal literal appeared NESTED inside the left input
+	// (e.g. a chained LEFT JOIN whose inner join already projected the
+	// ordinal away) and emitted an ORDER BY over a column that is not in
+	// scope.
+	rowNumberExpr := setOperationOrdinalRowNumber(ctx, m1(join.LeftScan()))
+	leftWithOrdinal := fmt.Sprintf(
+		"(SELECT *, %s AS \"%s\" %s) AS \"%s\"",
+		rowNumberExpr,
+		leftJoinOrdinalColumn,
+		formattedLeft,
+		leftAlias,
+	)
+	columns := []string{}
+	for _, col := range m1(join.ColumnList()) {
+		columns = append(columns, fmt.Sprintf("\"%s\"", uniqueColumnName(ctx, col)))
+	}
+	return fmt.Sprintf(
+		"(SELECT %s FROM %s LEFT JOIN %s ON %s ORDER BY \"%s\".\"%s\")",
+		strings.Join(columns, ","),
+		leftWithOrdinal,
+		right,
+		joinExpr,
+		leftAlias,
+		leftJoinOrdinalColumn,
+	), nil
+}
+
+// tryFormatFullOuterOffsetZip retargets the FULL OUTER JOIN that ARRAY_ZIP's
+// PAD mode emits. It fires only when the join condition equates two generated
+// UNNEST offset columns (the `$array_offset` / `$full_join` positional keys)
+// and both operands are UNNEST-derived. For that shape the FULL OUTER JOIN is
+// a positional outer zip: a row exists for every position 0..max(len)-1, with
+// the shorter side's columns NULL. Such offset columns are dense 0-based
+// indices, so the join is reproducible by driving the row set from a range
+// and re-joining each operand on its own positional key.
+//
+// The replacement keeps both operands verbatim (so every column they expose,
+// including any nested coalesce-of-offset columns the enclosing projections
+// read, flows through unchanged) and rewrites only the join shape:
+//
+//	range(0, greatest(count(left), count(right))) AS d(k)
+//	  LEFT JOIN (left)  ON leftOffset  = k
+//	  LEFT JOIN (right) ON rightOffset = k
+//
+// range() and the UNNEST operands stay correlated to the outer array columns,
+// which DuckDB decorrelates without trouble; the unsupported FULL OUTER node
+// is gone. Driving by count(*) of each operand (rather than the source array
+// length) keeps the rewrite agnostic to how deep the operand is, so a nested
+// (A FULL B) FULL C chain rewrites one join at a time. Any join that is not an
+// offset-keyed positional zip returns ok=false so the caller keeps the literal
+// FULL OUTER JOIN emission.
+func tryFormatFullOuterOffsetZip(ctx context.Context, join *googlesql.ResolvedJoinScan, left, right string) (string, bool, error) {
+	keyA, keyB, ok := offsetEqualityKeys(ctx, m1(join.JoinExpr()))
+	if !ok {
+		return "", false, nil
+	}
+	// Both operands must be UNNEST-derived for the positional-zip rewrite to
+	// be valid. ARRAY_ZIP's scans always lower through json_each; a user FULL
+	// OUTER JOIN on real tables never contains it. This also keeps the
+	// count(*) row-position assumption (dense 0-based offsets) sound.
+	if !strings.Contains(left, "json_each(") || !strings.Contains(right, "json_each(") {
+		return "", false, nil
+	}
+	// Map each offset key to the operand that exposes it. The formatter renders
+	// the key as a quoted unique name, so membership is a substring test on the
+	// already-formatted operand SQL.
+	leftKey, rightKey, ok := assignKeysToOperands(left, right, keyA, keyB)
+	if !ok {
+		return "", false, nil
+	}
+	driver := fmt.Sprintf(
+		"range(CAST(0 AS BIGINT), CAST(greatest((SELECT count(*) FROM %s),(SELECT count(*) FROM %s)) AS BIGINT)) AS __zip_drv(__zip_k)",
+		wrapZipOperand(left), wrapZipOperand(right),
+	)
+	return fmt.Sprintf(
+		"%s LEFT JOIN %s ON \"%s\" = __zip_drv.__zip_k LEFT JOIN %s ON \"%s\" = __zip_drv.__zip_k",
+		driver, wrapZipOperand(left), leftKey, wrapZipOperand(right), rightKey,
+	), true, nil
+}
+
+// offsetEqualityKeys returns the two column unique names of a join condition
+// of the form `<offsetA> = <offsetB>`, but only when both sides are bare
+// ColumnRefs to generated UNNEST offset columns (table name `$array_offset`
+// for a leaf UNNEST or `$full_join` for a prior outer-zip key). It returns
+// ok=false for any other predicate so the FULL OUTER retarget stays scoped to
+// the positional zip ARRAY_ZIP emits.
+func offsetEqualityKeys(ctx context.Context, joinExpr googlesql.ResolvedExprNode) (string, string, bool) {
+	call, ok := joinExpr.(*googlesql.ResolvedFunctionCall)
+	if !ok {
+		return "", "", false
+	}
+	name, err := getFuncName(ctx, call)
+	if err != nil || (name != "$equal" && !strings.HasSuffix(name, ".$equal")) {
+		return "", "", false
+	}
+	args := m1(call.ArgumentList())
+	if len(args) != 2 {
+		return "", "", false
+	}
+	colA, okA := offsetColumnName(ctx, args[0])
+	colB, okB := offsetColumnName(ctx, args[1])
+	if !okA || !okB {
+		return "", "", false
+	}
+	return colA, colB, true
+}
+
+// offsetColumnName returns the unique name of a ColumnRef to a generated
+// UNNEST offset column, and ok=false for any other expression. The positional
+// offset columns ARRAY_ZIP joins on live in the analyzer's `$array_offset`
+// (leaf UNNEST) and `$full_join` (a prior outer-zip's coalesced key) internal
+// ranges; restricting to those names avoids treating a value-based join key as
+// a position.
+func offsetColumnName(ctx context.Context, expr googlesql.ResolvedExprNode) (string, bool) {
+	ref, ok := expr.(*googlesql.ResolvedColumnRef)
+	if !ok {
+		return "", false
+	}
+	col := m1(ref.Column())
+	switch m1(col.TableName()) {
+	case "$array_offset", "$full_join":
+		return uniqueColumnName(ctx, col), true
+	}
+	return "", false
+}
+
+// assignKeysToOperands decides which of the two offset keys belongs to the
+// left operand and which to the right by testing which formatted operand SQL
+// contains each quoted key name. It returns ok=false when the mapping is
+// ambiguous (neither or both operands contain a key), leaving the literal
+// FULL OUTER JOIN in place.
+func assignKeysToOperands(left, right, keyA, keyB string) (string, string, bool) {
+	qa := fmt.Sprintf("\"%s\"", keyA)
+	qb := fmt.Sprintf("\"%s\"", keyB)
+	leftHasA := strings.Contains(left, qa)
+	leftHasB := strings.Contains(left, qb)
+	rightHasA := strings.Contains(right, qa)
+	rightHasB := strings.Contains(right, qb)
+	if leftHasA && rightHasB && !leftHasB && !rightHasA {
+		return keyA, keyB, true
+	}
+	if leftHasB && rightHasA && !leftHasA && !rightHasB {
+		return keyB, keyA, true
+	}
+	return "", "", false
+}
+
+// wrapZipOperand wraps a formatted scan operand as a parenthesised subquery so
+// it can sit on either side of a JOIN and be probed by `SELECT count(*) FROM`.
+// A scan that already starts with `(` is left as-is.
+func wrapZipOperand(operand string) string {
+	trimmed := strings.TrimSpace(operand)
+	if strings.HasPrefix(trimmed, "(") {
+		return trimmed
+	}
+	return fmt.Sprintf("(%s)", trimmed)
+}
+
+// unnestElementSQL returns the SQL projecting one decoded array element out
+// of the json_each(googlesqlite_decode_array(...)) scan, retyped to match the
+// element column's analyzer-resolved GoogleSQL type.
+//
+// Left as raw json_each.value, every element reaches DuckDB JSON-typed:
+// native functions fail to bind (mod(JSON, INTEGER_LITERAL)), CTAS persists
+// a JSON column, and — worst — native comparisons / MIN / MAX over the JSON
+// values are lexicographic, so MAX over UNNEST(GENERATE_ARRAY(1,1000))
+// silently returned 999. The analyzer knows the element type here, so:
+//
+//   - INT64 / FLOAT64 / BOOL elements are bare JSON scalars in the decoded
+//     array (EncodeValue passes them through raw); a native CAST retypes
+//     them to BIGINT / DOUBLE / BOOLEAN.
+//   - STRING elements are the value-layer envelope wrapped in JSON quotes;
+//     json_extract_string strips the quotes so the element carries the same
+//     VARCHAR envelope a stored TEXT column holds (equality with literals
+//     and stored columns is byte-identical either way; a plain CAST would
+//     keep the JSON quotes and break it).
+//   - DATE / TIME / DATETIME / TIMESTAMP elements ride the envelope inside
+//     the JSON; googlesqlite_unnest_temporal unwraps the envelope to a
+//     canonical native-castable text form and the CAST retypes it to the
+//     native temporal column type (matching ColumnSpec.SQLiteSchema, which
+//     stores temporals natively).
+//
+// Every other element kind (ARRAY, STRUCT, BYTES, NUMERIC, GEOGRAPHY, JSON,
+// INTERVAL, RANGE, ENUM, PROTO, ...) keeps the raw JSON projection: the
+// value-layer flow depends on receiving the envelope untouched.
+func unnestElementSQL(col *googlesql.ResolvedColumn) string {
+	const raw = "json_each.value"
+	if col == nil {
+		return raw
+	}
+	t, _ := col.Type()
+	if t == nil {
+		return raw
+	}
+	k, err := t.Kind()
+	if err != nil {
+		return raw
+	}
+	if castType, ok := valueLayerScalarCastType(k); ok {
+		return fmt.Sprintf("CAST(%s AS %s)", raw, castType)
+	}
+	switch k {
+	case googlesql.TypeKindTypeString:
+		return fmt.Sprintf("json_extract_string(%s, '$')", raw)
+	case googlesql.TypeKindTypeDate:
+		return fmt.Sprintf("CAST(googlesqlite_unnest_temporal(json_extract_string(%s, '$'), 'date') AS DATE)", raw)
+	case googlesql.TypeKindTypeTime:
+		return fmt.Sprintf("CAST(googlesqlite_unnest_temporal(json_extract_string(%s, '$'), 'time') AS TIME)", raw)
+	case googlesql.TypeKindTypeDatetime:
+		return fmt.Sprintf("CAST(googlesqlite_unnest_temporal(json_extract_string(%s, '$'), 'datetime') AS TIMESTAMP)", raw)
+	case googlesql.TypeKindTypeTimestamp:
+		return fmt.Sprintf("CAST(googlesqlite_unnest_temporal(json_extract_string(%s, '$'), 'timestamp') AS TIMESTAMPTZ)", raw)
+	}
+	return raw
 }
 
 func (n *ArrayScanNode) FormatSQL(ctx context.Context) (string, error) {
@@ -1650,12 +5203,16 @@ func (n *ArrayScanNode) FormatSQL(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	colName := uniqueColumnName(ctx, m1(n.node.ElementColumn()))
-	columns := []string{fmt.Sprintf("json_each.value AS `%s`", colName)}
+	elementColumn := m1(n.node.ElementColumn())
+	colName := uniqueColumnName(ctx, elementColumn)
+	columns := []string{fmt.Sprintf("%s AS \"%s\"", unnestElementSQL(elementColumn), colName)}
 
 	if offsetColumn, _ := n.node.ArrayOffsetColumn(); offsetColumn != nil {
 		offsetColName := uniqueColumnName(ctx, m1(offsetColumn.Column()))
-		columns = append(columns, fmt.Sprintf("json_each.key AS `%s`", offsetColName))
+		// The WITH OFFSET column resolves as INT64; retype json_each.key
+		// the same way the element is retyped so native functions bind and
+		// ORDER BY off sorts numerically rather than lexicographically.
+		columns = append(columns, fmt.Sprintf("CAST(json_each.key AS BIGINT) AS \"%s\"", offsetColName))
 	}
 	if m1(n.node.InputScan()) != nil {
 		input, err := newNode(m1(n.node.InputScan())).FormatSQL(ctx)
@@ -1681,21 +5238,61 @@ func (n *ArrayScanNode) FormatSQL(ctx context.Context) (string, error) {
 			} else {
 				joinMode = "INNER JOIN"
 			}
+			// DuckDB retarget: a correlated array scan with a JOIN condition
+			// (the multi-array UNNEST that ARRAY_ZIP lowers to) references the
+			// element/offset columns of THIS scan inside the ON clause
+			// (e.g. ON "offset#6" = "offset#8"). DuckDB resolves a JOIN ON
+			// against the joined relation's columns, not the outer SELECT
+			// list, so projecting `json_each.value AS "e#"` in the outer
+			// SELECT leaves the ON clause unable to see the alias (Binder
+			// Error: Referenced column "offset#8" not found). Push the value
+			// / key aliases into a subquery wrapping the joined json_each so
+			// they become real columns the ON clause and the outer `SELECT *`
+			// both resolve.
+			array = fmt.Sprintf("(SELECT %s FROM %s)", strings.Join(columns, ","), array)
 			arrayJoinExpr = fmt.Sprintf("%s %s ON %s",
 				joinMode,
 				array,
 				arrayJoinExpr,
 			)
-		} else {
-			// If there is no join expression, use a CROSS JOIN
-			arrayJoinExpr = fmt.Sprintf(", %s", array)
+			return fmt.Sprintf(
+				"SELECT * %s %s",
+				formattedInput,
+				arrayJoinExpr,
+			), nil
 		}
+		// If there is no join expression, use a CROSS JOIN. The single-array
+		// scan projects the element / offset aliases directly because there
+		// is no ON clause that needs them as real columns.
+		//
+		// DuckDB retarget: this comma join is a DEPENDENT (lateral) join —
+		// json_each's argument references the input relation's columns —
+		// and the engine's dependent-join flattening delivers each input
+		// row's elements in REVERSE array order (probed: `SELECT x, range
+		// FROM (SELECT 4 AS x), range(x)` yields 3,2,1,0). BigQuery's
+		// UNNEST surfaces elements in array order and the upstream SQLite
+		// lowering preserved it, so impose it deterministically: stamp
+		// each input row with an ordinal (row_number over the input's
+		// natural order), then order the cross product by (input ordinal,
+		// element offset). The helper ordinal is EXCLUDEd from the star
+		// expansion so downstream scans see exactly the columns they
+		// expect.
+		const inputOrdinal = `"$unnest_input_ordinal"`
+		wrappedInput := fmt.Sprintf(
+			"FROM (SELECT *, %s AS %s %s)",
+			setOperationOrdinalRowNumber(ctx, m1(n.node.InputScan())),
+			inputOrdinal,
+			formattedInput,
+		)
+		arrayJoinExpr = fmt.Sprintf(", %s", array)
 
 		return fmt.Sprintf(
-			"SELECT *, %s %s %s",
+			"SELECT * EXCLUDE (%s), %s %s %s ORDER BY %s, json_each.key",
+			inputOrdinal,
 			strings.Join(columns, ","),
-			formattedInput,
+			wrappedInput,
 			arrayJoinExpr,
+			inputOrdinal,
 		), nil
 	}
 	return fmt.Sprintf(
@@ -1772,13 +5369,69 @@ func nullSetContains(set map[string]struct{}, name string) bool {
 	return ok
 }
 
+func aggregateScanNeedsInputOrdinal(scan *googlesql.ResolvedAggregateScan) bool {
+	if scan == nil {
+		return false
+	}
+	for _, col := range m1(scan.AggregateList()) {
+		call, ok := m1(col.Expr()).(*googlesql.ResolvedAggregateFunctionCall)
+		if !ok {
+			continue
+		}
+		name := strings.TrimPrefix(strings.ReplaceAll(m1(m1(call.Function()).FullName(false)), ".", "_"), "$")
+		switch name {
+		case "array_agg", "array_concat_agg", "string_agg":
+			return true
+		}
+	}
+	return false
+}
+
+func orderExprForColumn(col *googlesql.ResolvedColumn, formattedName string) string {
+	if col == nil {
+		return formattedName
+	}
+	t, err := col.Type()
+	if err != nil || t == nil {
+		return formattedName
+	}
+	k, err := t.Kind()
+	if err != nil {
+		return formattedName
+	}
+	if isPlainTextOrderableKind(k) {
+		return fmt.Sprintf("googlesqlite_plain_string(%s)", formattedName)
+	}
+	return formattedName
+}
+
+func defaultNullOrderSQL(desc bool) string {
+	if desc {
+		return " NULLS LAST"
+	}
+	return " NULLS FIRST"
+}
+
 func (n *AggregateScanNode) FormatSQL(ctx context.Context) (string, error) {
 	if n.node == nil {
 		return "", nil
 	}
+	needsInputOrdinal := aggregateScanNeedsInputOrdinal(n.node)
+	// The agg-input-ordinal key is scoped to THIS scan's aggregate
+	// list: clear any inherited key first (this scan may itself be
+	// nested under another aggregate scan's input or argument), then
+	// set this scan's own key only if its aggregates need one. The
+	// input scan is always formatted without the key — the ordinal
+	// column is materialized by the wrap around `input` below, not by
+	// anything inside it.
+	ctx = withoutAggregateInputOrdinal(ctx)
+	aggCtx := ctx
+	if needsInputOrdinal {
+		aggCtx = withAggregateInputOrdinal(ctx)
+	}
 	for _, agg := range m1(n.node.AggregateList()) {
 		// assign sql to column ref map
-		if _, err := newNode(agg).FormatSQL(ctx); err != nil {
+		if _, err := newNode(agg).FormatSQL(aggCtx); err != nil {
 			return "", err
 		}
 	}
@@ -1787,14 +5440,27 @@ func (n *AggregateScanNode) FormatSQL(ctx context.Context) (string, error) {
 		return "", err
 	}
 	groupByColumns := []string{}
+	groupByOrderColumns := []string{}
+	groupByInputColumns := []string{}
 	groupByColumnMap := map[string]struct{}{}
 	for _, col := range m1(n.node.GroupByList()) {
+		if expr, err := col.Expr(); err == nil && expr != nil {
+			if sql, err := newNode(expr).FormatSQL(ctx); err == nil && sql != "" {
+				groupByInputColumns = append(groupByInputColumns, sql)
+			}
+		}
 		if _, err := newNode(col).FormatSQL(ctx); err != nil {
 			return "", err
 		}
-		colName := uniqueColumnName(ctx, m1(col.Column()))
-		groupByColumns = append(groupByColumns, fmt.Sprintf("`%s`", colName))
+		resolvedCol := m1(col.Column())
+		colName := uniqueColumnName(ctx, resolvedCol)
+		formattedCol := fmt.Sprintf("\"%s\"", colName)
+		groupByColumns = append(groupByColumns, formattedCol)
+		groupByOrderColumns = append(groupByOrderColumns, orderExprForColumn(resolvedCol, formattedCol)+defaultNullOrderSQL(false))
 		groupByColumnMap[colName] = struct{}{}
+	}
+	if len(groupByInputColumns) != len(groupByColumns) {
+		groupByInputColumns = append([]string{}, groupByColumns...)
 	}
 	columns := []string{}
 	columnMap := columnRefMap(ctx)
@@ -1806,7 +5472,7 @@ func (n *AggregateScanNode) FormatSQL(ctx context.Context) (string, error) {
 			columns = append(columns, ref)
 			delete(columnMap, colName)
 		} else {
-			columns = append(columns, fmt.Sprintf("`%s`", colName))
+			columns = append(columns, fmt.Sprintf("\"%s\"", colName))
 		}
 	}
 	if gsList := m1(n.node.GroupingSetList()); len(gsList) != 0 {
@@ -1840,7 +5506,7 @@ func (n *AggregateScanNode) FormatSQL(ctx context.Context) (string, error) {
 			groupBySetColumnMap := map[string]struct{}{}
 			for _, col := range m1(concreteSet.GroupByColumnList()) {
 				colName := uniqueColumnName(ctx, m1(col.Column()))
-				groupBySetColumns = append(groupBySetColumns, fmt.Sprintf("`%s`", colName))
+				groupBySetColumns = append(groupBySetColumns, fmt.Sprintf("\"%s\"", colName))
 				groupBySetColumnMap[colName] = struct{}{}
 			}
 			nullColumnNameMap := map[string]struct{}{}
@@ -1858,22 +5524,19 @@ func (n *AggregateScanNode) FormatSQL(ctx context.Context) (string, error) {
 					if _, exists := groupBySetColumnMap[target]; exists {
 						grouped = 0
 					}
-					groupBySetColumnPattern = append(groupBySetColumnPattern, fmt.Sprintf("%d AS `%s`", grouped, col))
+					groupBySetColumnPattern = append(groupBySetColumnPattern, fmt.Sprintf("%d AS \"%s\"", grouped, col))
 				case nullSetContains(nullColumnNameMap, col):
-					groupBySetColumnPattern = append(groupBySetColumnPattern, fmt.Sprintf("NULL AS `%s`", col))
+					groupBySetColumnPattern = append(groupBySetColumnPattern, fmt.Sprintf("NULL AS \"%s\"", col))
 				default:
 					groupBySetColumnPattern = append(groupBySetColumnPattern, columns[idx])
 				}
 			}
 			columnPatterns = append(columnPatterns, groupBySetColumnPattern)
-			annotatedGroupBySetColumns := make([]string, 0, len(groupBySetColumns))
-			for _, column := range groupBySetColumns {
-				annotatedGroupBySetColumns = append(
-					annotatedGroupBySetColumns,
-					fmt.Sprintf("googlesqlite_group_by(%s)", column),
-				)
-			}
-			groupByColumnPatterns = append(groupByColumnPatterns, annotatedGroupBySetColumns)
+			// DuckDB retarget (PATH B): emit the bare GROUP BY keys; the
+			// predecessor's googlesqlite_group_by() collation shim is not
+			// registered on DuckDB and is unnecessary (native GROUP BY on
+			// the value-layer encoding groups equal values correctly).
+			groupByColumnPatterns = append(groupByColumnPatterns, append([]string{}, groupBySetColumns...))
 		}
 		stmts := []string{}
 		for i := 0; i < len(columnPatterns); i++ {
@@ -1891,40 +5554,636 @@ func (n *AggregateScanNode) FormatSQL(ctx context.Context) (string, error) {
 				stmts = append(stmts, fmt.Sprintf("SELECT %s FROM %s %s", formattedColumns, input, groupBy))
 			}
 		}
-		groupByWithCollates := make([]string, 0, len(groupByColumns))
-		for _, groupByColumn := range groupByColumns {
-			groupByWithCollates = append(
-				groupByWithCollates,
-				fmt.Sprintf("%s COLLATE googlesqlite_collate", groupByColumn),
-			)
+		// DuckDB requires ORDER BY expressions over UNION results to live
+		// outside the set operation when they are not plain output columns.
+		unionSQL := strings.Join(stmts, " UNION ALL ")
+		if len(groupByOrderColumns) == 0 {
+			return unionSQL, nil
 		}
 		return fmt.Sprintf(
-			"%s ORDER BY %s",
-			strings.Join(stmts, " UNION ALL "),
-			strings.Join(groupByWithCollates, ","),
+			"SELECT * FROM (%s) ORDER BY %s",
+			unionSQL,
+			strings.Join(groupByOrderColumns, ","),
 		), nil
+	}
+	if sql, ok, err := tryFormatAggregateScanArrayAggTopN(ctx, n.node, input, columns, columnNames, groupByColumns, groupByInputColumns); ok || err != nil {
+		return sql, err
 	}
 	var groupBy string
 	if len(groupByColumns) > 0 {
-		annotatedGroupByColumns := make([]string, 0, len(groupByColumns))
-		for _, groupByColumn := range groupByColumns {
-			annotatedGroupByColumns = append(
-				annotatedGroupByColumns,
-				fmt.Sprintf("googlesqlite_group_by(%s)", groupByColumn),
-			)
-		}
-		groupBy = fmt.Sprintf("GROUP BY %s", strings.Join(annotatedGroupByColumns, ","))
+		// DuckDB retarget (PATH B): the predecessor wrapped each GROUP BY
+		// key in the googlesqlite_group_by() SQLite UDF (a collation /
+		// value-decode shim). DuckDB has no such UDF and groups on the
+		// raw value-layer encoding directly - rows that are equal under
+		// GoogleSQL semantics share a byte-identical encoded string, so
+		// native GROUP BY on the bare column is correct.
+		groupBy = fmt.Sprintf("GROUP BY %s", strings.Join(groupByColumns, ","))
 	}
 	formattedColumns := strings.Join(columns, ",")
+	orderBy := ""
+	if len(groupByOrderColumns) > 0 {
+		orderBy = " ORDER BY " + strings.Join(groupByOrderColumns, ",")
+	}
+	if needsInputOrdinal {
+		formattedInput, err := formatInput(input)
+		if err != nil {
+			return "", err
+		}
+		// Anchor the aggregate-input ordinal on the set-operation ordinal
+		// when the input exposes it, so ARRAY_AGG / STRING_AGG over a
+		// UNION ALL aggregate in branch order instead of engine order.
+		input = fmt.Sprintf("(SELECT *, %s AS \"%s\" %s)",
+			setOperationOrdinalRowNumber(ctx, m1(n.node.InputScan())), aggregateInputOrdinalColumn, formattedInput)
+		return fmt.Sprintf("SELECT %s FROM %s %s%s", formattedColumns, input, groupBy, orderBy), nil
+	}
 	switch getInputPattern(input) {
 	case InputKeep:
-		return fmt.Sprintf("SELECT %s %s %s", formattedColumns, input, groupBy), nil
+		return fmt.Sprintf("SELECT %s %s %s%s", formattedColumns, input, groupBy, orderBy), nil
 	case InputNeedsWrap:
-		return fmt.Sprintf("SELECT %s FROM (%s) %s", formattedColumns, input, groupBy), nil
+		return fmt.Sprintf("SELECT %s FROM (%s) %s%s", formattedColumns, input, groupBy, orderBy), nil
 	case InputNeedsFrom:
-		return fmt.Sprintf("SELECT %s FROM %s %s", formattedColumns, input, groupBy), nil
+		return fmt.Sprintf("SELECT %s FROM %s %s%s", formattedColumns, input, groupBy, orderBy), nil
 	}
 	return "", fmt.Errorf("unexpected input pattern: %s", input)
+}
+
+type arrayAggTopNPlan struct {
+	outputName   string
+	valueSQL     string
+	nullCheckSQL string
+	orderBy      []string
+	limitSQL     string
+}
+
+type arrayAggTopNRewritePlan struct {
+	helperColumn  string
+	elementColumn string
+	limitSQL      string
+	orderBy       []arrayAggTopNRewriteOrder
+	valueExpr     googlesql.ResolvedExprNode
+	fieldByColumn map[string]int
+}
+
+type arrayAggTopNRewriteOrder struct {
+	fieldIndex int
+	descending bool
+	nullOrder  googlesql.ResolvedOrderByItemEnums_NullOrderMode
+}
+
+type arrayAggRewriterScanInfo struct {
+	helperColumn  string
+	elementColumn string
+	fieldByColumn map[string]int
+}
+
+func tryFormatAggregateScanArrayAggTopN(ctx context.Context, scan *googlesql.ResolvedAggregateScan, input string, columns, columnNames, groupByColumns, groupByInputColumns []string) (string, bool, error) {
+	plans, err := arrayAggTopNPlans(ctx, scan)
+	if err != nil || len(plans) == 0 {
+		return "", len(plans) != 0, err
+	}
+	planByOutput := map[string]*arrayAggTopNPlan{}
+	for i := range plans {
+		planByOutput[plans[i].outputName] = &plans[i]
+	}
+
+	var baseColumns []string
+	for idx, colName := range columnNames {
+		if _, isTopN := planByOutput[colName]; isTopN {
+			continue
+		}
+		baseColumns = append(baseColumns, columns[idx])
+	}
+	if len(baseColumns) == 0 {
+		baseColumns = append(baseColumns, "1 AS \"__gsx_base_row\"")
+	}
+
+	inputSQL, err := aggregateScanInputSelect(input)
+	if err != nil {
+		return "", false, err
+	}
+	inputName := "__gsx_agg_input"
+	baseName := "__gsx_agg_base"
+	baseSQL := aggregateScanBaseSQL(inputName, baseColumns, groupByColumns)
+
+	joinSQL := ""
+	for idx, plan := range plans {
+		topName := fmt.Sprintf("__gsx_agg_topn_%d", idx)
+		topSQL := aggregateScanTopNSQL(inputName, plan, groupByColumns, groupByInputColumns)
+		if len(groupByColumns) == 0 {
+			joinSQL += fmt.Sprintf(" CROSS JOIN (%s) AS %s", topSQL, topName)
+			continue
+		}
+		var predicates []string
+		for _, groupCol := range groupByColumns {
+			predicates = append(predicates, fmt.Sprintf("%s.%s IS NOT DISTINCT FROM %s.%s", baseName, groupCol, topName, groupCol))
+		}
+		joinSQL += fmt.Sprintf(" LEFT JOIN (%s) AS %s ON %s", topSQL, topName, strings.Join(predicates, " AND "))
+	}
+
+	var finalColumns []string
+	for _, colName := range columnNames {
+		if plan, isTopN := planByOutput[colName]; isTopN {
+			topIdx := 0
+			for i := range plans {
+				if plans[i].outputName == plan.outputName {
+					topIdx = i
+					break
+				}
+			}
+			finalColumns = append(finalColumns, fmt.Sprintf("__gsx_agg_topn_%d.\"%s\" AS \"%s\"", topIdx, colName, colName))
+			continue
+		}
+		finalColumns = append(finalColumns, fmt.Sprintf("%s.\"%s\" AS \"%s\"", baseName, colName, colName))
+	}
+
+	return fmt.Sprintf(
+		"WITH %s AS (%s) SELECT %s FROM (%s) AS %s%s",
+		inputName,
+		inputSQL,
+		strings.Join(finalColumns, ","),
+		baseSQL,
+		baseName,
+		joinSQL,
+	), true, nil
+}
+
+func aggregateScanInputSelect(input string) (string, error) {
+	if strings.TrimSpace(input) == "" {
+		return "SELECT 1 AS \"__gsx_single_row\"", nil
+	}
+	formattedInput, err := formatInput(input)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("SELECT * %s", formattedInput), nil
+}
+
+func aggregateScanBaseSQL(inputName string, baseColumns, groupByColumns []string) string {
+	var groupBy string
+	if len(groupByColumns) > 0 {
+		groupBy = fmt.Sprintf(" GROUP BY %s", strings.Join(groupByColumns, ","))
+	} else if len(baseColumns) == 1 && baseColumns[0] == "1 AS \"__gsx_base_row\"" {
+		return "SELECT 1 AS \"__gsx_base_row\""
+	}
+	return fmt.Sprintf("SELECT %s FROM %s%s", strings.Join(baseColumns, ","), inputName, groupBy)
+}
+
+func aggregateScanTopNSQL(inputName string, plan arrayAggTopNPlan, groupByColumns, groupByInputColumns []string) string {
+	if len(groupByInputColumns) != len(groupByColumns) {
+		groupByInputColumns = groupByColumns
+	}
+	var partitionBy string
+	if len(groupByInputColumns) > 0 {
+		partitionBy = fmt.Sprintf("PARTITION BY %s ", strings.Join(groupByInputColumns, ","))
+	}
+	ranked := fmt.Sprintf(
+		"SELECT *, ROW_NUMBER() OVER (%sORDER BY %s) AS \"__gsx_topn_rank\" FROM %s",
+		partitionBy,
+		strings.Join(plan.orderBy, ","),
+		inputName,
+	)
+	var groupCols string
+	var groupBy string
+	if len(groupByColumns) > 0 {
+		var projectedGroupCols []string
+		for i, col := range groupByColumns {
+			projectedGroupCols = append(projectedGroupCols, fmt.Sprintf("%s AS %s", groupByInputColumns[i], col))
+		}
+		groupCols = strings.Join(projectedGroupCols, ",") + ","
+		groupBy = " GROUP BY " + strings.Join(groupByInputColumns, ",")
+	}
+	selected := fmt.Sprintf("\"__gsx_topn_rank\" <= %s", plan.limitSQL)
+	arrayExpr := fmt.Sprintf(
+		"array_agg(%s ORDER BY \"__gsx_topn_rank\") FILTER (WHERE %s)",
+		plan.valueSQL,
+		selected,
+	)
+	nullCheckSQL := plan.nullCheckSQL
+	if strings.TrimSpace(nullCheckSQL) == "" {
+		nullCheckSQL = plan.valueSQL
+	}
+	return fmt.Sprintf(
+		"SELECT %sCASE WHEN count(*) = 0 THEN NULL WHEN count(*) FILTER (WHERE %s AND (%s) IS NULL) > 0 THEN error('ARRAY_AGG: input value must be not null') ELSE googlesqlite_array_from_native(COALESCE(%s, [])) END AS \"%s\" FROM (%s)%s",
+		groupCols,
+		selected,
+		nullCheckSQL,
+		arrayExpr,
+		plan.outputName,
+		ranked,
+		groupBy,
+	)
+}
+
+func arrayAggTopNPlans(ctx context.Context, scan *googlesql.ResolvedAggregateScan) ([]arrayAggTopNPlan, error) {
+	var plans []arrayAggTopNPlan
+	rewritePlans := arrayAggTopNRewriteFromContext(ctx)
+	for _, agg := range m1(scan.AggregateList()) {
+		if rewritePlans != nil {
+			plan, ok, err := arrayAggTopNPlanFromRewrite(ctx, agg, rewritePlans)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				plans = append(plans, plan)
+				continue
+			}
+		}
+		plan, ok, err := arrayAggTopNPlanFromComputedColumn(ctx, agg)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			plans = append(plans, plan)
+		}
+	}
+	return plans, nil
+}
+
+func arrayAggTopNPlanFromRewrite(ctx context.Context, agg googlesql.ResolvedComputedColumnBaseNode, rewritePlans map[string]arrayAggTopNRewritePlan) (arrayAggTopNPlan, bool, error) {
+	computed, ok := agg.(resolvedComputedColumnLike)
+	if !ok {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	col, err := computed.Column()
+	if err != nil || col == nil {
+		return arrayAggTopNPlan{}, false, err
+	}
+	outputName := uniqueColumnName(ctx, col)
+	rewritePlan, ok := rewritePlans[outputName]
+	if !ok {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	expr, err := computed.Expr()
+	if err != nil || expr == nil {
+		return arrayAggTopNPlan{}, false, err
+	}
+	call, ok := expr.(*googlesql.ResolvedAggregateFunctionCall)
+	if !ok {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	funcName, args, err := getFuncNameAndArgs(ctx, call.ResolvedFunctionCallBase, false)
+	if err != nil {
+		return arrayAggTopNPlan{}, false, err
+	}
+	if funcName != "array_agg" && funcName != "googlesqlite_array_agg" {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	if len(args) != 1 || m1(call.Distinct()) {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	callArgs := m1(call.ResolvedFunctionCallBase.ArgumentList())
+	if len(callArgs) != 1 {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	makeStruct, ok := callArgs[0].(*googlesql.ResolvedMakeStruct)
+	if !ok {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	fields := m1(makeStruct.FieldList())
+	nullCheckSQL := args[0]
+	if rewritePlan.valueExpr != nil {
+		if _, isStructValue := rewritePlan.valueExpr.(*googlesql.ResolvedMakeStruct); !isStructValue {
+			columnMap := map[string]string{}
+			for colName, fieldIndex := range rewritePlan.fieldByColumn {
+				if fieldIndex < 0 || fieldIndex >= len(fields) {
+					continue
+				}
+				fieldSQL, err := newNode(fields[fieldIndex]).FormatSQL(ctx)
+				if err != nil {
+					return arrayAggTopNPlan{}, false, err
+				}
+				columnMap[colName] = fieldSQL
+			}
+			if rewritePlan.elementColumn != "" {
+				columnMap[rewritePlan.elementColumn] = args[0]
+			}
+			if len(columnMap) > 0 {
+				valueCtx := withColumnRefMap(ctx, columnMap)
+				valueSQL, err := newNode(rewritePlan.valueExpr).FormatSQL(valueCtx)
+				if err != nil {
+					return arrayAggTopNPlan{}, false, err
+				}
+				if strings.TrimSpace(valueSQL) != "" {
+					nullCheckSQL = valueSQL
+				}
+			}
+		}
+	}
+	var orderBy []string
+	for _, item := range rewritePlan.orderBy {
+		if item.fieldIndex < 0 || item.fieldIndex >= len(fields) {
+			return arrayAggTopNPlan{}, false, nil
+		}
+		fieldSQL, err := newNode(fields[item.fieldIndex]).FormatSQL(ctx)
+		if err != nil {
+			return arrayAggTopNPlan{}, false, err
+		}
+		orderBy = append(orderBy, aggregateTopNOrderByExpr(fieldSQL, item.descending, item.nullOrder)...)
+	}
+	if len(orderBy) == 0 {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	return arrayAggTopNPlan{
+		outputName:   outputName,
+		valueSQL:     args[0],
+		nullCheckSQL: nullCheckSQL,
+		orderBy:      orderBy,
+		limitSQL:     rewritePlan.limitSQL,
+	}, true, nil
+}
+
+type resolvedComputedColumnLike interface {
+	Column() (*googlesql.ResolvedColumn, error)
+	Expr() (googlesql.ResolvedExprNode, error)
+}
+
+func arrayAggTopNPlanFromComputedColumn(ctx context.Context, agg googlesql.ResolvedComputedColumnBaseNode) (arrayAggTopNPlan, bool, error) {
+	computed, ok := agg.(resolvedComputedColumnLike)
+	if !ok {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	expr, err := computed.Expr()
+	if err != nil || expr == nil {
+		return arrayAggTopNPlan{}, false, err
+	}
+	call, ok := expr.(*googlesql.ResolvedAggregateFunctionCall)
+	if !ok {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	funcName, args, err := getFuncNameAndArgs(ctx, call.ResolvedFunctionCallBase, false)
+	if err != nil {
+		return arrayAggTopNPlan{}, false, err
+	}
+	if funcName != "array_agg" && funcName != "googlesqlite_array_agg" {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	if len(args) != 1 || m1(call.Limit()) == nil || len(m1(call.OrderByItemList())) == 0 {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	if m1(call.Distinct()) {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	if mod := m1(call.NullHandlingModifier()); mod == googlesql.ResolvedNonScalarFunctionCallBaseEnums_NullHandlingModifierIgnoreNulls {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	limitSQL, err := newNode(m1(call.Limit())).FormatSQL(ctx)
+	if err != nil {
+		return arrayAggTopNPlan{}, false, err
+	}
+	var orderBy []string
+	for _, item := range m1(call.OrderByItemList()) {
+		orderBy = append(orderBy, aggregateTopNOrderByItem(ctx, item)...)
+	}
+	if len(orderBy) == 0 {
+		return arrayAggTopNPlan{}, false, nil
+	}
+	col, err := computed.Column()
+	if err != nil || col == nil {
+		return arrayAggTopNPlan{}, false, err
+	}
+	return arrayAggTopNPlan{
+		outputName:   uniqueColumnName(ctx, col),
+		valueSQL:     args[0],
+		nullCheckSQL: args[0],
+		orderBy:      orderBy,
+		limitSQL:     limitSQL,
+	}, true, nil
+}
+
+func aggregateTopNOrderByItem(ctx context.Context, item *googlesql.ResolvedOrderByItem) []string {
+	columnRef := m1(item.ColumnRef())
+	if columnRef == nil {
+		return nil
+	}
+	colName := uniqueColumnName(ctx, m1(columnRef.Column()))
+	return aggregateTopNOrderByExpr(fmt.Sprintf("\"%s\"", colName), m1(item.IsDescending()), m1(item.NullOrder()))
+}
+
+func aggregateTopNOrderByExpr(expr string, descending bool, nullOrder googlesql.ResolvedOrderByItemEnums_NullOrderMode) []string {
+	var orderBy []string
+	switch nullOrder {
+	case googlesql.ResolvedOrderByItemEnums_NullOrderModeNullsFirst:
+		orderBy = append(orderBy, fmt.Sprintf("(%s IS NOT NULL)", expr))
+	case googlesql.ResolvedOrderByItemEnums_NullOrderModeNullsLast:
+		orderBy = append(orderBy, fmt.Sprintf("(%s IS NULL)", expr))
+	}
+	if descending {
+		orderBy = append(orderBy, fmt.Sprintf("%s DESC", expr))
+	} else {
+		orderBy = append(orderBy, expr)
+	}
+	return orderBy
+}
+
+func arrayAggTopNRewritePlansFromProject(ctx context.Context, project *googlesql.ResolvedProjectScan) (map[string]arrayAggTopNRewritePlan, error) {
+	plans := map[string]arrayAggTopNRewritePlan{}
+	for _, col := range m1(project.ExprList()) {
+		expr, err := col.Expr()
+		if err != nil || expr == nil {
+			return nil, err
+		}
+		plan, ok, err := arrayAggTopNRewritePlanFromExpr(ctx, expr)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			plans[plan.helperColumn] = plan
+		}
+	}
+	if len(plans) == 0 {
+		return nil, nil
+	}
+	return plans, nil
+}
+
+func arrayAggTopNRewritePlanFromExpr(ctx context.Context, expr googlesql.ResolvedExprNode) (arrayAggTopNRewritePlan, bool, error) {
+	subquery, ok, err := findArraySubqueryExpr(expr)
+	if err != nil || !ok {
+		return arrayAggTopNRewritePlan{}, false, err
+	}
+	return arrayAggTopNRewritePlanFromArraySubquery(ctx, subquery)
+}
+
+func findArraySubqueryExpr(node googlesql.ResolvedNode) (*googlesql.ResolvedSubqueryExpr, bool, error) {
+	if node == nil {
+		return nil, false, nil
+	}
+	if subquery, ok := node.(*googlesql.ResolvedSubqueryExpr); ok {
+		if m1(subquery.SubqueryType()) == googlesql.ResolvedSubqueryExprEnums_SubqueryTypeArray {
+			return subquery, true, nil
+		}
+	}
+	children, err := node.GetChildNodes()
+	if err != nil {
+		return nil, false, err
+	}
+	for _, child := range children {
+		subquery, ok, err := findArraySubqueryExpr(child)
+		if err != nil || ok {
+			return subquery, ok, err
+		}
+	}
+	return nil, false, nil
+}
+
+func arrayAggTopNRewritePlanFromArraySubquery(ctx context.Context, subquery *googlesql.ResolvedSubqueryExpr) (arrayAggTopNRewritePlan, bool, error) {
+	scan, err := subquery.Subquery()
+	if err != nil || scan == nil {
+		return arrayAggTopNRewritePlan{}, false, err
+	}
+	limitScan, ok := scan.(*googlesql.ResolvedLimitOffsetScan)
+	if !ok || m1(limitScan.Limit()) == nil {
+		return arrayAggTopNRewritePlan{}, false, nil
+	}
+	if offset := m1(limitScan.Offset()); offset != nil {
+		offsetSQL, err := newNode(offset).FormatSQL(ctx)
+		if err != nil {
+			return arrayAggTopNRewritePlan{}, false, err
+		}
+		if strings.TrimSpace(offsetSQL) != "0" {
+			return arrayAggTopNRewritePlan{}, false, nil
+		}
+	}
+	limitSQL, err := newNode(m1(limitScan.Limit())).FormatSQL(ctx)
+	if err != nil {
+		return arrayAggTopNRewritePlan{}, false, err
+	}
+	orderScan, ok := m1(limitScan.InputScan()).(*googlesql.ResolvedOrderByScan)
+	if !ok {
+		return arrayAggTopNRewritePlan{}, false, nil
+	}
+	info, ok, err := arrayAggRewriterScanInfoFromScan(ctx, m1(orderScan.InputScan()))
+	if err != nil || !ok {
+		return arrayAggTopNRewritePlan{}, false, err
+	}
+	valueExpr, err := arrayAggTopNRewriteValueExpr(ctx, limitScan, m1(orderScan.InputScan()))
+	if err != nil {
+		return arrayAggTopNRewritePlan{}, false, err
+	}
+	var orderBy []arrayAggTopNRewriteOrder
+	for _, item := range m1(orderScan.OrderByItemList()) {
+		columnRef := m1(item.ColumnRef())
+		if columnRef == nil {
+			return arrayAggTopNRewritePlan{}, false, nil
+		}
+		colName := uniqueColumnName(ctx, m1(columnRef.Column()))
+		fieldIndex, ok := info.fieldByColumn[colName]
+		if !ok {
+			return arrayAggTopNRewritePlan{}, false, nil
+		}
+		orderBy = append(orderBy, arrayAggTopNRewriteOrder{
+			fieldIndex: fieldIndex,
+			descending: m1(item.IsDescending()),
+			nullOrder:  m1(item.NullOrder()),
+		})
+	}
+	if info.helperColumn == "" || len(orderBy) == 0 {
+		return arrayAggTopNRewritePlan{}, false, nil
+	}
+	return arrayAggTopNRewritePlan{
+		helperColumn:  info.helperColumn,
+		elementColumn: info.elementColumn,
+		limitSQL:      limitSQL,
+		orderBy:       orderBy,
+		valueExpr:     valueExpr,
+		fieldByColumn: info.fieldByColumn,
+	}, true, nil
+}
+
+func arrayAggTopNRewriteValueExpr(ctx context.Context, limitScan *googlesql.ResolvedLimitOffsetScan, input googlesql.ResolvedScanNode) (googlesql.ResolvedExprNode, error) {
+	cols := m1(limitScan.ColumnList())
+	if len(cols) != 1 {
+		return nil, nil
+	}
+	expr, _, err := computedColumnExprForScan(ctx, input, uniqueColumnName(ctx, cols[0]))
+	return expr, err
+}
+
+func computedColumnExprForScan(ctx context.Context, scan googlesql.ResolvedScanNode, target string) (googlesql.ResolvedExprNode, bool, error) {
+	switch s := scan.(type) {
+	case *googlesql.ResolvedProjectScan:
+		for _, col := range m1(s.ExprList()) {
+			out, err := col.Column()
+			if err != nil || out == nil {
+				return nil, false, err
+			}
+			if uniqueColumnName(ctx, out) != target {
+				continue
+			}
+			expr, err := col.Expr()
+			return expr, expr != nil, err
+		}
+		return computedColumnExprForScan(ctx, m1(s.InputScan()), target)
+	case *googlesql.ResolvedOrderByScan:
+		return computedColumnExprForScan(ctx, m1(s.InputScan()), target)
+	case *googlesql.ResolvedLimitOffsetScan:
+		return computedColumnExprForScan(ctx, m1(s.InputScan()), target)
+	}
+	return nil, false, nil
+}
+
+func arrayAggRewriterScanInfoFromScan(ctx context.Context, scan googlesql.ResolvedScanNode) (arrayAggRewriterScanInfo, bool, error) {
+	switch s := scan.(type) {
+	case *googlesql.ResolvedProjectScan:
+		info, ok, err := arrayAggRewriterScanInfoFromScan(ctx, m1(s.InputScan()))
+		if err != nil || !ok {
+			return arrayAggRewriterScanInfo{}, false, err
+		}
+		for _, col := range m1(s.ExprList()) {
+			expr, err := col.Expr()
+			if err != nil || expr == nil {
+				return arrayAggRewriterScanInfo{}, false, err
+			}
+			fieldIndex, ok, err := helperStructFieldIndex(ctx, expr, info.elementColumn)
+			if err != nil {
+				return arrayAggRewriterScanInfo{}, false, err
+			}
+			if !ok {
+				continue
+			}
+			out, err := col.Column()
+			if err != nil || out == nil {
+				return arrayAggRewriterScanInfo{}, false, err
+			}
+			info.fieldByColumn[uniqueColumnName(ctx, out)] = fieldIndex
+		}
+		return info, true, nil
+	case *googlesql.ResolvedArrayScan:
+		exprs := m1(s.ArrayExprList())
+		cols := m1(s.ElementColumnList())
+		if len(exprs) != 1 || len(cols) != 1 {
+			return arrayAggRewriterScanInfo{}, false, nil
+		}
+		ref, ok := exprs[0].(*googlesql.ResolvedColumnRef)
+		if !ok {
+			return arrayAggRewriterScanInfo{}, false, nil
+		}
+		return arrayAggRewriterScanInfo{
+			helperColumn:  uniqueColumnName(ctx, m1(ref.Column())),
+			elementColumn: uniqueColumnName(ctx, cols[0]),
+			fieldByColumn: map[string]int{},
+		}, true, nil
+	}
+	return arrayAggRewriterScanInfo{}, false, nil
+}
+
+func helperStructFieldIndex(ctx context.Context, expr googlesql.ResolvedExprNode, elementColumn string) (int, bool, error) {
+	getField, ok := expr.(*googlesql.ResolvedGetStructField)
+	if !ok {
+		return 0, false, nil
+	}
+	ref, ok := m1(getField.Expr()).(*googlesql.ResolvedColumnRef)
+	if !ok {
+		return 0, false, nil
+	}
+	if uniqueColumnName(ctx, m1(ref.Column())) != elementColumn {
+		return 0, false, nil
+	}
+	idx, err := getField.FieldIdx()
+	if err != nil {
+		return 0, false, err
+	}
+	return int(idx), true, nil
 }
 
 // FormatSQL lowers a ResolvedAnonymizedAggregateScan (the
@@ -1973,7 +6232,7 @@ func (n *AnonymizedAggregateScanNode) FormatSQL(ctx context.Context) (string, er
 			return "", err
 		}
 		colName := uniqueColumnName(ctx, m1(col.Column()))
-		groupByColumns = append(groupByColumns, fmt.Sprintf("`%s`", colName))
+		groupByColumns = append(groupByColumns, fmt.Sprintf("\"%s\"", colName))
 	}
 	columns := []string{}
 	columnMap := columnRefMap(ctx)
@@ -1983,7 +6242,7 @@ func (n *AnonymizedAggregateScanNode) FormatSQL(ctx context.Context) (string, er
 			columns = append(columns, ref)
 			delete(columnMap, colName)
 		} else {
-			columns = append(columns, fmt.Sprintf("`%s`", colName))
+			columns = append(columns, fmt.Sprintf("\"%s\"", colName))
 		}
 	}
 	formattedColumns := strings.Join(columns, ",")
@@ -2018,6 +6277,19 @@ func dpOptionsFromContext(ctx context.Context) *dpOptions {
 		return v
 	}
 	return nil
+}
+
+// isDPAggregateName reports whether funcName is one of the differential
+// privacy / anonymization aggregate calls that the (epsilon, delta)
+// budget should be appended to. The DIFFERENTIAL_PRIVACY surface arrives
+// as googlesqlite_differential_privacy_*; the ANONYMIZATION surface's
+// rewriter emits anon_* (bare) or $anon_* (which the prefix logic turns
+// into googlesqlite_anon_*). All variants want the budget so the runtime
+// can size Laplace noise.
+func isDPAggregateName(funcName string) bool {
+	return strings.HasPrefix(funcName, "googlesqlite_differential_privacy_") ||
+		strings.HasPrefix(funcName, "googlesqlite_anon_") ||
+		strings.HasPrefix(funcName, "anon_")
 }
 
 func withDPOptions(ctx context.Context, dp *dpOptions) context.Context {
@@ -2073,7 +6345,7 @@ func (n *DifferentialPrivacyAggregateScanNode) FormatSQL(ctx context.Context) (s
 			return "", err
 		}
 		colName := uniqueColumnName(ctx, m1(col.Column()))
-		groupByColumns = append(groupByColumns, fmt.Sprintf("`%s`", colName))
+		groupByColumns = append(groupByColumns, fmt.Sprintf("\"%s\"", colName))
 	}
 	columns := []string{}
 	columnMap := columnRefMap(ctx)
@@ -2083,7 +6355,7 @@ func (n *DifferentialPrivacyAggregateScanNode) FormatSQL(ctx context.Context) (s
 			columns = append(columns, ref)
 			delete(columnMap, colName)
 		} else {
-			columns = append(columns, fmt.Sprintf("`%s`", colName))
+			columns = append(columns, fmt.Sprintf("\"%s\"", colName))
 		}
 	}
 	formattedColumns := strings.Join(columns, ",")
@@ -2131,10 +6403,28 @@ func (n *SetOperationScanNode) FormatSQL(ctx context.Context) (string, error) {
 		opType = "UNKNOWN"
 	}
 	var queries []string
-	for _, item := range m1(n.node.InputItemList()) {
+	carryOrdinal := m1(n.node.OpType()) == googlesql.ResolvedSetOperationScanEnums_SetOperationTypeUnionAll
+	for idx, item := range m1(n.node.InputItemList()) {
 		var outputColumns []string
 		for _, outputColumn := range m1(item.OutputColumnList()) {
-			outputColumns = append(outputColumns, fmt.Sprintf("`%s`", uniqueColumnName(ctx, outputColumn)))
+			outputColumns = append(outputColumns, fmt.Sprintf("\"%s\"", uniqueColumnName(ctx, outputColumn)))
+		}
+		if carryOrdinal {
+			// The ordinal is TOTAL, not a per-branch constant: branch idx
+			// contributes the high bits (stride) and a per-branch
+			// row_number contributes the low bits, so `ORDER BY
+			// "__gsx_setop_ordinal"` reproduces both the branch order AND
+			// the within-branch row order. A constant idx+1 would leave
+			// within-branch order resting on the engine's insertion-order
+			// stability at every anchor site. The branch row_number itself
+			// anchors on a nested union's ordinal when the branch input
+			// exposes one.
+			outputColumns = append(outputColumns, fmt.Sprintf(
+				"(%d + %s) AS \"%s\"",
+				int64(idx)*setOperationOrdinalStride,
+				setOperationOrdinalRowNumber(ctx, m1(item.Scan())),
+				setOperationOrdinalColumn,
+			))
 		}
 		query, err := newNode(item).FormatSQL(ctx)
 		if err != nil {
@@ -2160,12 +6450,15 @@ func (n *SetOperationScanNode) FormatSQL(ctx context.Context) (string, error) {
 			columnMaps = append(
 				columnMaps,
 				fmt.Sprintf(
-					"`%s` AS `%s`",
+					"\"%s\" AS \"%s\"",
 					uniqueColumnName(ctx, col),
 					uniqueColumnName(ctx, m1(n.node.ColumnList())[idx]),
 				),
 			)
 		}
+	}
+	if carryOrdinal {
+		columnMaps = append(columnMaps, fmt.Sprintf("\"%s\"", setOperationOrdinalColumn))
 	}
 	return fmt.Sprintf(
 		"SELECT %s FROM (%s)",
@@ -2192,30 +6485,32 @@ func (n *OrderByScanNode) FormatSQL(ctx context.Context) (string, error) {
 		} else {
 			columns = append(
 				columns,
-				fmt.Sprintf("`%s`", colName),
+				fmt.Sprintf("\"%s\"", colName),
 			)
 		}
 	}
 	orderByColumns := []string{}
 	for _, item := range m1(n.node.OrderByItemList()) {
-		colName := uniqueColumnName(ctx, m1(m1(item.ColumnRef()).Column()))
+		col := m1(m1(item.ColumnRef()).Column())
+		colName := uniqueColumnName(ctx, col)
+		formattedCol := fmt.Sprintf("\"%s\"", colName)
+		isDesc := m1(item.IsDescending())
+		nullOrder := defaultNullOrderSQL(isDesc)
 		switch m1(item.NullOrder()) {
 		case googlesql.ResolvedOrderByItemEnums_NullOrderModeNullsFirst:
-			orderByColumns = append(
-				orderByColumns,
-				fmt.Sprintf("(`%s` IS NOT NULL)", colName),
-			)
+			nullOrder = " NULLS FIRST"
 		case googlesql.ResolvedOrderByItemEnums_NullOrderModeNullsLast:
-			orderByColumns = append(
-				orderByColumns,
-				fmt.Sprintf("(`%s` IS NULL)", colName),
-			)
+			nullOrder = " NULLS LAST"
 		}
-		if m1(item.IsDescending()) {
-			orderByColumns = append(orderByColumns, fmt.Sprintf("`%s` COLLATE googlesqlite_collate DESC", colName))
-		} else {
-			orderByColumns = append(orderByColumns, fmt.Sprintf("`%s` COLLATE googlesqlite_collate", colName))
+		// DuckDB retarget: drop the googlesqlite_collate SQLite collation
+		// (no DuckDB callback-collation API). STRING/UUID keys sort by
+		// decoded payload text; other scalar storage orders natively.
+		orderExpr := orderExprForColumn(col, formattedCol)
+		direction := ""
+		if isDesc {
+			direction = " DESC"
 		}
+		orderByColumns = append(orderByColumns, orderExpr+direction+nullOrder)
 	}
 	formattedInput, err := formatInput(input)
 	if err != nil {
@@ -2247,7 +6542,7 @@ func (n *LimitOffsetScanNode) FormatSQL(ctx context.Context) (string, error) {
 		} else {
 			columns = append(
 				columns,
-				fmt.Sprintf("`%s`", colName),
+				fmt.Sprintf("\"%s\"", colName),
 			)
 		}
 	}
@@ -2298,20 +6593,25 @@ func (n *WithRefScanNode) FormatSQL(ctx context.Context) (string, error) {
 	for i := range columnDefs {
 		formattedColumns = append(
 			formattedColumns,
-			fmt.Sprintf("`%s` AS `%s`", uniqueColumnName(ctx, columnDefs[i]), uniqueColumnName(ctx, columns[i])),
+			fmt.Sprintf("\"%s\" AS \"%s\"", uniqueColumnName(ctx, columnDefs[i]), uniqueColumnName(ctx, columns[i])),
 		)
 	}
-	return fmt.Sprintf("(SELECT %s FROM `%s`)", strings.Join(formattedColumns, ","), tableName), nil
+	if cteSetOperationOrdinals(ctx)[tableName] {
+		formattedColumns = append(formattedColumns, fmt.Sprintf("\"%s\"", setOperationOrdinalColumn))
+	}
+	return fmt.Sprintf("(SELECT %s FROM \"%s\")", strings.Join(formattedColumns, ","), tableName), nil
 }
 
 func (n *AnalyticScanNode) FormatSQL(ctx context.Context) (string, error) {
 	if n.node == nil {
 		return "", nil
 	}
-	input, err := newNode(m1(n.node.InputScan())).FormatSQL(ctx)
+	inputScan := m1(n.node.InputScan())
+	input, err := newNode(inputScan).FormatSQL(ctx)
 	if err != nil {
 		return "", err
 	}
+	rowIDExpr := setOperationOrdinalRowNumber(ctx, inputScan)
 	formattedInput, err := formatInput(input)
 	if err != nil {
 		return "", err
@@ -2326,14 +6626,17 @@ func (n *AnalyticScanNode) FormatSQL(ctx context.Context) (string, error) {
 		if m1(group.PartitionBy()) != nil {
 			var partitionColumns []string
 			for _, columnRef := range m1(m1(group.PartitionBy()).PartitionByList()) {
-				colName := fmt.Sprintf("`%s`", uniqueColumnName(ctx, m1(columnRef.Column())))
+				col := m1(columnRef.Column())
+				colName := fmt.Sprintf("\"%s\"", uniqueColumnName(ctx, col))
 				partitionColumns = append(
 					partitionColumns,
 					colName,
 				)
 				order := &analyticOrderBy{
-					column: colName,
-					isAsc:  true,
+					column:        colName,
+					sortExpr:      analyticSortExprForColumn(col, colName),
+					isAsc:         true,
+					fromPartition: true,
 				}
 				orderColumnNames.values = append(orderColumnNames.values, order)
 				scanOrderBy = append(scanOrderBy, order)
@@ -2342,8 +6645,9 @@ func (n *AnalyticScanNode) FormatSQL(ctx context.Context) (string, error) {
 		}
 		if m1(group.OrderBy()) != nil {
 			for _, item := range m1(m1(group.OrderBy()).OrderByItemList()) {
-				colName := uniqueColumnName(ctx, m1(m1(item.ColumnRef()).Column()))
-				formattedColName := fmt.Sprintf("`%s`", colName)
+				col := m1(m1(item.ColumnRef()).Column())
+				colName := uniqueColumnName(ctx, col)
+				formattedColName := fmt.Sprintf("\"%s\"", colName)
 				nullOrder := nullOrderUnspecified
 				switch m1(item.NullOrder()) {
 				case googlesql.ResolvedOrderByItemEnums_NullOrderModeNullsFirst:
@@ -2353,6 +6657,7 @@ func (n *AnalyticScanNode) FormatSQL(ctx context.Context) (string, error) {
 				}
 				order := &analyticOrderBy{
 					column:    formattedColName,
+					sortExpr:  analyticSortExprForColumn(col, formattedColName),
 					isAsc:     !m1(item.IsDescending()),
 					nullOrder: nullOrder,
 				}
@@ -2378,64 +6683,86 @@ func (n *AnalyticScanNode) FormatSQL(ctx context.Context) (string, error) {
 		} else {
 			columns = append(
 				columns,
-				fmt.Sprintf("`%s`", colName),
+				fmt.Sprintf("\"%s\"", colName),
 			)
 		}
 	}
+	// Trailing output ORDER BY: the legacy SQLite engine evaluated window
+	// functions by sorting rows on (partition keys, order keys) and emitted
+	// them in that order, and the test corpus (zetasqlite heritage) asserts
+	// that order. DuckDB's window operator gives no output-order guarantee,
+	// so reproduce it explicitly: sort by the last function group's
+	// partition + order keys (value-layer aware via sortSQL, BigQuery null
+	// placement: NULLS FIRST when ASC, NULLS LAST when DESC unless the
+	// query said otherwise) and break ties by "row_id" — the input ordinal
+	// materialized by the wrap below — for a stable, input-order result.
 	var orderColumnFormattedNames []string
 	for _, col := range scanOrderBy {
-		// NULLS FIRST/LAST is implemented as a sort key prefix:
-		// emit (col IS NOT NULL) for NULLS FIRST so nulls (0) sort
-		// before non-nulls (1); emit (col IS NULL) for NULLS LAST so
-		// non-nulls (0) come before nulls (1). Skipped when the
-		// query did not request explicit null ordering.
-		switch col.nullOrder {
-		case nullOrderFirst:
-			orderColumnFormattedNames = append(
-				orderColumnFormattedNames,
-				fmt.Sprintf("(%s IS NOT NULL)", col.column),
-			)
-		case nullOrderLast:
-			orderColumnFormattedNames = append(
-				orderColumnFormattedNames,
-				fmt.Sprintf("(%s IS NULL)", col.column),
-			)
-		}
-		if col.isAsc {
-			orderColumnFormattedNames = append(
-				orderColumnFormattedNames,
-				fmt.Sprintf("%s COLLATE googlesqlite_collate", col.column),
-			)
-		} else {
-			orderColumnFormattedNames = append(
-				orderColumnFormattedNames,
-				fmt.Sprintf("%s COLLATE googlesqlite_collate DESC", col.column),
-			)
-		}
+		orderColumnFormattedNames = append(
+			orderColumnFormattedNames,
+			col.sortSQL()+analyticOrderDirectionSQL(col),
+		)
 	}
-	var orderBy string
-	if len(orderColumnFormattedNames) != 0 {
-		orderBy = fmt.Sprintf("ORDER BY %s", strings.Join(orderColumnFormattedNames, ","))
-	}
+	orderColumnFormattedNames = append(orderColumnFormattedNames, `"row_id"`)
+	orderBy := fmt.Sprintf("ORDER BY %s", strings.Join(orderColumnFormattedNames, ","))
 	orderColumnNames.values = []*analyticOrderBy{}
-	if !*emulationUsed {
-		// Every analytic call in this scan went through the native
-		// OVER path; the row_id column the predecessor's emulation
-		// needs is dead weight here, so skip the wrap and let
-		// SQLite read the input directly.
-		return fmt.Sprintf(
-			"SELECT %s %s %s",
-			strings.Join(columns, ","),
-			formattedInput,
-			orderBy,
-		), nil
-	}
+	_ = emulationUsed
+	// Always materialize the input ordinal: both the emulation path and
+	// the native path reference "row_id" (the native OVER clauses use it
+	// as a deterministic intra-tie ordering key, and the trailing output
+	// ORDER BY uses it as the final tiebreak).
 	return fmt.Sprintf(
-		"SELECT %s FROM (SELECT *, ROW_NUMBER() OVER() AS `row_id` %s) %s",
+		"SELECT %s FROM (SELECT *, %s AS \"row_id\" %s) %s",
 		strings.Join(columns, ","),
+		rowIDExpr,
 		formattedInput,
 		orderBy,
 	), nil
+}
+
+// analyticOrderDirectionSQL renders the direction + null-placement suffix
+// for one analytic sort key. BigQuery (like the legacy SQLite engine)
+// places NULLs first on ASC and last on DESC by default; DuckDB defaults
+// to NULLS LAST regardless of direction, so the placement is always
+// emitted explicitly.
+func analyticOrderDirectionSQL(col *analyticOrderBy) string {
+	dir := ""
+	nulls := " NULLS FIRST"
+	if !col.isAsc {
+		dir = " DESC"
+		nulls = " NULLS LAST"
+	}
+	switch col.nullOrder {
+	case nullOrderFirst:
+		nulls = " NULLS FIRST"
+	case nullOrderLast:
+		nulls = " NULLS LAST"
+	}
+	return dir + nulls
+}
+
+// analyticSortExprForColumn builds the native sort expression for an
+// analytic partition / order column. STRING and UUID columns ride the
+// value-layer base64 envelope, whose text does not order like the payload,
+// so they unwrap through googlesqlite_plain_string (UTF-8 byte order over
+// the payload matches GoogleSQL code-point ordering). Every other kind
+// orders correctly on its stored form.
+func analyticSortExprForColumn(col *googlesql.ResolvedColumn, formattedName string) string {
+	if col == nil {
+		return formattedName
+	}
+	t, err := col.Type()
+	if err != nil || t == nil {
+		return formattedName
+	}
+	k, err := t.Kind()
+	if err != nil {
+		return formattedName
+	}
+	if isPlainTextOrderableKind(k) {
+		return fmt.Sprintf("googlesqlite_plain_string(%s)", formattedName)
+	}
+	return formattedName
 }
 
 // FormatSQL passes the SampleScan through to its InputScan. We do
@@ -2462,12 +6789,12 @@ func (n *ComputedColumnNode) FormatSQL(ctx context.Context) (string, error) {
 	}
 	col, _ := n.node.Column()
 	uniqueName := uniqueColumnName(ctx, col)
-	query := fmt.Sprintf("%s AS `%s`", expr, uniqueColumnName(ctx, col))
+	query := fmt.Sprintf("%s AS \"%s\"", expr, uniqueColumnName(ctx, col))
 	columnMap := columnRefMap(ctx)
 	columnMap[uniqueName] = query
 	arraySubqueryColumnNames := arraySubqueryColumnNameFromContext(ctx)
 	if arraySubqueryColumnNames != nil {
-		arraySubqueryColumnNames.names = append(arraySubqueryColumnNames.names, fmt.Sprintf("`%s`", m1(col.Name())))
+		arraySubqueryColumnNames.names = append(arraySubqueryColumnNames.names, fmt.Sprintf("\"%s\"", m1(col.Name())))
 	}
 	return query, nil
 }
@@ -2476,6 +6803,11 @@ func (n *ProjectScanNode) FormatSQL(ctx context.Context) (string, error) {
 	if n.node == nil {
 		return "", nil
 	}
+	rewritePlans, err := arrayAggTopNRewritePlansFromProject(ctx, n.node)
+	if err != nil {
+		return "", err
+	}
+	ctx = withArrayAggTopNRewrite(ctx, rewritePlans)
 	for _, col := range m1(n.node.ExprList()) {
 		// assign expr to columnRefMap
 		if _, err := newNode(col).FormatSQL(ctx); err != nil {
@@ -2496,7 +6828,7 @@ func (n *ProjectScanNode) FormatSQL(ctx context.Context) (string, error) {
 		} else {
 			columns = append(
 				columns,
-				fmt.Sprintf("`%s`", colName),
+				fmt.Sprintf("\"%s\"", colName),
 			)
 		}
 	}
@@ -2566,7 +6898,7 @@ func (n *QueryStmtNode) FormatSQL(ctx context.Context) (string, error) {
 	for _, outputColumnNode := range m1(n.node.OutputColumnList()) {
 		columns = append(
 			columns,
-			fmt.Sprintf("`%s` AS `%s`",
+			fmt.Sprintf("\"%s\" AS \"%s\"",
 				uniqueColumnName(ctx, m1(outputColumnNode.Column())),
 				m1(outputColumnNode.Name()),
 			),
@@ -2588,9 +6920,9 @@ func (n *DropStmtNode) FormatSQL(ctx context.Context) (string, error) {
 	tableName := namePath.format2(n.node.NamePath())
 	objectType, _ := n.node.ObjectType()
 	if m1(n.node.IsIfExists()) {
-		return fmt.Sprintf("DROP %s IF EXISTS `%s`", objectType, tableName), nil
+		return fmt.Sprintf("DROP %s IF EXISTS \"%s\"", objectType, tableName), nil
 	}
-	return fmt.Sprintf("DROP %s `%s`", objectType, tableName), nil
+	return fmt.Sprintf("DROP %s \"%s\"", objectType, tableName), nil
 }
 
 // RecursiveRefScanNode renders as the enclosing CTE's queryName so
@@ -2601,9 +6933,7 @@ func (n *RecursiveRefScanNode) FormatSQL(ctx context.Context) (string, error) {
 	if name == "" {
 		return "", fmt.Errorf("recursive ref scan rendered outside a recursive WITH entry")
 	}
-	// Quote to match the WITH definition (WithEntryNode) so names with
-	// hyphens and other non-bare-identifier characters resolve.
-	return fmt.Sprintf("`%s`", name), nil
+	return fmt.Sprintf("\"%s\"", name), nil
 }
 
 // findRecursiveRefScanCols walks a scan tree looking for the column
@@ -2650,14 +6980,20 @@ func (n *RecursiveScanNode) FormatSQL(ctx context.Context) (string, error) {
 		if err != nil {
 			return "", err
 		}
+		// The recursive scan's two arms are positional UNION operands — a
+		// fixed-column splice boundary. A branch whose own projection
+		// exposes the set-operation ordinal helper (a UNION ALL seed term)
+		// must be re-projected to its OutputColumnList or the seed arm
+		// renders one column wider than the recursive arm.
 		trimmed := strings.TrimSpace(scanSQL)
-		if strings.HasPrefix(trimmed, "SELECT") || strings.HasPrefix(trimmed, "WITH") {
+		if !scanExposesSetOperationOrdinal(ctx, m1(item.Scan())) &&
+			(strings.HasPrefix(trimmed, "SELECT") || strings.HasPrefix(trimmed, "WITH")) {
 			return scanSQL, nil
 		}
 		out := m1(item.OutputColumnList())
 		cols := make([]string, 0, len(out))
 		for _, c := range out {
-			cols = append(cols, fmt.Sprintf("`%s`", uniqueColumnName(ctx, c)))
+			cols = append(cols, fmt.Sprintf("\"%s\"", uniqueColumnName(ctx, c)))
 		}
 		formatted, err := formatInput(scanSQL)
 		if err != nil {
@@ -2688,8 +7024,8 @@ func (n *RecursiveScanNode) FormatSQL(ctx context.Context) (string, error) {
 					if ref == nil {
 						continue
 					}
-					refName := fmt.Sprintf("`%s`", uniqueColumnName(ctx, ref))
-					canName := fmt.Sprintf("`%s`", uniqueColumnName(ctx, canonical[i]))
+					refName := fmt.Sprintf("\"%s\"", uniqueColumnName(ctx, ref))
+					canName := fmt.Sprintf("\"%s\"", uniqueColumnName(ctx, canonical[i]))
 					if refName != canName {
 						rec = strings.ReplaceAll(rec, refName, canName)
 					}
@@ -2738,6 +7074,16 @@ func (n *WithScanNode) FormatSQL(ctx context.Context) (string, error) {
 		}
 	}
 	subCtx := withCteRefCounts(ctx, refCounts)
+	// Each WITH scope gets its own ordinal-carrying-CTE set, seeded with a
+	// COPY of the enclosing scope's entries: an outer union CTE referenced
+	// inside this subtree must keep re-exposing its ordinal (resetting to
+	// an empty map silently un-anchored such references), while entries
+	// added or shadowed here must not leak back out.
+	inheritedOrdinals := map[string]bool{}
+	for name, exposed := range cteSetOperationOrdinals(ctx) {
+		inheritedOrdinals[name] = exposed
+	}
+	subCtx = withCteSetOperationOrdinals(subCtx, inheritedOrdinals)
 	queries := []string{}
 	for _, entry := range m1(n.node.WithEntryList()) {
 		sql, err := newNode(entry).FormatSQL(subCtx)
@@ -2795,6 +7141,13 @@ func (n *WithEntryNode) FormatSQL(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Record this CTE's exposure either way: scopes now inherit the
+	// enclosing scope's entries, so a CTE that SHADOWS an outer
+	// ordinal-carrying name with a non-union body must overwrite the
+	// inherited `true`.
+	if ordinals := cteSetOperationOrdinals(ctx); ordinals != nil {
+		ordinals[queryName] = scanExposesSetOperationOrdinal(ctx, sub)
+	}
 	tableToColumnList := tableNameToColumnListMap(ctx)
 	tableToColumnList[queryName] = m1(sub.MutableColumnList())
 	hint := cteMaterializeHint(ctx, queryName, subKind)
@@ -2808,11 +7161,119 @@ func (n *WithEntryNode) FormatSQL(ctx context.Context) (string, error) {
 		canonical := m1(sub.MutableColumnList())
 		cols := make([]string, 0, len(canonical))
 		for _, c := range canonical {
-			cols = append(cols, fmt.Sprintf("`%s`", uniqueColumnName(ctx, c)))
+			cols = append(cols, fmt.Sprintf("\"%s\"", uniqueColumnName(ctx, c)))
 		}
-		return fmt.Sprintf("`%s`(%s) AS%s ( %s )", queryName, strings.Join(cols, ","), hint, subquery), nil
+		return fmt.Sprintf("\"%s\"(%s) AS%s ( %s )", queryName, strings.Join(cols, ","), hint, subquery), nil
 	}
-	return fmt.Sprintf("`%s` AS%s ( %s )", queryName, hint, subquery), nil
+	return fmt.Sprintf("\"%s\" AS%s ( %s )", queryName, hint, subquery), nil
+}
+
+// scanExposesSetOperationOrdinal reports whether the SQL rendered for
+// `scan` exposes the __gsx_setop_ordinal helper column in its own output
+// projection. This is THE structural source of truth for every decision
+// about the helper column — order anchors (`ORDER BY "__gsx_setop_ordinal"`)
+// and splice-boundary re-projection both derive from it; nothing may match
+// substrings of rendered SQL, because a nested-but-stripped ordinal literal
+// in the text does not mean the column is in scope (and vice versa).
+//
+// The classification mirrors each node's FormatSQL by construction:
+//
+//   - SetOperationScan(UNION ALL) mints the column (it appends the ordinal
+//     after its column map);
+//   - WithRefScan re-exposes it for CTEs recorded in the scope's
+//     cteSetOperationOrdinals set;
+//   - pass-through scans whose rendering forwards the input projection
+//     unchanged (FilterScan appends only WHERE; AssertScan / BarrierScan /
+//     SampleScan return the input verbatim; ArrayScan-with-input renders
+//     `SELECT * ... FROM input ...`) recurse into their input;
+//   - JoinScans rendered as plain joins (INNER / CROSS / RIGHT / FULL)
+//     keep both operands' columns in scope, so they expose the ordinal
+//     when exactly one side does (both sides would make the name ambiguous
+//     to DuckDB's binder, so that case must read as "not usable");
+//     LEFT joins go through formatLeftJoinPreservingLeftOrder, which
+//     projects join.ColumnList() — the helper column never crosses it;
+//   - WithScan renders as `WITH ... <query>`, so its exposure is the
+//     final query's exposure evaluated in a scope that has the entry
+//     CTEs' exposure recorded (same copy-inherit semantics as
+//     WithScanNode.FormatSQL installs);
+//   - every other scan (ProjectScan, AggregateScan, OrderByScan,
+//     LimitOffsetScan, AnalyticScan, RecursiveScan, TableScan, TVFScan,
+//     ...) re-projects its own ColumnList, which drops the helper column.
+func scanExposesSetOperationOrdinal(ctx context.Context, scan googlesql.ResolvedNode) bool {
+	if scan == nil {
+		return false
+	}
+	switch s := scan.(type) {
+	case *googlesql.ResolvedSetOperationScan:
+		return m1(s.OpType()) == googlesql.ResolvedSetOperationScanEnums_SetOperationTypeUnionAll
+	case *googlesql.ResolvedWithRefScan:
+		name, _ := s.WithQueryName()
+		return cteSetOperationOrdinals(ctx)[name]
+	case *googlesql.ResolvedFilterScan:
+		return scanExposesSetOperationOrdinal(ctx, m1(s.InputScan()))
+	case *googlesql.ResolvedAssertScan:
+		return scanExposesSetOperationOrdinal(ctx, m1(s.InputScan()))
+	case *googlesql.ResolvedBarrierScan:
+		return scanExposesSetOperationOrdinal(ctx, m1(s.InputScan()))
+	case *googlesql.ResolvedSampleScan:
+		return scanExposesSetOperationOrdinal(ctx, m1(s.InputScan()))
+	case *googlesql.ResolvedArrayScan:
+		if m1(s.InputScan()) == nil {
+			// No input: ArrayScanNode projects the element/offset columns
+			// only.
+			return false
+		}
+		return scanExposesSetOperationOrdinal(ctx, m1(s.InputScan()))
+	case *googlesql.ResolvedJoinScan:
+		if m1(s.JoinType()) == googlesql.ResolvedJoinScanEnums_JoinTypeLeft {
+			return false
+		}
+		l := scanExposesSetOperationOrdinal(ctx, m1(s.LeftScan()))
+		r := scanExposesSetOperationOrdinal(ctx, m1(s.RightScan()))
+		return l != r
+	case *googlesql.ResolvedWithScan:
+		inner := map[string]bool{}
+		for k, v := range cteSetOperationOrdinals(ctx) {
+			inner[k] = v
+		}
+		innerCtx := withCteSetOperationOrdinals(ctx, inner)
+		for _, entry := range m1(s.WithEntryList()) {
+			name, _ := entry.WithQueryName()
+			inner[name] = scanExposesSetOperationOrdinal(innerCtx, m1(entry.WithSubquery()))
+		}
+		return scanExposesSetOperationOrdinal(innerCtx, m1(s.Query()))
+	}
+	return false
+}
+
+// reprojectScanColumns wraps an already-rendered scan SQL so its output is
+// exactly `cols`. Splice sites that paste a formatted scan into a
+// fixed-column context (INSERT ... SELECT, MERGE USING, recursive-CTE
+// union branches) call this whenever scanExposesSetOperationOrdinal says a
+// helper column may ride along, which guarantees by construction that the
+// consumer sees the resolver's column list and nothing else. `ctx` must be
+// the same context the scan was formatted under (uniqueColumnName depends
+// on its naming flags).
+func reprojectScanColumns(ctx context.Context, sql string, cols []*googlesql.ResolvedColumn) string {
+	names := make([]string, 0, len(cols))
+	for _, col := range cols {
+		names = append(names, fmt.Sprintf("\"%s\"", uniqueColumnName(ctx, col)))
+	}
+	return fmt.Sprintf("SELECT %s FROM (%s)", strings.Join(names, ","), sql)
+}
+
+// setOperationOrdinalRowNumber returns the row_number() window expression
+// used to stamp a deterministic per-row ordinal over `scan`'s rendered
+// rows: anchored on the set-operation ordinal when the scan exposes it,
+// engine row order otherwise. Shared by every stamp site (left-join
+// anchor, window row_id, aggregate input ordinal, array-subquery ordinal,
+// unnest input ordinal) so anchoring decisions stay AST-derived and
+// uniform.
+func setOperationOrdinalRowNumber(ctx context.Context, scan googlesql.ResolvedNode) string {
+	if scanExposesSetOperationOrdinal(ctx, scan) {
+		return fmt.Sprintf("row_number() OVER (ORDER BY \"%s\")", setOperationOrdinalColumn)
+	}
+	return "row_number() OVER ()"
 }
 
 // cteMaterializeHint returns either " MATERIALIZED" (with a leading
@@ -2884,7 +7345,7 @@ func (n *InsertStmtNode) FormatSQL(ctx context.Context) (string, error) {
 	for _, col := range insertCols {
 		name := m1(col.Name())
 		insertedNames[name] = struct{}{}
-		columns = append(columns, fmt.Sprintf("`%s`", name))
+		columns = append(columns, fmt.Sprintf("\"%s\"", name))
 	}
 	// Collect any column DEFAULT expressions for columns the INSERT
 	// omitted. Splicing them into the rewritten INSERT here is what
@@ -2892,38 +7353,134 @@ func (n *InsertStmtNode) FormatSQL(ctx context.Context) (string, error) {
 	// substitute the default — bqe#211.
 	defaults := missingColumnDefaults(ctx, table, insertedNames)
 	for _, d := range defaults {
-		columns = append(columns, fmt.Sprintf("`%s`", d.name))
+		columns = append(columns, fmt.Sprintf("\"%s\"", d.name))
 	}
 	query, _ := n.node.Query()
 	if query != nil {
-		stmt, err := newNode(query).FormatSQL(withUseColumnID(ctx))
+		queryCtx := withUseColumnID(ctx)
+		stmt, err := newNode(query).FormatSQL(queryCtx)
 		if err != nil {
 			return "", err
+		}
+		// INSERT consumes the spliced query positionally against a fixed
+		// column list, so the splice boundary must expose exactly the
+		// resolver's QueryOutputColumnList. When the query root's own
+		// projection carries the set-operation ordinal helper column
+		// (a bare `INSERT ... SELECT 1 UNION ALL SELECT 2` resolves to
+		// the SetOperationScan itself — no ProjectScan above it), the
+		// helper would land as an extra inserted column. Re-project by
+		// construction, keyed off the AST exposure signal.
+		if scanExposesSetOperationOrdinal(ctx, query) {
+			outCols := m1(n.node.QueryOutputColumnList())
+			if len(outCols) == 0 {
+				outCols = m1(query.MutableColumnList())
+			}
+			stmt = reprojectScanColumns(queryCtx, stmt, outCols)
 		}
 		// INSERT ... SELECT form: extending the column list would
 		// require rewriting the SELECT to project the defaults too.
 		// Skip default substitution here — defaults still apply to
 		// the VALUES form, which covers the common case.
 		_ = defaults
-		return fmt.Sprintf("INSERT INTO `%s` (%s) %s",
+		// Native-storage seam (same as the VALUES form below): JSON /
+		// NUMERIC / BYTES target columns must receive their storage
+		// representation, but a projected googlesqlite_* UDF result is
+		// still an envelope VARCHAR. When any targeted column needs it,
+		// re-project the SELECT through a positional column-alias
+		// subquery (FROM (...) AS src(c0, c1, ...)) with the per-kind
+		// normalizers; native projections pass through them unchanged.
+		needsWrap := false
+		for _, col := range insertCols {
+			if t, err := col.Type(); err == nil && t != nil {
+				if k, err := t.Kind(); err == nil {
+					switch k {
+					case googlesql.TypeKindTypeJson, googlesql.TypeKindTypeNumeric, googlesql.TypeKindTypeBytes:
+						needsWrap = true
+					}
+				}
+			}
+		}
+		if needsWrap {
+			aliases := make([]string, len(insertCols))
+			projs := make([]string, len(insertCols))
+			for i, col := range insertCols {
+				alias := fmt.Sprintf(`"__gsx_ins_c%d"`, i)
+				aliases[i] = alias
+				projs[i] = alias
+				if t, err := col.Type(); err == nil && t != nil {
+					if k, err := t.Kind(); err == nil {
+						switch k {
+						case googlesql.TypeKindTypeJson:
+							projs[i] = fmt.Sprintf("googlesqlite_to_native_json(%s)", alias)
+						case googlesql.TypeKindTypeNumeric:
+							projs[i] = numericStorageReadSQL(alias)
+						case googlesql.TypeKindTypeBytes:
+							projs[i] = bytesStorageReadSQL(alias)
+						}
+					}
+				}
+			}
+			stmt = fmt.Sprintf("SELECT %s FROM (%s) AS __gsx_ins_src(%s)",
+				strings.Join(projs, ","), stmt, strings.Join(aliases, ","))
+		}
+		return fmt.Sprintf("INSERT INTO \"%s\" (%s) %s",
 			table,
 			strings.Join(columns[:len(insertCols)], ","),
 			stmt,
 		), nil
 	}
+	// DuckDB retarget: JSON columns are native-typed (spec.go maps
+	// TypeKindTypeJson to a JSON column), but JSON-producing
+	// expressions (googlesqlite_parse_json / to_json UDF calls and the
+	// JSON literal lowering) emit the value-layer base64 envelope,
+	// which fails DuckDB's VARCHAR->JSON cast at execution time
+	// ("Malformed JSON at byte 0 ... eyJoZWFkZXIi..."). Wrap each
+	// value headed for a JSON column in googlesqlite_to_native_json,
+	// which unwraps the envelope to raw JSON text and passes already-
+	// native values (bound params) through untouched.
+	// The native-storage NUMERIC / BYTES columns need the analogous
+	// normalization (numericStorageReadSQL / bytesStorageReadSQL): a
+	// stored cell must be the native DECIMAL(38,9) / payload BLOB, but a
+	// googlesqlite_* UDF result still arrives as the envelope VARCHAR.
+	// Native value expressions (literals, params, operator results) pass
+	// through the wraps unchanged.
+	colKinds := make([]googlesql.TypeKind, len(insertCols))
+	for i, col := range insertCols {
+		colKinds[i] = googlesql.TypeKindTypeUnknown
+		if t, err := col.Type(); err == nil && t != nil {
+			if k, err := t.Kind(); err == nil {
+				colKinds[i] = k
+			}
+		}
+	}
 	rows := []string{}
 	for _, row := range m1(n.node.RowList()) {
-		sql, err := newNode(row).FormatSQL(ctx)
-		if err != nil {
-			return "", err
+		valueNodes := m1(row.ValueList())
+		values := make([]string, 0, len(valueNodes))
+		for i, valueNode := range valueNodes {
+			sql, err := newNode(valueNode).FormatSQL(ctx)
+			if err != nil {
+				return "", err
+			}
+			if i < len(colKinds) && sql != "" {
+				switch colKinds[i] {
+				case googlesql.TypeKindTypeJson:
+					sql = fmt.Sprintf("googlesqlite_to_native_json(%s)", sql)
+				case googlesql.TypeKindTypeNumeric:
+					sql = numericStorageReadSQL(sql)
+				case googlesql.TypeKindTypeBytes:
+					sql = bytesStorageReadSQL(sql)
+				}
+			}
+			values = append(values, sql)
 		}
-		full := sql
+		full := strings.Join(values, ",")
 		for _, d := range defaults {
 			full += "," + d.expr
 		}
 		rows = append(rows, fmt.Sprintf("(%s)", full))
 	}
-	return fmt.Sprintf("INSERT INTO `%s` (%s) VALUES %s",
+	return fmt.Sprintf("INSERT INTO \"%s\" (%s) VALUES %s",
 		table,
 		strings.Join(columns, ","),
 		strings.Join(rows, ","),
@@ -2970,7 +7527,7 @@ func (n *DeleteStmtNode) FormatSQL(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf(
-		"DELETE FROM `%s` WHERE %s",
+		"DELETE FROM \"%s\" WHERE %s",
 		table,
 		where,
 	), nil
@@ -2994,6 +7551,25 @@ func (n *UpdateItemNode) FormatSQL(ctx context.Context) (string, error) {
 		return "", err
 	} else if ok {
 		return rewritten, nil
+	}
+	// Same native-storage seam as InsertStmtNode: a native JSON /
+	// NUMERIC / BYTES target column rejects (or would mis-store) the
+	// value-layer envelope that googlesqlite_* UDF expressions emit, so
+	// normalize to the storage representation at assignment time —
+	// native value expressions pass through the wraps unchanged.
+	// Applied only on the whole-column path — struct-field assignments
+	// (above) live inside envelope storage and keep the envelope form.
+	if t, terr := targetNode.Type(); terr == nil && t != nil && setValue != "" {
+		if k, kerr := t.Kind(); kerr == nil {
+			switch k {
+			case googlesql.TypeKindTypeJson:
+				setValue = fmt.Sprintf("googlesqlite_to_native_json(%s)", setValue)
+			case googlesql.TypeKindTypeNumeric:
+				setValue = numericStorageReadSQL(setValue)
+			case googlesql.TypeKindTypeBytes:
+				setValue = bytesStorageReadSQL(setValue)
+			}
+		}
 	}
 	target, err := newNode(targetNode).FormatSQL(targetCtx)
 	if err != nil {
@@ -3085,7 +7661,7 @@ func (n *UpdateStmtNode) FormatSQL(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf(
-		"UPDATE `%s` SET %s WHERE %s",
+		"UPDATE \"%s\" SET %s WHERE %s",
 		table,
 		strings.Join(updateItems, ","),
 		where,
@@ -3096,5 +7672,5 @@ func (n *ArgumentRefNode) FormatSQL(ctx context.Context) (string, error) {
 	if n.node == nil {
 		return "", nil
 	}
-	return fmt.Sprintf("@%s", m1(n.node.Name())), nil
+	return fmt.Sprintf("$%s", m1(n.node.Name())), nil
 }

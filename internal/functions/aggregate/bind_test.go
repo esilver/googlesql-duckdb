@@ -420,6 +420,57 @@ func TestBindArrayAgg(t *testing.T) {
 	if got := mustDone(t, a); got != nil {
 		t.Fatalf("empty ARRAY_AGG: got %v; want nil", got)
 	}
+
+	// Inline LIMIT keeps only the first N unordered values.
+	a = newAgg(t, BindArrayAgg())
+	limit2, _ := helper.LIMIT(2)
+	for _, v := range []int64{1, 2, 3, 4} {
+		if err := a.Step(v, limit2); err != nil {
+			t.Fatal(err)
+		}
+	}
+	arr, err = doneValue(t, a).ToArray()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(arr.Values) != 2 {
+		t.Fatalf("ARRAY_AGG LIMIT 2 length = %d; want 2", len(arr.Values))
+	}
+	for i, want := range []int64{1, 2} {
+		got, err := arr.Values[i].ToInt64()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("ARRAY_AGG LIMIT 2[%d] = %d; want %d", i, got, want)
+		}
+	}
+
+	// ORDER BY with LIMIT keeps only the current top N rows instead of
+	// buffering the full group until Done.
+	a = newAgg(t, BindArrayAgg())
+	for _, v := range []int64{10, 40, 20, 30} {
+		orderBy, _ := helper.ORDER_BY(value.IntValue(v), false)
+		if err := a.Step(v, orderBy, limit2); err != nil {
+			t.Fatal(err)
+		}
+	}
+	arr, err = doneValue(t, a).ToArray()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(arr.Values) != 2 {
+		t.Fatalf("ARRAY_AGG ORDER BY DESC LIMIT 2 length = %d; want 2", len(arr.Values))
+	}
+	for i, want := range []int64{40, 30} {
+		got, err := arr.Values[i].ToInt64()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("ARRAY_AGG ORDER BY DESC LIMIT 2[%d] = %d; want %d", i, got, want)
+		}
+	}
 }
 
 // ---------------- STRING_AGG ----------------

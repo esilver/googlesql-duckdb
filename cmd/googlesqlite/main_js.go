@@ -11,10 +11,11 @@
 // timezone database), and a synchronous js.Func that blocked on such
 // I/O would deadlock the Go scheduler.
 //
-// The database is a single file on the Origin Private File System,
-// reached through the "opfs" VFS (see opfsvfs_js.go). SQLite reads and
-// writes it directly, so it persists across reloads with no explicit
-// save step — the page does not export or import a database image.
+// The database is in-memory only: the pure-Go DuckDB engine behind
+// this build has no browser filesystem, so nothing persists across a
+// reload. (The previous SQLite-backed build kept the database in an
+// OPFS file; restoring persistence is future work on the engine's FS
+// seam.)
 package main
 
 import (
@@ -29,20 +30,12 @@ import (
 	"github.com/goccy/googlesqlite/internal/cli"
 )
 
-const (
-	// playgroundDSN opens the Playground database on the OPFS-backed
-	// VFS. journal_mode=memory and temp_store=memory keep SQLite from
-	// opening a rollback journal or temporary files, so the VFS only
-	// ever serves the single persistent database file (opfsvfs_js.go).
-	playgroundDSN = "file:/googlesqlite.db?vfs=" + opfsVFSName +
-		"&_pragma=journal_mode(memory)&_pragma=temp_store(memory)"
-
-	// fallbackDSN backs the database with the in-process "memdb" VFS
-	// when OPFS is unavailable — a non-secure context, e.g. plain HTTP
-	// over a LAN IP, where navigator.storage is absent. The engine
-	// still runs; the database just does not persist across reloads.
-	fallbackDSN = "file:/googlesqlite.db?vfs=memdb"
-)
+// playgroundDSN is the Playground data source. The DuckDB-backed
+// engine maps every in-memory form to its single in-process database;
+// a bare ":memory:" keeps the translation in duckdbDSN trivial. v1 of
+// the in-browser build is :memory:-only — OPFS persistence (the old
+// SQLite-VFS path) is intentionally not wired.
+const playgroundDSN = ":memory:"
 
 // app holds the stateful Playground session. Every exported operation
 // runs under mu, so concurrent JS calls are serialised.
@@ -55,21 +48,12 @@ type app struct {
 }
 
 func main() {
-	registerOPFSVFS()
-
 	a := &app{
 		ctx:     context.Background(),
 		history: &cli.History{},
 		sink:    &strings.Builder{},
 	}
-	// worker.ts publishes the OPFS database handle before starting this
-	// program; its absence means OPFS is unavailable, so fall back to
-	// the non-persistent in-memory VFS.
-	dsn := fallbackDSN
-	if js.Global().Get(dbHandleGlobal).Truthy() {
-		dsn = playgroundDSN
-	}
-	runner, err := cli.NewRunner(a.ctx, dsn)
+	runner, err := cli.NewRunner(a.ctx, playgroundDSN)
 	if err != nil {
 		consoleError("googlesqlite: init failed: " + err.Error())
 		return
@@ -223,7 +207,7 @@ func (a *app) listTables(_ js.Value, _ []js.Value) any {
 }
 
 // setDebug toggles whether rendered output includes the translated
-// SQLite query.
+// DuckDB query.
 func (a *app) setDebug(_ js.Value, args []js.Value) any {
 	on := len(args) > 0 && args[0].Truthy()
 	return a.promise(func() (any, error) {
@@ -240,9 +224,11 @@ func entryToJS(e cli.HistoryEntry) map[string]any {
 	for i, row := range e.Rows {
 		rows[i] = stringsToJS(row)
 	}
+	translatedQuery := e.TranslatedQuery()
 	return map[string]any{
 		"statement":    e.Statement,
-		"sqliteQuery":  e.SQLiteQuery,
+		"duckdbQuery":  translatedQuery,
+		"sqliteQuery":  translatedQuery,
 		"isQuery":      e.IsQuery,
 		"columns":      stringsToJS(e.Columns),
 		"rows":         rows,

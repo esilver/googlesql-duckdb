@@ -2,6 +2,7 @@ package internal
 
 import (
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -51,6 +52,61 @@ var bindBool = helper.Scalar1KeepNull(func(v value.Value) (value.Value, error) {
 var bindInt64 = helper.Scalar1KeepNull(func(v value.Value) (value.Value, error) {
 	return v, nil
 })
+
+func bindTypeof(args ...value.Value) (value.Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("TYPEOF: invalid number of arguments: got %d, want 1", len(args))
+	}
+	return value.StringValue(typeNameForValue(args[0])), nil
+}
+
+func typeNameForValue(v value.Value) string {
+	if v == nil {
+		return "INT64"
+	}
+	switch v.(type) {
+	case value.BoolValue:
+		return "BOOL"
+	case value.IntValue:
+		return "INT64"
+	case value.FloatValue:
+		return "DOUBLE"
+	case value.StringValue:
+		return "STRING"
+	case value.BytesValue:
+		return "BYTES"
+	case value.JsonValue:
+		return "JSON"
+	case value.DateValue:
+		return "DATE"
+	case value.DatetimeValue:
+		return "DATETIME"
+	case value.TimeValue:
+		return "TIME"
+	case value.TimestampValue:
+		return "TIMESTAMP"
+	case *value.IntervalValue:
+		return "INTERVAL"
+	case *value.ArrayValue:
+		return "ARRAY"
+	case *value.StructValue:
+		return "STRUCT"
+	case *value.RangeValue:
+		return "RANGE"
+	case *value.NumericValue:
+		if v.(*value.NumericValue).IsBigNumeric {
+			return "BIGNUMERIC"
+		}
+		return "NUMERIC"
+	case *value.GeographyValue:
+		return "GEOGRAPHY"
+	}
+	t := reflect.TypeOf(v)
+	if t == nil {
+		return "INT64"
+	}
+	return strings.ToUpper(strings.TrimPrefix(t.String(), "value."))
+}
 
 // bindDouble implements `FLOAT64(json_expr[, wide_number_mode])`.
 // Strict: errors on non-numeric JSON. wide_number_mode controls
@@ -120,6 +176,28 @@ func bindIgnoreNulls(args ...value.Value) (value.Value, error) {
 		return nil, fmt.Errorf("IGNORE_NULLS: invalid number of arguments: got %d, want 0", len(args))
 	}
 	return helper.IGNORE_NULLS()
+}
+
+func bindLimit(args ...value.Value) (value.Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("LIMIT: invalid number of arguments: got %d, want 1", len(args))
+	}
+	limit, err := args[0].ToInt64()
+	if err != nil {
+		return nil, err
+	}
+	return helper.LIMIT(limit)
+}
+
+func bindOrderBy(args ...value.Value) (value.Value, error) {
+	if len(args) != 2 {
+		return nil, fmt.Errorf("ORDER_BY: invalid number of arguments: got %d, want 2", len(args))
+	}
+	isAsc, err := args[1].ToBool()
+	if err != nil {
+		return nil, err
+	}
+	return helper.ORDER_BY(args[0], isAsc)
 }
 
 var bindWindowRowID = helper.Scalar1(func(v value.Value) (value.Value, error) {

@@ -6,17 +6,17 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"net/url"
+	"os"
 	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
 
 	googlesql "github.com/goccy/go-googlesql"
-	sqlite3 "github.com/ncruces/go-sqlite3"
-	sqlitedriver "github.com/ncruces/go-sqlite3/driver"
+	duckdb "github.com/goccy/googlesqlite/internal/duckdbgo"
 
 	internal "github.com/goccy/googlesqlite/internal"
-	"github.com/goccy/googlesqlite/internal/sqlitex"
 )
 
 // dsnParts splits a googlesqlite DSN into the filename portion the SQLite
@@ -38,15 +38,60 @@ func dsnParts(dsn string) (path, query string) {
 	return dsn, ""
 }
 
+// WasmCompilationMode selects how the embedded GoogleSQL wasm module
+// is executed.
+//
+// Deprecated: since go-googlesql moved from the wazero interpreter to a
+// wasm2go-transpiled native-Go module (github.com/goccy/googlesqlwasm2go),
+// there is no wasm runtime to configure. The type and its constants are
+// retained for source compatibility only and have no effect.
+type WasmCompilationMode string
+
+const (
+	// WasmCompilationModeInterpreter is retained for source
+	// compatibility; the analyzer now always runs as ordinary Go code.
+	//
+	// Deprecated: no effect; see WasmCompilationMode.
+	WasmCompilationModeInterpreter WasmCompilationMode = "interpreter"
+	// WasmCompilationModeCompiler is retained for source compatibility;
+	// the analyzer now always runs as ordinary Go code.
+	//
+	// Deprecated: no effect; see WasmCompilationMode.
+	WasmCompilationModeCompiler WasmCompilationMode = "compiler"
+)
+
+// Environment variables that previously configured the embedded
+// GoogleSQL wasm runtime. The analyzer is now a wasm2go-transpiled
+// native-Go module, so both are ignored.
+const (
+	// EnvWasmCompilationMode previously selected the wazero execution
+	// engine.
+	//
+	// Deprecated: ignored; the analyzer runs as ordinary Go code.
+	EnvWasmCompilationMode = "GOOGLESQLITE_WASM_COMPILATION_MODE"
+	// EnvWasmCacheDir previously pointed the wazero compilation cache
+	// at a directory.
+	//
+	// Deprecated: ignored; there is no wasm compilation step.
+	EnvWasmCacheDir = "GOOGLESQLITE_WASM_CACHE_DIR"
+)
+
 // ensureGoogleSQLInit initialises the embedded GoogleSQL WASM runtime
 // once per process. Subsequent calls are no-ops (Init uses sync.Once).
 // It is invoked on the first sql.Open of a googlesqlite DB.
 //
-// The runtime is the wasm2go-transpiled module — already AOT-compiled
-// into Go at generation time — so there is no runtime compilation
-// mode to pick and no on-disk cache to configure.
+// It also primes the one-time spatial-extension load here, inside the same
+// process-init barrier. Because this runs under sync.OnceValue, the first
+// open blocks every other open until it returns, so the single INSTALL/LOAD
+// of the spatial extension completes while the process is still effectively
+// single-threaded - before any concurrent query reaches DuckDB's
+// duckdb_execute_pending. That ordering is what keeps the extension loader
+// from racing the steady-state query stream (see loadSpatialExtension).
 var ensureGoogleSQLInit = sync.OnceValue(func() error {
-	return googlesql.Init()
+	if err := googlesql.Init(); err != nil {
+		return err
+	}
+	return loadSpatialExtension(nil)
 })
 
 var (
@@ -62,73 +107,110 @@ var (
 )
 
 // internalDriverName is the database/sql driver name for the raw
-// SQLite engine that backs every googlesqlite query. It registers
-// every custom function and collation defined in
-// internal.RegisterFunctions on each new connection.
-const internalDriverName = "googlesqlite_sqlite3"
+// engine that backs every googlesqlite query. The DuckDB fork routes
+// formatter-emitted SQL straight to the duckdb-go driver registered as
+// "duckdb"; we open it through that registered driver via a thin
+// connector wrapper that only rewrites the DSN.
+const internalDriverName = "googlesqlite_duckdb"
 
 func init() {
 	sql.Register("googlesqlite", &Driver{})
-	sql.Register(internalDriverName, &internalSQLiteDriver{})
+	sql.Register(internalDriverName, &internalDuckDBDriver{})
 }
 
-// internalSQLiteDriver wraps ncruces/go-sqlite3 and runs the
-// googlesqlite function registration on every new connection.
-type internalSQLiteDriver struct{}
-
-func (internalSQLiteDriver) Open(name string) (driver.Conn, error) {
-	path, _ := dsnParts(name)
-	conn, err := (&sqlitedriver.SQLite{}).Open(path)
-	if err != nil {
-		return nil, err
-	}
-	rawConn, ok := conn.(sqlitedriver.Conn)
-	if !ok {
-		_ = conn.Close()
-		return nil, fmt.Errorf("googlesqlite: unexpected ncruces conn type %T", conn)
-	}
-	raw := rawConn.Raw()
-	// The predecessor's value layer emits double-quoted base64 string
-	// literals into rewritten SQL. Modern SQLite (and the ncruces
-	// build) treat double-quoted tokens as identifiers by default; we
-	// need DQS enabled so the rewritten SQL parses as the predecessor
-	// expected.
-	if _, err := raw.Config(sqlite3.DBCONFIG_DQS_DDL, true); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("googlesqlite: enable DQS_DDL: %w", err)
-	}
-	if _, err := raw.Config(sqlite3.DBCONFIG_DQS_DML, true); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("googlesqlite: enable DQS_DML: %w", err)
-	}
-	// Allow user-registered functions to be referenced from inside
-	// views and triggers. Without this, SQLite's safety check refuses
-	// to evaluate googlesqlite_*-flavoured calls embedded in view
-	// definitions.
-	if _, err := raw.Config(sqlite3.DBCONFIG_TRUSTED_SCHEMA, true); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("googlesqlite: enable TRUSTED_SCHEMA: %w", err)
-	}
-	if err := internal.RegisterFunctions(raw); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("googlesqlite: register functions: %w", err)
-	}
-	// INFORMATION_SCHEMA virtual tables are bound to the per-DSN
-	// catalog. The googlesqlite top-level Driver.Open populates
-	// nameToCatalogMap[name] before triggering db.Conn(), which
-	// is what eventually drives this Open. The catalog is therefore
-	// always present at this point (sequential, single-DSN flow).
-	nameToValueMapMu.Lock()
-	catalog := nameToCatalogMap[name]
-	nameToValueMapMu.Unlock()
-	if catalog != nil {
-		if err := internal.RegisterInfoSchemaModules(raw, catalog); err != nil {
-			_ = conn.Close()
-			return nil, fmt.Errorf("googlesqlite: register info-schema modules: %w", err)
+// duckdbDSN translates a googlesqlite-style DSN into one DuckDB accepts.
+// SQLite URI forms (file::memory:?cache=shared, :memory:?<opts>) and the
+// engine's per-open `_googlesqlite_id` freshness suffix are SQLite-only;
+// DuckDB rejects unknown options, so any in-memory variant collapses to a
+// DuckDB in-memory DSN. A plain on-disk path is passed through after stripping
+// the leading "file:" scheme and SQLite-only query params. DuckDB-native
+// allowlisted params are preserved.
+func duckdbDSN(name string) string {
+	path, query := dsnParts(name)
+	if query == "" {
+		if i := strings.IndexByte(path, '?'); i >= 0 {
+			query = path[i+1:]
 		}
 	}
-	sqlitex.SetVariableNumberLimit(raw, -1)
-	return conn, nil
+	duckParams := duckDBQueryParams(query)
+	// Any in-memory variant -> DuckDB in-memory. The ncruces "memdb"
+	// VFS (the CLI's default DSN, file:/NAME?vfs=memdb) is a
+	// process-shared in-memory database keyed by its path; mapping it
+	// to a root-level on-disk file fails on DuckDB (errno 30). The
+	// DSN-keyed *sql.DB cache in newDBAndCatalog already shares one
+	// engine per full DSN string, which reproduces memdb's
+	// shared-by-name semantics on a DuckDB in-memory database.
+	if path == ":memory:" ||
+		strings.HasPrefix(name, "file::memory:") ||
+		strings.Contains(name, "mode=memory") ||
+		strings.Contains(name, "vfs=memdb") {
+		if duckParams != "" {
+			return ":memory:?" + duckParams
+		}
+		return ""
+	}
+	// On-disk: strip the file: scheme DuckDB does not parse, and drop
+	// SQLite-only query params (cache=shared etc).
+	path = strings.TrimPrefix(path, "file:")
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
+	if path != "" {
+		if st, err := os.Stat(path); err == nil && st.Mode().IsRegular() && st.Size() == 0 {
+			_ = os.Remove(path)
+		}
+	}
+	if duckParams != "" {
+		return path + "?" + duckParams
+	}
+	return path
+}
+
+func duckDBQueryParams(query string) string {
+	values, err := url.ParseQuery(query)
+	if err != nil {
+		return ""
+	}
+	out := url.Values{}
+	for _, key := range []string{"max_memory", "memory_limit"} {
+		for _, value := range values[key] {
+			if value != "" {
+				out.Add(key, value)
+			}
+		}
+	}
+	return out.Encode()
+}
+
+// internalDuckDBDriver runs formatter-emitted SQL on duckdb-go. The
+// SQLite-specific connection setup (DQS config, TRUSTED_SCHEMA, the ~348
+// googlesqlite_* UDF registrations and INFORMATION_SCHEMA vtab modules)
+// is intentionally omitted for the Milestone-0 spine: the tracer-bullet
+// queries (SELECT 1, CREATE/INSERT/COUNT over scalar columns) use only
+// native DuckDB SQL and bind no googlesqlite_* function. Retargeting the
+// UDF layer to DuckDB scalar/aggregate UDFs is the Milestone-1 work item.
+type internalDuckDBDriver struct{}
+
+// internalDuckDBDriver must implement driver.DriverContext: without
+// OpenConnector, database/sql wraps the driver in its dsnConnector
+// fallback and calls Open once per POOLED CONNECTION — and the engine
+// driver's raw Open creates a brand-new wasm engine (~200MB, no
+// googlesqlite_* UDFs) per call. Any second pooled connection (forced
+// by a held transaction or concurrent load) then ran on a fresh,
+// UDF-less engine ("Scalar Function with name googlesqlite_in_array
+// does not exist"). Delegating to the engine driver's connector shares
+// ONE engine + database across the whole pool.
+var _ driver.DriverContext = internalDuckDBDriver{}
+
+func (internalDuckDBDriver) Open(name string) (driver.Conn, error) {
+	return duckdb.Driver{}.Open(duckdbDSN(name))
+}
+
+// OpenConnector implements driver.DriverContext by handing back the
+// engine driver's connector (one shared engine + database; a fresh
+// duckdb_connection per Connect).
+func (internalDuckDBDriver) OpenConnector(name string) (driver.Connector, error) {
+	return duckdb.Driver{}.OpenConnector(duckdbDSN(name))
 }
 
 func newDBAndCatalog(name string) (*sql.DB, *internal.Catalog, error) {
@@ -144,6 +226,26 @@ func newDBAndCatalog(name string) (*sql.DB, *internal.Catalog, error) {
 	db, err := sql.Open(internalDriverName, name)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open database by %s: %w", name, err)
+	}
+	// duckdb-go shares one underlying in-memory database across every
+	// connection minted from the same connector, so DDL on one pooled
+	// connection is visible to queries on another. We deliberately do NOT
+	// pin MaxOpenConns(1): the engine issues nested statements during
+	// query execution, and a single-connection pool deadlocks them.
+	if err := registerDuckDBUDFs(db); err != nil {
+		return nil, nil, err
+	}
+	if err := registerDuckDBJSONUDFs(db); err != nil {
+		return nil, nil, err
+	}
+	if err := registerDuckDBGeography(db); err != nil {
+		return nil, nil, err
+	}
+	if err := registerDuckDBAggregates(db); err != nil {
+		return nil, nil, err
+	}
+	if err := registerKLLExtractScalars(db); err != nil {
+		return nil, nil, err
 	}
 	catalog := internal.NewCatalog(db)
 	nameToDBMap[name] = db
@@ -219,6 +321,21 @@ func (d *Driver) OpenConnector(name string) (driver.Connector, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to open database by %s: %w", name, err)
 		}
+		if err := registerDuckDBUDFs(inner); err != nil {
+			return nil, err
+		}
+		if err := registerDuckDBJSONUDFs(inner); err != nil {
+			return nil, err
+		}
+		if err := registerDuckDBGeography(inner); err != nil {
+			return nil, err
+		}
+		if err := registerDuckDBAggregates(inner); err != nil {
+			return nil, err
+		}
+		if err := registerKLLExtractScalars(inner); err != nil {
+			return nil, err
+		}
 		catalog := internal.NewCatalog(inner)
 		nameToValueMapMu.Lock()
 		nameToCatalogMap[innerName] = catalog
@@ -277,6 +394,22 @@ func freshMemoryDSN(name string) string {
 	return name + "?" + suffix
 }
 
+// RawEngineDB returns the raw-engine *sql.DB the googlesqlite driver is
+// sharing for the given DSN, if one is currently open. Callers that need
+// raw-engine reads (the CLI's .tables/.functions catalog queries) MUST use
+// this handle rather than sql.Open a second engine on the same DSN:
+// duckdb-go-pure >= v0.3.3 enforces DuckDB's single-instance file lock, so
+// a second engine on the same on-disk database fails with "Conflicting
+// lock is held". The returned handle is owned by the driver — callers must
+// not Close it. Private in-memory connectors (bare :memory:) are connector-
+// owned and not in the DSN cache; they report false.
+func RawEngineDB(name string) (*sql.DB, bool) {
+	nameToValueMapMu.Lock()
+	defer nameToValueMapMu.Unlock()
+	db, ok := nameToDBMap[name]
+	return db, ok
+}
+
 var _ driver.DriverContext = (*Driver)(nil)
 
 type Conn struct {
@@ -294,11 +427,15 @@ type Conn struct {
 	// happily hands a Conn whose inner handle has been closed by a
 	// cancelled tx's discardConn rollback to the next caller, which
 	// then surfaces a confusing "sql: connection is already closed"
-	// 500 on every subsequent request (see IsValid and the
-	// translateConnDone defers below). The dead flag is read by IsValid
-	// and written from any goroutine that drove the failing operation;
-	// concurrent writes are harmless because they all store the same
-	// value (true).
+	// error on every subsequent request (see IsValid and the
+	// translateConnDone defers below). On this fork the exposure is
+	// larger than upstream's: every pooled Conn shares one DuckDB
+	// engine, so a wedged Conn is a wedged slot against the shared
+	// engine. The dead flag is read by IsValid and written from any
+	// goroutine that drove the failing operation; concurrent writes are
+	// harmless because they all store the same value (true).
+	//
+	// Ported from upstream goccy/googlesqlite bf326675 (issue #12).
 	dead atomic.Bool
 }
 
@@ -311,8 +448,30 @@ type Conn struct {
 // handle had been closed (typically by a request whose context was
 // cancelled mid-statement; database/sql's tx watcher then ran
 // Rollback(discardConn=true) on the inner connection).
+//
+// A non-nil c.tx at validation time is the second poisoned state: a
+// driver conn can only re-enter the pool with an open driver-level
+// transaction when the OUTER tx was discarded by its context watcher
+// (expiry/cancel mid-statement — e.g. a watchdog budget interrupting a
+// runaway statement) WITHOUT calling Tx.Rollback on us. The inner tx
+// watcher has closed (or is about to close) the inner conn, so the
+// next caller would eat one "driver: bad connection" — fatal on a
+// dedicated sql.Conn, where database/sql cannot retry. Reporting
+// invalid here makes the pool prune us at put-back/fetch instead.
 func (c *Conn) IsValid() bool {
-	return !c.dead.Load()
+	return !c.dead.Load() && c.tx == nil
+}
+
+// ResetSession implements driver.SessionResetter as a second line of
+// defense for the same poisoned states IsValid covers: database/sql
+// calls it on every cached-conn fetch and silently swaps in a fresh
+// conn when it reports driver.ErrBadConn, so the caller never observes
+// the dead conn even if it slipped past put-back validation.
+func (c *Conn) ResetSession(_ context.Context) error {
+	if c.dead.Load() || c.tx != nil {
+		return driver.ErrBadConn
+	}
+	return nil
 }
 
 // translateConnDone is the single point that converts the inner
@@ -346,11 +505,31 @@ func (c *Conn) translateConnDone(err error) error {
 	return err
 }
 
+// markDeadOnExpiredTx marks the Conn dead when an operation failed
+// inside an open driver-level transaction whose context has expired.
+// The inner tx was begun on that same context, so database/sql's inner
+// tx watcher is guaranteed to discard the inner connection — but the
+// discard races the operation's return, and at put-back time the Conn
+// can look healthy (the watcher's driver Rollback has already cleared
+// c.tx, dead is unset). Without this, the conn re-enters the pool and
+// the NEXT caller eats one "driver: bad connection" — fatal on a
+// dedicated sql.Conn, where database/sql cannot retry. Observed behind
+// the bigquery-emulator statement watchdog: the v0.3.5 engine interrupt
+// kills the runaway statement, then the very next request failed.
+func (c *Conn) markDeadOnExpiredTx(ctx context.Context, e *error) {
+	if *e != nil && c.tx != nil && ctx.Err() != nil {
+		c.dead.Store(true)
+	}
+}
+
 // Static contract check: database/sql's pool only calls IsValid via a
 // type assertion against driver.Validator. Failing this assertion at
 // compile time keeps a future refactor that drops the method visible
-// instead of silently regressing the #478 fix.
-var _ driver.Validator = (*Conn)(nil)
+// instead of silently regressing the fix.
+var (
+	_ driver.Validator       = (*Conn)(nil)
+	_ driver.SessionResetter = (*Conn)(nil)
+)
 
 func newConn(db *sql.DB, catalog *internal.Catalog) (*Conn, error) {
 	conn, err := db.Conn(context.Background())
@@ -414,17 +593,81 @@ func recoverPanicAsError(e *error) {
 	if r == nil {
 		return
 	}
+	*e = panicAsError(r, *e)
+}
+
+// panicAsError formats a recovered panic value (plus the in-flight
+// error, if any) into the ordinary error the boundary returns. The
+// panic value is rendered with %v on purpose: the result must NEVER
+// satisfy errors.Is(err, driver.ErrBadConn) — a Raw callback or driver
+// entry point that surfaces ErrBadConn makes database/sql call
+// Conn.close synchronously, which deadlocks on closemu against an open
+// transaction's read lock (issue #20).
+func panicAsError(r any, prior error) error {
 	stack := debug.Stack()
-	if existing := *e; existing != nil {
-		*e = fmt.Errorf("googlesqlite: panic %v (prior error: %w)\n%s", r, existing, stack)
-	} else {
-		*e = fmt.Errorf("googlesqlite: panic %v\n%s", r, stack)
+	if prior != nil {
+		return fmt.Errorf("googlesqlite: panic %v (prior error: %w)\n%s", r, prior, stack)
 	}
+	return fmt.Errorf("googlesqlite: panic %v\n%s", r, stack)
+}
+
+// recoverPanicPoison is the Conn-bound recoverPanicAsError: the same
+// panic→error conversion, plus it marks the Conn dead so the pool
+// discards it (via IsValid / ResetSession) once the caller is done
+// with it.
+//
+// This is the issue #20 containment seam. A panic that escapes the
+// driver boundary while the caller holds an open transaction on the
+// same *sql.Conn is fatal upstream: stdlib Conn.Raw's deferred release
+// treats the panic as driver.ErrBadConn and synchronously calls
+// Conn.close, which needs the closemu WRITE lock — held as a read lock
+// by the open transaction until it ends, which it never can because
+// its rollback defer sits in a caller frame above the parked panic.
+// Permanent mid-unwind self-deadlock; every caller-held mutex is
+// orphaned (observed live as a wedged bigquery-emulator after one
+// analyzer bad_alloc, #19/#20). Recovering here returns a plain
+// non-ErrBadConn error instead: Raw skips the synchronous close, the
+// transaction unwinds through the caller's rollback defer, and the
+// poisoned Conn — whose analyzer/wasm state may be unusable after the
+// abort — is pruned at pool put-back/fetch instead.
+func (c *Conn) recoverPanicPoison(e *error) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	c.dead.Store(true)
+	*e = panicAsError(r, *e)
+}
+
+// rollbackDanglingTx clears a transaction the DuckDB engine may have
+// left open on the pooled connection after a failed statement. The
+// pure-Go engine begins an implicit transaction at PREPARE time and a
+// Binder-stage prepare failure returns without aborting it; every
+// later statement on the same connection then fails with "cannot
+// start a transaction within a transaction" (the first victim is the
+// catalog sync). Issuing a best-effort ROLLBACK clears the dangling
+// transaction; if none is open the ROLLBACK itself fails harmlessly
+// and is discarded. Never called while an explicit user transaction
+// (c.tx) is open — rolling that back is the user's decision.
+func (c *Conn) rollbackDanglingTx() {
+	if c.tx != nil {
+		return
+	}
+	// context.Background() deliberately: the statement's ctx may be the
+	// reason the statement failed (cancellation), and the rollback must
+	// still run to un-poison the pooled connection.
+	_, _ = c.conn.ExecContext(context.Background(), "ROLLBACK")
 }
 
 func (c *Conn) PrepareContext(ctx context.Context, query string) (s driver.Stmt, e error) {
 	defer func() { e = c.translateConnDone(e) }()
-	defer recoverPanicAsError(&e)
+	defer c.markDeadOnExpiredTx(ctx, &e)
+	defer func() {
+		if e != nil {
+			c.rollbackDanglingTx()
+		}
+	}()
+	defer c.recoverPanicPoison(&e)
 	conn := internal.NewConnWithOptions(c.conn, c.tx, c.systemVars, c.scriptVars, c.materializeCTE)
 	actionFuncs, err := c.analyzer.Analyze(ctx, conn, query, nil)
 	if err != nil {
@@ -447,7 +690,13 @@ func (c *Conn) PrepareContext(ctx context.Context, query string) (s driver.Stmt,
 
 func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (r driver.Result, e error) {
 	defer func() { e = c.translateConnDone(e) }()
-	defer recoverPanicAsError(&e)
+	defer c.markDeadOnExpiredTx(ctx, &e)
+	defer func() {
+		if e != nil {
+			c.rollbackDanglingTx()
+		}
+	}()
+	defer c.recoverPanicPoison(&e)
 	conn := internal.NewConnWithOptions(c.conn, c.tx, c.systemVars, c.scriptVars, c.materializeCTE)
 	actionFuncs, err := c.analyzer.Analyze(ctx, conn, query, args)
 	if err != nil {
@@ -483,7 +732,13 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 
 func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (r driver.Rows, e error) {
 	defer func() { e = c.translateConnDone(e) }()
-	defer recoverPanicAsError(&e)
+	defer c.markDeadOnExpiredTx(ctx, &e)
+	defer func() {
+		if e != nil {
+			c.rollbackDanglingTx()
+		}
+	}()
+	defer c.recoverPanicPoison(&e)
 	conn := internal.NewConnWithOptions(c.conn, c.tx, c.systemVars, c.scriptVars, c.materializeCTE)
 	actionFuncs, err := c.analyzer.Analyze(ctx, conn, query, args)
 	if err != nil {
@@ -559,12 +814,35 @@ func (tx *Tx) Commit() error {
 	defer func() {
 		tx.conn.tx = nil
 	}()
-	return tx.tx.Commit()
+	return tx.conn.markDeadOnLostTx(tx.tx.Commit())
 }
 
 func (tx *Tx) Rollback() error {
 	defer func() {
 		tx.conn.tx = nil
 	}()
-	return tx.tx.Rollback()
+	return tx.conn.markDeadOnLostTx(tx.tx.Rollback())
+}
+
+// markDeadOnLostTx inspects a driver-level Commit/Rollback result: at
+// this level database/sql calls each exactly once, so ErrTxDone means
+// the INNER tx watcher finished the transaction first (context expiry
+// mid-transaction) and has discarded — or is discarding — the inner
+// connection. ErrConnDone is the same story observed later. Either way
+// this Conn must not return to the pool; see markDeadOnExpiredTx for
+// the statement-time twin of this put-back-time check.
+func (c *Conn) markDeadOnLostTx(err error) error {
+	if err != nil && (errors.Is(err, sql.ErrTxDone) || errors.Is(err, sql.ErrConnDone)) {
+		c.dead.Store(true)
+	}
+	return err
+}
+
+// AnalysisCacheCounters reports the process-wide GoogleSQL
+// analysis-cache hit / miss counts (see internal/analysis_cache.go).
+// Repeated identical query texts (same parameter shape, no
+// intervening DDL) are served from the cache, skipping the wasm
+// analyzer entirely. Intended for observability and tests.
+func AnalysisCacheCounters() (hits, misses uint64) {
+	return internal.AnalysisCacheCounters()
 }

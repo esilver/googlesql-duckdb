@@ -4,8 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"os"
+	"sort"
 	"testing"
+	"time"
+
+	"github.com/goccy/googlesqlite"
 )
 
 // ---- from tests/parity/regression_test.go ----
@@ -466,6 +471,40 @@ func TestW_TVF_Call(t *testing.T) {
 	}
 	if lo != 3 || hi != 7 {
 		t.Errorf("pair result got (%d,%d) want (3,7)", lo, hi)
+	}
+}
+
+func TestW_TVF_ReplaceShape(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	if _, err := db.ExecContext(ctx,
+		`CREATE TABLE FUNCTION swap(x INT64) AS (SELECT x AS y)`); err != nil {
+		t.Fatalf("CREATE TABLE FUNCTION swap: %v", err)
+	}
+	var initial int64
+	if err := db.QueryRowContext(ctx, `SELECT y FROM swap(7)`).Scan(&initial); err != nil {
+		t.Fatalf("scan initial swap: %v", err)
+	}
+	if initial != 7 {
+		t.Fatalf("initial swap got %d want 7", initial)
+	}
+
+	if _, err := db.ExecContext(ctx,
+		`CREATE OR REPLACE TABLE FUNCTION swap(x STRING) AS (SELECT x AS z)`); err != nil {
+		t.Fatalf("CREATE OR REPLACE TABLE FUNCTION swap: %v", err)
+	}
+	var replaced string
+	if err := db.QueryRowContext(ctx, `SELECT z FROM swap('ok')`).Scan(&replaced); err != nil {
+		t.Fatalf("scan replaced swap: %v", err)
+	}
+	if replaced != "ok" {
+		t.Fatalf("replaced swap got %q want ok", replaced)
 	}
 }
 
@@ -1425,39 +1464,6 @@ SELECT n FROM t ORDER BY n`)
 	}
 }
 
-// TestRegression_CTENameWithHyphen: a backtick-quoted CTE name containing a
-// hyphen (valid in BigQuery) was emitted unquoted by WithEntryNode, producing
-// `near "-": syntax error`. Covers plain and RECURSIVE CTEs. goccy/googlesqlite#17
-func TestRegression_CTENameWithHyphen(t *testing.T) {
-	t.Parallel()
-	db, err := sql.Open("googlesqlite", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	ctx := context.Background()
-
-	var x int64
-	if err := db.QueryRowContext(ctx,
-		"WITH `with-hyphen` AS (SELECT 1 AS x) SELECT x FROM `with-hyphen`",
-	).Scan(&x); err != nil {
-		t.Fatalf("non-recursive hyphenated CTE failed: %v", err)
-	}
-	if x != 1 {
-		t.Errorf("non-recursive: got %d want 1", x)
-	}
-
-	var total int64
-	if err := db.QueryRowContext(ctx,
-		"WITH RECURSIVE `rec-hyphen` AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM `rec-hyphen` WHERE n < 3) SELECT SUM(n) AS total FROM `rec-hyphen`",
-	).Scan(&total); err != nil {
-		t.Fatalf("recursive hyphenated CTE failed: %v", err)
-	}
-	if total != 6 {
-		t.Errorf("recursive: got %d want 6", total)
-	}
-}
-
 // TestRegression_DDLPartitionByAccepted: bqe#152
 func TestRegression_DDLPartitionByAccepted(t *testing.T) {
 	t.Parallel()
@@ -2275,5 +2281,806 @@ func TestRegression_InUnnestArrayParam(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("got %v want %v", got, want)
 		}
+	}
+}
+
+// TestRegression_PrepareFailureDoesNotPoisonConnection asserts that a
+// DuckDB PREPARE-time failure (Binder error) does not leave a dangling
+// engine transaction on the pooled connection. The pure-Go DuckDB
+// engine begins an implicit transaction at prepare time and a Binder
+// failure returns without aborting it; before the fix every subsequent
+// statement on the connection failed its catalog sync with "cannot
+// start a transaction within a transaction".
+func TestRegression_PrepareFailureDoesNotPoisonConnection(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1) // force statement reuse of the same pooled connection
+	defer db.Close()
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "CREATE TABLE poison_repro (dt DATE, x INT64)"); err != nil {
+		t.Fatal(err)
+	}
+	// A statement that survives analysis but fails at DuckDB prepare
+	// (or used to, before the temporal-column lowering fix). Whether it
+	// fails or succeeds, it must not poison the connection.
+	rows, qerr := conn.QueryContext(ctx, "SELECT CAST(dt AS STRING) FROM poison_repro")
+	if qerr == nil {
+		rows.Close()
+	}
+	// The very next statement must work.
+	var got int64
+	if err := conn.QueryRowContext(ctx, "SELECT 1").Scan(&got); err != nil {
+		t.Fatalf("connection poisoned after prepare failure: %v", err)
+	}
+	if got != 1 {
+		t.Fatalf("got %d, want 1", got)
+	}
+	// Also exercise a guaranteed DuckDB prepare failure that survives
+	// every analyzer/formatter fix: drop the engine table behind the
+	// catalog's back, so analysis succeeds but DuckDB prepare fails
+	// with "table does not exist".
+	if _, err := conn.ExecContext(ctx, "CREATE TABLE poison_repro2 (s STRING)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Raw(func(dc any) error {
+		return dc.(*googlesqlite.Conn).RawEngineExec(ctx, `DROP TABLE "poison_repro2"`)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM poison_repro2").Scan(&got); err == nil {
+		t.Fatal("expected DuckDB prepare failure for dropped engine table")
+	}
+	// The very next statement must work: pre-fix it failed its catalog
+	// sync with "cannot start a transaction within a transaction".
+	if err := conn.QueryRowContext(ctx, "SELECT 2").Scan(&got); err != nil {
+		t.Fatalf("connection poisoned after prepare failure: %v", err)
+	}
+	if got != 2 {
+		t.Fatalf("got %d, want 2", got)
+	}
+}
+
+// TestRegression_StoredTemporalColumns asserts that stored DATE /
+// DATETIME / TIME / TIMESTAMP columns work with native temporal
+// builtins and round-trip their values exactly. Before the fix,
+// CREATE TABLE lowered every temporal column to TEXT/VARCHAR storage
+// while the expression lowering emitted native DuckDB date functions
+// on the raw column (date_part(STRING_LITERAL, VARCHAR) Binder error),
+// and DATE literals were encoded through a local-zone time.Time so
+// they stored/displayed one day early in zones west of UTC.
+func TestRegression_StoredTemporalColumns(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE temporal_repro (dt DATE, ts TIMESTAMP, dtt DATETIME, tm TIME)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO temporal_repro VALUES (DATE "2024-03-22", TIMESTAMP "2024-03-22 12:30:00", DATETIME "2024-03-22 12:30:00", TIME "12:30:00")`); err != nil {
+		t.Fatal(err)
+	}
+	var y, h int64
+	if err := db.QueryRowContext(ctx, "SELECT EXTRACT(YEAR FROM dt) FROM temporal_repro").Scan(&y); err != nil {
+		t.Fatalf("EXTRACT over stored DATE: %v", err)
+	}
+	if y != 2024 {
+		t.Fatalf("EXTRACT(YEAR FROM dt) = %d, want 2024", y)
+	}
+	if err := db.QueryRowContext(ctx, "SELECT EXTRACT(YEAR FROM ts) FROM temporal_repro").Scan(&y); err != nil {
+		t.Fatalf("EXTRACT over stored TIMESTAMP: %v", err)
+	}
+	if y != 2024 {
+		t.Fatalf("EXTRACT(YEAR FROM ts) = %d, want 2024", y)
+	}
+	if err := db.QueryRowContext(ctx, "SELECT EXTRACT(YEAR FROM dtt) FROM temporal_repro").Scan(&y); err != nil {
+		t.Fatalf("EXTRACT over stored DATETIME: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, "SELECT EXTRACT(HOUR FROM tm) FROM temporal_repro").Scan(&h); err != nil {
+		t.Fatalf("EXTRACT over stored TIME: %v", err)
+	}
+	if h != 12 {
+		t.Fatalf("EXTRACT(HOUR FROM tm) = %d, want 12", h)
+	}
+	var s string
+	if err := db.QueryRowContext(ctx, "SELECT CAST(dt AS STRING) FROM temporal_repro").Scan(&s); err != nil {
+		t.Fatalf("CAST stored DATE to STRING: %v", err)
+	}
+	if s != "2024-03-22" {
+		t.Fatalf("CAST(dt AS STRING) = %q, want 2024-03-22 (day-early regression)", s)
+	}
+	// Bare SELECT of the stored DATE must render the same civil date
+	// (this is the one-day-early display regression).
+	if err := db.QueryRowContext(ctx, "SELECT dt FROM temporal_repro").Scan(&s); err != nil {
+		t.Fatal(err)
+	}
+	if s != "2024-03-22" {
+		t.Fatalf("SELECT dt = %q, want 2024-03-22", s)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT FORMAT_DATE("%Y/%m/%d", dt) FROM temporal_repro`).Scan(&s); err != nil {
+		t.Fatalf("FORMAT_DATE over stored DATE: %v", err)
+	}
+	if s != "2024/03/22" {
+		t.Fatalf("FORMAT_DATE = %q, want 2024/03/22", s)
+	}
+}
+
+// TestRegression_SafeDivideAggregateCoercion asserts that the implicit
+// INT64 -> DOUBLE coercion the analyzer inserts around SAFE_DIVIDE's
+// arguments lowers to a native DuckDB CAST. Before the fix it lowered
+// to the googlesqlite_cast UDF, whose VARCHAR result made
+// /(DOUBLE, VARCHAR) fail to bind at DuckDB prepare time.
+func TestRegression_SafeDivideAggregateCoercion(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE safediv_repro (x INT64)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO safediv_repro VALUES (10),(20)"); err != nil {
+		t.Fatal(err)
+	}
+	var got float64
+	if err := db.QueryRowContext(ctx, "SELECT SAFE_DIVIDE(SUM(x), COUNT(*)) FROM safediv_repro").Scan(&got); err != nil {
+		t.Fatalf("SAFE_DIVIDE(SUM, COUNT): %v", err)
+	}
+	if got != 15 {
+		t.Fatalf("SAFE_DIVIDE(SUM(x), COUNT(*)) = %v, want 15", got)
+	}
+	// Division by zero must stay NULL (SAFE semantics intact).
+	var nullable sql.NullFloat64
+	if err := db.QueryRowContext(ctx, "SELECT SAFE_DIVIDE(SUM(x), 0) FROM safediv_repro").Scan(&nullable); err != nil {
+		t.Fatal(err)
+	}
+	if nullable.Valid {
+		t.Fatalf("SAFE_DIVIDE(.., 0) = %v, want NULL", nullable.Float64)
+	}
+}
+
+// TestRegression_UnnestElementNativeBinding asserts that array elements
+// produced by UNNEST reach DuckDB with their analyzer-resolved native type
+// instead of JSON, so DuckDB-native functions bind against them.
+//
+// Origin: https://github.com/esilver/googlesqlite/issues/1 — the UNNEST
+// lowering projected raw json_each.value, so MOD(y, 7) over an unnested
+// element failed at prepare time with
+// 'No function matches ... mod(JSON, INTEGER_LITERAL)'.
+func TestRegression_UnnestElementNativeBinding(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	rows, err := db.QueryContext(ctx, "SELECT MOD(y,7) AS m FROM UNNEST([10,20,30]) AS y ORDER BY m")
+	if err != nil {
+		t.Fatalf("MOD over UNNEST element: %v", err)
+	}
+	defer rows.Close()
+	var got []int64
+	for rows.Next() {
+		var v int64
+		if err := rows.Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, v)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 || got[0] != 2 || got[1] != 3 || got[2] != 6 {
+		t.Fatalf("MOD(y,7) over UNNEST([10,20,30]) = %v, want [2 3 6]", got)
+	}
+}
+
+// TestRegression_UnnestMaxNotLexicographic asserts that MIN / MAX over an
+// unnested integer array compare numerically.
+//
+// Origin: https://github.com/esilver/googlesqlite/issues/1 — with the raw
+// JSON projection, native MAX compared the JSON values lexicographically,
+// so MAX over UNNEST(GENERATE_ARRAY(1,1000)) silently returned 999.
+func TestRegression_UnnestMaxNotLexicographic(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	var n, max int64
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) AS n, MAX(x) AS m FROM UNNEST(GENERATE_ARRAY(1,1000)) AS x").Scan(&n, &max); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1000 || max != 1000 {
+		t.Fatalf("COUNT, MAX over UNNEST(GENERATE_ARRAY(1,1000)) = %d, %d; want 1000, 1000", n, max)
+	}
+}
+
+// TestRegression_UnnestCTASColumnType asserts that CREATE TABLE AS SELECT
+// over an unnested array persists a natively typed column, so native
+// functions bind against the stored column afterwards.
+//
+// Origin: https://github.com/esilver/googlesqlite/issues/1 — the JSON typing
+// persisted through CTAS, so MOD(id, 1000) on the stored column failed with
+// the same binder error.
+func TestRegression_UnnestCTASColumnType(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx,
+		"CREATE TABLE unnest_ctas AS SELECT x AS id, MOD(x,1000) AS grp FROM UNNEST(GENERATE_ARRAY(1,5000)) AS x"); err != nil {
+		t.Fatalf("CTAS over UNNEST: %v", err)
+	}
+	var groups, total int64
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(DISTINCT MOD(id,1000)), COUNT(*) FROM unnest_ctas").Scan(&groups, &total); err != nil {
+		t.Fatalf("MOD over stored CTAS column: %v", err)
+	}
+	if groups != 1000 || total != 5000 {
+		t.Fatalf("MOD over stored column: groups=%d total=%d, want 1000, 5000", groups, total)
+	}
+	// Numeric (not lexicographic) semantics on the stored column too.
+	var max int64
+	if err := db.QueryRowContext(ctx, "SELECT MAX(id) FROM unnest_ctas").Scan(&max); err != nil {
+		t.Fatal(err)
+	}
+	if max != 5000 {
+		t.Fatalf("MAX(id) over stored column = %d, want 5000", max)
+	}
+}
+
+// TestRegression_UnnestElementTypedProjections drives the per-kind UNNEST
+// element projections (BOOL / FLOAT64 / STRING / DATE / TIMESTAMP / offset)
+// introduced for issue #1, asserting both that native functions bind and
+// that values round-trip.
+func TestRegression_UnnestElementTypedProjections(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	// FLOAT64: native rounding over the element.
+	var f float64
+	if err := db.QueryRowContext(ctx,
+		"SELECT SUM(ROUND(v)) FROM UNNEST([1.4, 2.6]) AS v").Scan(&f); err != nil {
+		t.Fatalf("ROUND over FLOAT64 element: %v", err)
+	}
+	if f != 4 {
+		t.Fatalf("SUM(ROUND(v)) = %v, want 4", f)
+	}
+
+	// BOOL: usable directly as a predicate.
+	var c int64
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM UNNEST([true, false, true]) AS b WHERE b").Scan(&c); err != nil {
+		t.Fatalf("BOOL element as predicate: %v", err)
+	}
+	if c != 2 {
+		t.Fatalf("COUNT WHERE b = %d, want 2", c)
+	}
+
+	// STRING: function application and equality.
+	var s string
+	if err := db.QueryRowContext(ctx,
+		"SELECT UPPER(v) FROM UNNEST(['a','b']) AS v WHERE v = 'b'").Scan(&s); err != nil {
+		t.Fatalf("UPPER / equality over STRING element: %v", err)
+	}
+	if s != "B" {
+		t.Fatalf("UPPER(v) = %q, want B", s)
+	}
+
+	// DATE: native EXTRACT over the element.
+	var y int64
+	if err := db.QueryRowContext(ctx,
+		"SELECT EXTRACT(YEAR FROM d) FROM UNNEST([DATE '2024-03-22']) AS d").Scan(&y); err != nil {
+		t.Fatalf("EXTRACT over DATE element: %v", err)
+	}
+	if y != 2024 {
+		t.Fatalf("EXTRACT(YEAR) = %d, want 2024", y)
+	}
+
+	// TIMESTAMP: native EXTRACT over the element.
+	if err := db.QueryRowContext(ctx,
+		"SELECT EXTRACT(HOUR FROM ts) FROM UNNEST([TIMESTAMP '2024-01-01 12:00:00']) AS ts").Scan(&y); err != nil {
+		t.Fatalf("EXTRACT over TIMESTAMP element: %v", err)
+	}
+	if y != 12 {
+		t.Fatalf("EXTRACT(HOUR) = %d, want 12", y)
+	}
+
+	// WITH OFFSET: the offset column is INT64-native (MOD binds, numeric
+	// ordering past one digit).
+	rows, err := db.QueryContext(ctx,
+		"SELECT MOD(off, 2) FROM UNNEST(GENERATE_ARRAY(0,11)) AS v WITH OFFSET off ORDER BY off")
+	if err != nil {
+		t.Fatalf("MOD over OFFSET column: %v", err)
+	}
+	defer rows.Close()
+	var offs []int64
+	for rows.Next() {
+		var v int64
+		if err := rows.Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		offs = append(offs, v)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(offs) != 12 || offs[10] != 0 || offs[11] != 1 {
+		t.Fatalf("MOD(off,2) ordered by off = %v, want alternating 0/1 over 12 rows", offs)
+	}
+}
+
+// TestRegression_Int64BigintStorage pins the INT64 storage width fix:
+// ColumnSpec.SQLiteSchema used to emit the engine's 32-bit INTEGER for
+// INT64 columns, so any value outside [-2^31, 2^31) failed the implicit
+// int64->int32 cast on INSERT. INT64 columns now map to BIGINT and the
+// full 64-bit domain must round-trip — via literals and via bound
+// parameters (the prepared-statement encode fast path).
+func TestRegression_Int64BigintStorage(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", "file:int64_bigint?mode=memory&cache=private")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE t_i64 (x INT64)"); err != nil {
+		t.Fatal(err)
+	}
+	// Literal above 2^31 (the original bug report shape).
+	if _, err := db.ExecContext(ctx, "INSERT INTO t_i64 (x) VALUES (4000000000)"); err != nil {
+		t.Fatalf("literal insert of 4000000000 failed: %v", err)
+	}
+	// Bound parameters across the full 64-bit domain.
+	for _, v := range []int64{-4000000000, -9223372036854775808, 9223372036854775807} {
+		if _, err := db.ExecContext(ctx, "INSERT INTO t_i64 (x) VALUES (?)", v); err != nil {
+			t.Fatalf("param insert of %d failed: %v", v, err)
+		}
+	}
+	// NOTE: no ORDER BY on this table. The engine's prepare-time sort
+	// optimization computes the column-stats span (max - min), which
+	// overflows INT64 when both extremes are present ("Overflow in
+	// subtraction of INT64 (9223372036854775807 - -9223372036854775808)").
+	// That is a separate, pre-existing engine limitation; this test pins
+	// the storage round-trip, so sort client-side here and exercise
+	// ORDER BY on a narrower-span table below.
+	want := []int64{-9223372036854775808, -4000000000, 4000000000, 9223372036854775807}
+	rows, err := db.QueryContext(ctx, "SELECT x FROM t_i64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []int64
+	for rows.Next() {
+		var x int64
+		if err := rows.Scan(&x); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, x)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	sort.Slice(got, func(i, j int) bool { return got[i] < got[j] })
+	if len(got) != len(want) {
+		t.Fatalf("got %d rows %v, want %d", len(got), got, len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("row %d = %d, want %d (full got %v)", i, got[i], want[i], got)
+		}
+	}
+	// ORDER BY over >2^31 magnitudes (span small enough for the engine's
+	// stats subtraction): the original bug-report shape, ordered.
+	if _, err := db.ExecContext(ctx, "CREATE TABLE t_i64b (x INT64)"); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []int64{4000000000, -4000000000, 7} {
+		if _, err := db.ExecContext(ctx, "INSERT INTO t_i64b (x) VALUES (?)", v); err != nil {
+			t.Fatalf("param insert of %d failed: %v", v, err)
+		}
+	}
+	wantB := []int64{-4000000000, 7, 4000000000}
+	rowsB, err := db.QueryContext(ctx, "SELECT x FROM t_i64b ORDER BY x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rowsB.Close()
+	var gotB []int64
+	for rowsB.Next() {
+		var x int64
+		if err := rowsB.Scan(&x); err != nil {
+			t.Fatal(err)
+		}
+		gotB = append(gotB, x)
+	}
+	if err := rowsB.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(gotB) != fmt.Sprint(wantB) {
+		t.Fatalf("ORDER BY round-trip = %v, want %v", gotB, wantB)
+	}
+}
+
+// TestRegression_SumInt64Exactness asserts that SUM over an INT64 column is
+// computed as an EXACT integer — no float64 routing anywhere on the path —
+// including above 2^53 where double rounding becomes observable.
+//
+// Origin: https://github.com/esilver/googlesqlite/issues/5 — the aggregate
+// lowering cast SUM's argument to DOUBLE, so the whole sum accumulated in
+// float64 and 2^62 + 1 came back as 2^62 (the float64-nearest value), with
+// the result type itself surfacing as FLOAT64.
+func TestRegression_SumInt64Exactness(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE sum_exact (n INT64)"); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []int64{1, 4611686018427387904} { // 1, 2^62
+		if _, err := db.ExecContext(ctx, "INSERT `sum_exact` (`n`) VALUES (?)", v); err != nil {
+			t.Fatalf("insert %d: %v", v, err)
+		}
+	}
+	// The issue's exact repro: CAST(SUM(n) AS STRING) is computed server
+	// side, so this pins the in-engine result, not client scan conversion.
+	var s string
+	if err := db.QueryRowContext(ctx, "SELECT CAST(SUM(n) AS STRING) FROM sum_exact").Scan(&s); err != nil {
+		t.Fatal(err)
+	}
+	if want := "4611686018427387905"; s != want { // 2^62 + 1
+		t.Fatalf("CAST(SUM(n) AS STRING) = %q, want %q", s, want)
+	}
+	// The result must scan as an exact int64 too.
+	var got int64
+	if err := db.QueryRowContext(ctx, "SELECT SUM(n) FROM sum_exact").Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(4611686018427387905); got != want {
+		t.Fatalf("SUM(n) = %d, want %d", got, want)
+	}
+	// FORMAT('%T', SUM(n)) renders an INT64 literal, not a FLOAT64 one
+	// (the issue's type-level probe: 4.611686018427388e+18 was the bug).
+	var lit string
+	if err := db.QueryRowContext(ctx, "SELECT FORMAT('%T', SUM(n)) FROM sum_exact").Scan(&lit); err != nil {
+		t.Fatal(err)
+	}
+	if want := "4611686018427387905"; lit != want {
+		t.Fatalf("FORMAT('%%T', SUM(n)) = %q, want %q", lit, want)
+	}
+}
+
+// TestRegression_SumInt64NearMaxExact asserts SUM stays exact when the
+// result lands within a few units of math.MaxInt64 — every float64 ulp at
+// that magnitude is 1024, so any float routing shows up immediately.
+//
+// Origin: https://github.com/esilver/googlesqlite/issues/5.
+func TestRegression_SumInt64NearMaxExact(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE sum_nearmax (n INT64)"); err != nil {
+		t.Fatal(err)
+	}
+	// math.MaxInt64 - 10 plus 7 = math.MaxInt64 - 3: inside the int64
+	// range, far outside float64 exactness.
+	for _, v := range []int64{math.MaxInt64 - 10, 7} {
+		if _, err := db.ExecContext(ctx, "INSERT `sum_nearmax` (`n`) VALUES (?)", v); err != nil {
+			t.Fatalf("insert %d: %v", v, err)
+		}
+	}
+	var got int64
+	if err := db.QueryRowContext(ctx, "SELECT SUM(n) FROM sum_nearmax").Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(math.MaxInt64 - 3); got != want {
+		t.Fatalf("SUM(n) = %d, want %d", got, want)
+	}
+	var s string
+	if err := db.QueryRowContext(ctx, "SELECT CAST(SUM(n) AS STRING) FROM sum_nearmax").Scan(&s); err != nil {
+		t.Fatal(err)
+	}
+	if want := "9223372036854775804"; s != want {
+		t.Fatalf("CAST(SUM(n) AS STRING) = %q, want %q", s, want)
+	}
+}
+
+// TestRegression_SumInt64OverflowErrors asserts BigQuery's overflow
+// semantics: a SUM whose exact value exceeds the int64 range raises an
+// error instead of silently returning a float64-rounded (wrong) value.
+//
+// Origin: https://github.com/esilver/googlesqlite/issues/5.
+func TestRegression_SumInt64OverflowErrors(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE sum_overflow (n INT64)"); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []int64{math.MaxInt64, 1} {
+		if _, err := db.ExecContext(ctx, "INSERT `sum_overflow` (`n`) VALUES (?)", v); err != nil {
+			t.Fatalf("insert %d: %v", v, err)
+		}
+	}
+	var got int64
+	err = db.QueryRowContext(ctx, "SELECT SUM(n) FROM sum_overflow").Scan(&got)
+	if err == nil {
+		t.Fatalf("SUM overflowing int64 returned %d, want an error", got)
+	}
+}
+
+// TestRegression_SumFloat64Unchanged pins the control: SUM over FLOAT64
+// keeps its double semantics (the issue #5 fix must only retarget the
+// INT64-result path).
+func TestRegression_SumFloat64Unchanged(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE sum_float (x FLOAT64)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO sum_float (x) VALUES (1.5), (2.25)"); err != nil {
+		t.Fatal(err)
+	}
+	var got float64
+	if err := db.QueryRowContext(ctx, "SELECT SUM(x) FROM sum_float").Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != 3.75 {
+		t.Fatalf("SUM(x) = %v, want 3.75", got)
+	}
+	// AVG over INT64 stays FLOAT64 as before (only SUM's result type
+	// retargets the argument cast).
+	var avg float64
+	if err := db.QueryRowContext(ctx, "SELECT AVG(y) FROM UNNEST([1,2]) AS y").Scan(&avg); err != nil {
+		t.Fatal(err)
+	}
+	if avg != 1.5 {
+		t.Fatalf("AVG(y) = %v, want 1.5", avg)
+	}
+}
+
+// TestRegression_CTENameWithHyphen: a backtick-quoted CTE name containing a
+// hyphen (valid in BigQuery) was emitted unquoted by WithEntryNode, producing
+// `syntax error at or near "-"`. Covers plain and RECURSIVE CTEs.
+// Ported from upstream goccy/googlesqlite PR 18 (issue 17); this fork quotes
+// in DuckDB double-quote style. Fork issue #11.
+func TestRegression_CTENameWithHyphen(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	var x int64
+	if err := db.QueryRowContext(ctx,
+		"WITH `with-hyphen` AS (SELECT 1 AS x) SELECT x FROM `with-hyphen`",
+	).Scan(&x); err != nil {
+		t.Fatalf("non-recursive hyphenated CTE failed: %v", err)
+	}
+	if x != 1 {
+		t.Errorf("non-recursive: got %d want 1", x)
+	}
+
+	var total int64
+	if err := db.QueryRowContext(ctx,
+		"WITH RECURSIVE `rec-hyphen` AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM `rec-hyphen` WHERE n < 3) SELECT SUM(n) AS total FROM `rec-hyphen`",
+	).Scan(&total); err != nil {
+		t.Fatalf("recursive hyphenated CTE failed: %v", err)
+	}
+	if total != 6 {
+		t.Errorf("recursive: got %d want 6", total)
+	}
+}
+
+// TestRegression_WedgedSlotRecovery: the shared-engine end-to-end shape of
+// issue #12 (upstream goccy/googlesqlite bf326675 / goccy/bigquery-emulator#478).
+// A request context cancelled mid-statement can close the inner *sql.Conn out
+// from under the pooled driver Conn (database/sql's tx watcher runs
+// Rollback(discardConn=true)). Before the driver.Validator port, that dead
+// Conn stayed in the pool and every later caller got
+// "sql: connection is already closed". On this fork all pooled Conns share
+// one DuckDB engine, so a wedged Conn is a wedged slot against the shared
+// engine mutex — the pool must both drop the poisoned Conn (IsValid /
+// ErrBadConn) and keep serving from the other slot.
+func TestRegression_WedgedSlotRecovery(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(2)
+	ctx := context.Background()
+
+	// Warm both pool slots so the cancelled statement runs on an
+	// already-pooled conn (the poisoning shape, not a fresh-dial shape).
+	var warm int64
+	if err := db.QueryRowContext(ctx, "SELECT 1").Scan(&warm); err != nil {
+		t.Fatalf("warmup: %v", err)
+	}
+
+	// Conn A: a multi-second statement inside a context-cancelled
+	// transaction; the cancel fires while the statement is in flight.
+	cancelCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() {
+		tx, err := db.BeginTx(cancelCtx, nil)
+		if err != nil {
+			done <- err
+			return
+		}
+		defer func() { _ = tx.Rollback() }()
+		var n int64
+		done <- tx.QueryRowContext(cancelCtx,
+			"SELECT COUNT(*) FROM UNNEST(GENERATE_ARRAY(1, 3000)) AS a, UNNEST(GENERATE_ARRAY(1, 3000)) AS b WHERE MOD(a + b, 7) = 0",
+		).Scan(&n)
+	}()
+	time.Sleep(200 * time.Millisecond) // let the statement get in flight
+	cancel()
+	select {
+	case <-done:
+		// The cancelled side may surface context.Canceled, ErrConnDone,
+		// driver-level noise, or (if the engine raced the cancel and
+		// finished) even nil — the assertion below is what matters.
+	case <-time.After(120 * time.Second):
+		t.Fatal("cancelled statement never returned: engine slot wedged")
+	}
+
+	// Conn B (and the recycled slot): the pool must keep serving. Loop a
+	// few times so both pool slots are exercised — before the Validator
+	// port the poisoned slot kept resurfacing as
+	// "sql: connection is already closed".
+	checkCtx, cancel2 := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel2()
+	for i := 0; i < 8; i++ {
+		var one int64
+		if err := db.QueryRowContext(checkCtx, "SELECT 1").Scan(&one); err != nil {
+			t.Fatalf("pool stopped serving after mid-statement cancel (iteration %d): %v", i, err)
+		}
+		if one != 1 {
+			t.Fatalf("SELECT 1 = %d after mid-statement cancel", one)
+		}
+	}
+}
+
+// TestRegression_NumericAggregateEnvelope: issue #9 part 1. SUM/AVG over a
+// stored NUMERIC column lowered to CAST(col AS DOUBLE) over the value-layer
+// envelope — a hard Conversion Error, and the wrong type besides (BigQuery
+// SUM/AVG(NUMERIC) are NUMERIC-exact). Uses the parameter INSERT path from
+// the issue repro; the seam suite covers the literal path.
+func TestRegression_NumericAggregateEnvelope(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE n (amt NUMERIC)"); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []string{"0.000000008", "0.000000004"} {
+		if _, err := db.ExecContext(ctx, "INSERT `n` (`amt`) VALUES (?)", v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var got string
+	if err := db.QueryRowContext(ctx, "SELECT CAST(SUM(amt) AS STRING) FROM `n`").Scan(&got); err != nil {
+		t.Fatalf("SUM over stored NUMERIC failed (issue #9 envelope leak): %v", err)
+	}
+	if got != "0.000000012" {
+		t.Errorf("SUM(amt) = %q, want %q", got, "0.000000012")
+	}
+	if err := db.QueryRowContext(ctx, "SELECT CAST(AVG(amt) AS STRING) FROM `n`").Scan(&got); err != nil {
+		t.Fatalf("AVG over stored NUMERIC failed: %v", err)
+	}
+	if got != "0.000000006" {
+		t.Errorf("AVG(amt) = %q, want %q (AVG(NUMERIC) is NUMERIC in BigQuery)", got, "0.000000006")
+	}
+	// Window form shares the lowering.
+	if err := db.QueryRowContext(ctx,
+		"SELECT CAST(SUM(amt) OVER () AS STRING) FROM `n` LIMIT 1").Scan(&got); err != nil {
+		t.Fatalf("window SUM over stored NUMERIC failed: %v", err)
+	}
+	if got != "0.000000012" {
+		t.Errorf("SUM(amt) OVER () = %q, want %q", got, "0.000000012")
+	}
+}
+
+// TestRegression_CastBytesToString: issue #9 part 2. CAST of a stored BYTES
+// column to STRING returned the storage envelope (base64 of the
+// {"header":"bytes",...} carrier) instead of BigQuery's semantics: the
+// payload decoded as UTF-8 text (an error when the payload is not valid
+// UTF-8, NULL under SAFE_CAST).
+func TestRegression_CastBytesToString(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("googlesqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE b (byt BYTES)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT `b` (`byt`) VALUES (?)", []byte("blob-7")); err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	if err := db.QueryRowContext(ctx, "SELECT CAST(byt AS STRING) FROM `b`").Scan(&got); err != nil {
+		t.Fatalf("CAST(byt AS STRING): %v", err)
+	}
+	if got != "blob-7" {
+		t.Errorf("CAST(byt AS STRING) = %q, want %q (envelope leak)", got, "blob-7")
+	}
+
+	// Invalid UTF-8 payload: CAST errors, SAFE_CAST yields NULL.
+	if _, err := db.ExecContext(ctx, "CREATE TABLE binv (byt BYTES)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT `binv` (`byt`) VALUES (?)", []byte{0xff, 0xfe, 0x01}); err != nil {
+		t.Fatal(err)
+	}
+	var castErr string
+	if err := db.QueryRowContext(ctx, "SELECT CAST(byt AS STRING) FROM `binv`").Scan(&castErr); err == nil {
+		t.Errorf("CAST of invalid-UTF-8 BYTES to STRING succeeded with %q, want error", castErr)
+	}
+	var safe sql.NullString
+	if err := db.QueryRowContext(ctx, "SELECT SAFE_CAST(byt AS STRING) FROM `binv`").Scan(&safe); err != nil {
+		t.Fatalf("SAFE_CAST of invalid-UTF-8 BYTES: %v", err)
+	}
+	if safe.Valid {
+		t.Errorf("SAFE_CAST of invalid-UTF-8 BYTES = %q, want NULL", safe.String)
 	}
 }

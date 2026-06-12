@@ -5,14 +5,17 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
+
+var testRunnerDSNCounter atomic.Uint64
 
 func newTestRunner(t *testing.T) *Runner {
 	t.Helper()
 	// A per-test memdb database keeps tests isolated while still
 	// exercising the shared-memory VFS the CLI defaults to.
-	dsn := fmt.Sprintf("file:/%s.db?vfs=memdb", strings.ReplaceAll(t.Name(), "/", "_"))
+	dsn := fmt.Sprintf("file:/%s_%d.db?vfs=memdb", strings.ReplaceAll(t.Name(), "/", "_"), testRunnerDSNCounter.Add(1))
 	r, err := NewRunner(context.Background(), dsn)
 	if err != nil {
 		t.Fatalf("NewRunner: %v", err)
@@ -47,7 +50,7 @@ func TestRunnerDebugCollector(t *testing.T) {
 	if res.Err != nil {
 		t.Fatalf("Exec: %v", res.Err)
 	}
-	// The translated SQLite query must mention the addition; it is the
+	// The translated backend SQL must mention the addition; it is the
 	// internal SQL collector hook that feeds CLI debug mode.
 	if !strings.Contains(res.SQLiteQuery, "1") {
 		t.Errorf("SQLiteQuery = %q, expected the translated query text", res.SQLiteQuery)
