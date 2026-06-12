@@ -89,9 +89,11 @@ func entryJSON(e cli.HistoryEntry) map[string]any {
 	if rows == nil {
 		rows = [][]string{}
 	}
+	translatedQuery := e.TranslatedQuery()
 	return map[string]any{
 		"statement":    e.Statement,
-		"sqliteQuery":  e.SQLiteQuery,
+		"duckdbQuery":  translatedQuery,
+		"sqliteQuery":  translatedQuery,
 		"isQuery":      e.IsQuery,
 		"columns":      columns,
 		"rows":         rows,

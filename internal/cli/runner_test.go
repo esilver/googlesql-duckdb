@@ -50,7 +50,7 @@ func TestRunnerDebugCollector(t *testing.T) {
 	if res.Err != nil {
 		t.Fatalf("Exec: %v", res.Err)
 	}
-	// The translated SQLite query must mention the addition; it is the
+	// The translated backend SQL must mention the addition; it is the
 	// internal SQL collector hook that feeds CLI debug mode.
 	if !strings.Contains(res.SQLiteQuery, "1") {
 		t.Errorf("SQLiteQuery = %q, expected the translated query text", res.SQLiteQuery)

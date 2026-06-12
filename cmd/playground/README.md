@@ -83,11 +83,12 @@ server (5173) and preview server (4173) both work.
 | `/history/load`                    | POST   | exported JSON       | `{"ok": true}`                           |
 
 An `entry` is one statement's outcome:
-`{statement, sqliteQuery, isQuery, columns, rows, rowsAffected, error,
+`{statement, duckdbQuery, isQuery, columns, rows, rowsAffected, error,
 elapsedMs, timestamp}` — rows are display strings, exactly as the wasm
-engine reports them. `/exec` accepts multi-statement input; a SQL error
-is HTTP 200 with the per-statement `error` field set (only malformed
-requests are 4xx, as `{"error": "..."}`).
+engine reports them. The legacy `sqliteQuery` alias is also emitted for
+older clients and history exports. `/exec` accepts multi-statement
+input; a SQL error is HTTP 200 with the per-statement `error` field set
+(only malformed requests are 4xx, as `{"error": "..."}`).
 
 Smoke test with curl:
 

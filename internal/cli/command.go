@@ -17,7 +17,7 @@ import (
 type Session struct {
 	runner *Runner
 	out    io.Writer
-	// Debug, when true, prints the translated SQLite query above each
+	// Debug, when true, prints the translated DuckDB query above each
 	// result.
 	Debug bool
 	// Color enables ANSI colourisation of rendered output.
@@ -235,7 +235,7 @@ func (s *Session) printHelp() {
 	fmt.Fprint(s.out, `Commands:
   .help              show this help
   .quit, .exit       leave the CLI
-  .debug [on|off]    show the translated SQLite query for each statement
+  .debug [on|off]    show the translated DuckDB query for each statement
   .tables            list tables and views
   .functions         list functions
   .read <path>       run the statements in a SQL file

@@ -207,7 +207,7 @@ func (a *app) listTables(_ js.Value, _ []js.Value) any {
 }
 
 // setDebug toggles whether rendered output includes the translated
-// SQLite query.
+// DuckDB query.
 func (a *app) setDebug(_ js.Value, args []js.Value) any {
 	on := len(args) > 0 && args[0].Truthy()
 	return a.promise(func() (any, error) {
@@ -224,9 +224,11 @@ func entryToJS(e cli.HistoryEntry) map[string]any {
 	for i, row := range e.Rows {
 		rows[i] = stringsToJS(row)
 	}
+	translatedQuery := e.TranslatedQuery()
 	return map[string]any{
 		"statement":    e.Statement,
-		"sqliteQuery":  e.SQLiteQuery,
+		"duckdbQuery":  translatedQuery,
+		"sqliteQuery":  translatedQuery,
 		"isQuery":      e.IsQuery,
 		"columns":      stringsToJS(e.Columns),
 		"rows":         rows,

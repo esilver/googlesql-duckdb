@@ -56,7 +56,7 @@ type Result struct {
 	Rows [][]any
 	// RowsAffected is the affected-row count (non-queries only).
 	RowsAffected int64
-	// SQLiteQuery is the translated SQLite text the engine executed.
+	// SQLiteQuery is the translated backend SQL the engine executed.
 	// It is always captured; the CLI shows it only in debug mode.
 	SQLiteQuery string
 	// Elapsed is the wall-clock execution time.
@@ -105,8 +105,8 @@ func (r *Runner) Close() error {
 }
 
 // Exec runs a single statement and returns its structured Result. A
-// trailing \G selects group display mode. The translated SQLite query
-// is captured into Result.SQLiteQuery via the internal SQL collector.
+// trailing \G selects group display mode. The translated backend SQL is
+// captured into Result.SQLiteQuery via the internal SQL collector.
 func (r *Runner) Exec(ctx context.Context, statement string) Result {
 	res := Result{Statement: statement}
 	stmt := strings.TrimSpace(statement)

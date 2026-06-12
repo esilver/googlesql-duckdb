@@ -177,7 +177,7 @@ export function App({ mode, onToggleMode }: AppProps) {
           onChange={(e) => setDebug(e.target.checked)}
         />
       }
-      label="Show translated SQLite"
+      label="Show translated DuckDB"
     />
   )
 

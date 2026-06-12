@@ -40,6 +40,8 @@ type execResponse struct {
 
 type execEntry struct {
 	Statement    string     `json:"statement"`
+	DuckDBQuery  string     `json:"duckdbQuery"`
+	SQLiteQuery  string     `json:"sqliteQuery"`
 	IsQuery      bool       `json:"isQuery"`
 	Columns      []string   `json:"columns"`
 	Rows         [][]string `json:"rows"`
@@ -97,6 +99,12 @@ func TestExecQuery(t *testing.T) {
 	}
 	if r.Timestamp == "" {
 		t.Error("timestamp missing")
+	}
+	if r.DuckDBQuery == "" {
+		t.Error("duckdbQuery missing")
+	}
+	if r.SQLiteQuery != r.DuckDBQuery {
+		t.Errorf("sqliteQuery legacy alias = %q, want duckdbQuery %q", r.SQLiteQuery, r.DuckDBQuery)
 	}
 }
 

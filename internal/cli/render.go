@@ -21,7 +21,7 @@ func displayWidth(s string) int {
 type RenderOptions struct {
 	// Color enables ANSI colourisation of values.
 	Color bool
-	// Debug, when true, prints the translated SQLite query above the
+	// Debug, when true, prints the translated DuckDB query above the
 	// result.
 	Debug bool
 }
@@ -32,7 +32,7 @@ type RenderOptions struct {
 func RenderResult(w io.Writer, res Result, opt RenderOptions) {
 	if opt.Debug && res.SQLiteQuery != "" {
 		for _, line := range strings.Split(res.SQLiteQuery, "\n") {
-			fmt.Fprintf(w, "-- sqlite: %s\n", line)
+			fmt.Fprintf(w, "-- duckdb: %s\n", line)
 		}
 	}
 	if res.Err != nil {
