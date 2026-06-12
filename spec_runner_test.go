@@ -102,15 +102,20 @@ func runFile(t *testing.T, root, rel, path string) {
 	}
 
 	subName := strings.TrimSuffix(filepath.ToSlash(rel), ".yaml")
+	serialProtoCases := testdataRegistersProtos(td)
 	t.Run(subName, func(t *testing.T) {
-		t.Parallel()
+		if !serialProtoCases {
+			t.Parallel()
+		}
 		for i, c := range td.Cases {
 			name := c.Desc
 			if name == "" {
 				name = fmt.Sprintf("case_%d", i)
 			}
 			t.Run(name, func(t *testing.T) {
-				t.Parallel()
+				if !serialProtoCases {
+					t.Parallel()
+				}
 				if !gateAsserts {
 					t.Skip("spec status is not implemented/tested; case retained as documentation only")
 				}
@@ -118,6 +123,15 @@ func runFile(t *testing.T, root, rel, path string) {
 			})
 		}
 	})
+}
+
+func testdataRegistersProtos(td specmeta.Testdata) bool {
+	for _, c := range td.Cases {
+		if len(c.RegisterProtos) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func loadSpecFrontmatter(root, specPath string) (specmeta.Frontmatter, error) {

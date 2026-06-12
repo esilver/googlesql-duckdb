@@ -52,13 +52,15 @@ func castResolved(expr value.Value, from googlesql.Googlesql_TypeNode, fromKind 
 // pays json.Unmarshal + ToGoogleSQLType (one or more MakeSimpleType /
 // MakeArrayType wasm round-trips, each of which stack-walks for
 // goroutine pinning) — ~2ms/row, the entire cost behind issue #8's
-// "CTAS is 2ms/row". Type handles returned by the wasm type factory are
-// process-global and never freed (the registered-proto/enum caches rely
-// on the same property), so caching them per JSON literal is safe.
+// "CTAS is 2ms/row". Direct PROTO casts cache the stable protobuf
+// full name instead of a catalog-scoped *ProtoType handle; repeated
+// short-lived catalogs can otherwise leave the cache holding stale proto
+// handles.
 type resolvedCastType struct {
-	typ  *Type
-	node googlesql.Googlesql_TypeNode
-	kind googlesql.TypeKind
+	typ       *Type
+	node      googlesql.Googlesql_TypeNode
+	kind      googlesql.TypeKind
+	protoName string
 }
 
 var castTypeCache sync.Map // JSON type string -> *resolvedCastType
@@ -71,13 +73,56 @@ func resolveCastType(jsonEncodedType string) (*resolvedCastType, error) {
 	if err := json.Unmarshal([]byte(jsonEncodedType), &typ); err != nil {
 		return nil, err
 	}
-	node, err := typ.ToGoogleSQLType()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get googlesql type from cast type: %w", err)
+	kind := typ.kindAs()
+	protoName := ""
+	var node googlesql.Googlesql_TypeNode
+	if kind == googlesql.TypeKindTypeProto {
+		protoName = protoNameFromDebug(typ.Name)
+	} else {
+		var err error
+		node, err = typ.ToGoogleSQLType()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get googlesql type from cast type: %w", err)
+		}
 	}
-	resolved := &resolvedCastType{typ: &typ, node: node, kind: typ.kindAs()}
+	resolved := &resolvedCastType{typ: &typ, node: node, kind: kind, protoName: protoName}
 	castTypeCache.Store(jsonEncodedType, resolved)
 	return resolved, nil
+}
+
+func castValueWithResolvedType(rt *resolvedCastType, v value.Value) (value.Value, error) {
+	if rt == nil {
+		return v, nil
+	}
+	if rt.kind == googlesql.TypeKindTypeProto {
+		if sv, ok := v.(value.StringValue); ok && rt.protoName != "" {
+			bytes, err := parseProtoTextLiteral(rt.protoName, string(sv))
+			if err != nil {
+				return nil, fmt.Errorf("CAST to PROTO<%s>: %w", rt.protoName, err)
+			}
+			return value.BytesValue(bytes), nil
+		}
+		return v, nil
+	}
+	return castValueWithKind(rt.kind, rt.node, v)
+}
+
+func castResolvedTypes(expr value.Value, fromType, toType *resolvedCastType, isSafeCast bool) (value.Value, error) {
+	fromValue, err := castValueWithResolvedType(fromType, expr)
+	if err != nil {
+		if isSafeCast {
+			return nil, nil
+		}
+		return nil, err
+	}
+	casted, err := castValueWithResolvedType(toType, fromValue)
+	if err != nil {
+		if isSafeCast {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return casted, nil
 }
 
 func bindCast(args ...value.Value) (value.Value, error) {
@@ -104,5 +149,5 @@ func bindCast(args ...value.Value) (value.Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	return castResolved(args[0], fromType.node, fromType.kind, toType.node, toType.kind, isSafeCast)
+	return castResolvedTypes(args[0], fromType, toType, isSafeCast)
 }
