@@ -4843,8 +4843,13 @@ func formatLeftJoinPreservingLeftOrder(ctx context.Context, join *googlesql.Reso
 		return "", err
 	}
 	leftAlias := "__gsx_left_join_l"
+	rowNumberExpr := "row_number() OVER ()"
+	if strings.Contains(left, fmt.Sprintf("\"%s\"", setOperationOrdinalColumn)) {
+		rowNumberExpr = fmt.Sprintf("row_number() OVER (ORDER BY \"%s\")", setOperationOrdinalColumn)
+	}
 	leftWithOrdinal := fmt.Sprintf(
-		"(SELECT *, row_number() OVER () AS \"%s\" %s) AS \"%s\"",
+		"(SELECT *, %s AS \"%s\" %s) AS \"%s\"",
+		rowNumberExpr,
 		leftJoinOrdinalColumn,
 		formattedLeft,
 		leftAlias,
