@@ -22,6 +22,13 @@ type Formatter interface {
 
 const setOperationOrdinalColumn = "__gsx_setop_ordinal"
 
+// setOperationOrdinalStride separates UNION ALL branches in the
+// __gsx_setop_ordinal key space: branch idx contributes idx*stride and a
+// per-branch row_number() contributes the offset within the branch, making
+// the ordinal a TOTAL order over the union's rows. 2^40 leaves room for
+// ~10^12 rows per branch and ~2^23 branches inside int64.
+const setOperationOrdinalStride = int64(1) << 40
+
 func New(node googlesql.ResolvedNode) Formatter {
 	return newNode(node)
 }
@@ -4709,8 +4716,16 @@ func (n *SubqueryExprNode) FormatSQL(ctx context.Context) (string, error) {
 			// extraction legal for the >1-row case while the COUNT probe
 			// still forces the NULL fold. Re-evaluates the sub-select
 			// twice - acceptable in error-handling expressions.
+			//
+			// The extraction arm always wraps valueSelect in a derived
+			// table before appending its LIMIT: valueSelect may be the
+			// raw subquery SQL, which can itself already end in
+			// LIMIT/OFFSET (e.g. `(SELECT 5 LIMIT 1)`), and `(%s LIMIT 1)`
+			// over that is a double-LIMIT parse error. The wrap is safe
+			// for the ordinal-guarded form too — formatSingleValueSubquery
+			// has already narrowed it to the single value column.
 			return fmt.Sprintf(
-				"(SELECT CASE WHEN (SELECT COUNT(*) FROM (%s)) = 1 THEN (%s LIMIT 1) ELSE NULL END)",
+				"(SELECT CASE WHEN (SELECT COUNT(*) FROM (%s)) = 1 THEN (SELECT * FROM (%s) LIMIT 1) ELSE NULL END)",
 				sql, valueSelect,
 			), nil
 		}
@@ -4739,13 +4754,14 @@ func (n *SubqueryExprNode) FormatSQL(ctx context.Context) (string, error) {
 		// ORDER BY, so a bare array_agg returns the subquery rows in an
 		// arbitrary (run-to-run unstable) order. GoogleSQL's ARRAY(subquery)
 		// preserves the subquery's row order (its ORDER BY when present, else
-		// the producing order). Stamp each row with row_number() OVER () -
-		// which is assigned in the subquery's output order, after any inner
-		// ORDER BY - and aggregate ORDER BY that stamp so the materialised
+		// the producing order). Stamp each row with a row_number ordinal -
+		// assigned in the subquery's output order, after any inner ORDER BY,
+		// and anchored on the set-operation ordinal when the subquery is a
+		// UNION ALL - and aggregate ORDER BY that stamp so the materialised
 		// array keeps the subquery's order deterministically.
 		return fmt.Sprintf(
-			"googlesqlite_array_from_native(COALESCE((SELECT array_agg(\"%s\" ORDER BY __gsx_array_subq_rn) FROM (SELECT *, row_number() OVER () AS __gsx_array_subq_rn FROM (%s))), []))",
-			colName, sql,
+			"googlesqlite_array_from_native(COALESCE((SELECT array_agg(\"%s\" ORDER BY __gsx_array_subq_rn) FROM (SELECT *, %s AS __gsx_array_subq_rn FROM (%s))), []))",
+			colName, setOperationOrdinalRowNumber(ctx, subquery), sql,
 		), nil
 	case googlesql.ResolvedSubqueryExprEnums_SubqueryTypeExists:
 		return fmt.Sprintf("EXISTS (%s)", sql), nil
@@ -4769,8 +4785,13 @@ func (n *SubqueryExprNode) FormatSQL(ctx context.Context) (string, error) {
 	return fmt.Sprintf("(%s)", sql), nil
 }
 
+// formatSingleValueSubquery narrows a subquery used in a single-value
+// position (scalar / IN) down to its one value column when the scan's
+// projection exposes the set-operation ordinal helper column. Exposure is
+// AST-derived — a nested-but-projected-away ordinal in the rendered text
+// must not trigger the rewrap.
 func formatSingleValueSubquery(ctx context.Context, subquery googlesql.ResolvedScanNode, sql string) (string, error) {
-	if !strings.Contains(sql, fmt.Sprintf("\"%s\"", setOperationOrdinalColumn)) {
+	if !scanExposesSetOperationOrdinal(ctx, subquery) {
 		return sql, nil
 	}
 	subCols := m1(subquery.MutableColumnList())
@@ -4892,10 +4913,14 @@ func formatLeftJoinPreservingLeftOrder(ctx context.Context, join *googlesql.Reso
 		return "", err
 	}
 	leftAlias := "__gsx_left_join_l"
-	rowNumberExpr := "row_number() OVER ()"
-	if strings.Contains(left, fmt.Sprintf("\"%s\"", setOperationOrdinalColumn)) {
-		rowNumberExpr = fmt.Sprintf("row_number() OVER (ORDER BY \"%s\")", setOperationOrdinalColumn)
-	}
+	// Anchor the left side's row stamp on the set-operation ordinal only
+	// when the LEFT SCAN's own projection exposes it (AST-derived). The
+	// previous substring probe over the rendered left SQL false-positived
+	// whenever the ordinal literal appeared NESTED inside the left input
+	// (e.g. a chained LEFT JOIN whose inner join already projected the
+	// ordinal away) and emitted an ORDER BY over a column that is not in
+	// scope.
+	rowNumberExpr := setOperationOrdinalRowNumber(ctx, m1(join.LeftScan()))
 	leftWithOrdinal := fmt.Sprintf(
 		"(SELECT *, %s AS \"%s\" %s) AS \"%s\"",
 		rowNumberExpr,
@@ -5191,7 +5216,8 @@ func (n *ArrayScanNode) FormatSQL(ctx context.Context) (string, error) {
 		// expect.
 		const inputOrdinal = `"$unnest_input_ordinal"`
 		wrappedInput := fmt.Sprintf(
-			"FROM (SELECT *, row_number() OVER () AS %s %s)",
+			"FROM (SELECT *, %s AS %s %s)",
+			setOperationOrdinalRowNumber(ctx, m1(n.node.InputScan())),
 			inputOrdinal,
 			formattedInput,
 		)
@@ -5491,7 +5517,11 @@ func (n *AggregateScanNode) FormatSQL(ctx context.Context) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		input = fmt.Sprintf("(SELECT *, row_number() OVER () AS \"%s\" %s)", aggregateInputOrdinalColumn, formattedInput)
+		// Anchor the aggregate-input ordinal on the set-operation ordinal
+		// when the input exposes it, so ARRAY_AGG / STRING_AGG over a
+		// UNION ALL aggregate in branch order instead of engine order.
+		input = fmt.Sprintf("(SELECT *, %s AS \"%s\" %s)",
+			setOperationOrdinalRowNumber(ctx, m1(n.node.InputScan())), aggregateInputOrdinalColumn, formattedInput)
 		return fmt.Sprintf("SELECT %s FROM %s %s%s", formattedColumns, input, groupBy, orderBy), nil
 	}
 	switch getInputPattern(input) {
@@ -6308,7 +6338,21 @@ func (n *SetOperationScanNode) FormatSQL(ctx context.Context) (string, error) {
 			outputColumns = append(outputColumns, fmt.Sprintf("\"%s\"", uniqueColumnName(ctx, outputColumn)))
 		}
 		if carryOrdinal {
-			outputColumns = append(outputColumns, fmt.Sprintf("%d AS \"%s\"", idx+1, setOperationOrdinalColumn))
+			// The ordinal is TOTAL, not a per-branch constant: branch idx
+			// contributes the high bits (stride) and a per-branch
+			// row_number contributes the low bits, so `ORDER BY
+			// "__gsx_setop_ordinal"` reproduces both the branch order AND
+			// the within-branch row order. A constant idx+1 would leave
+			// within-branch order resting on the engine's insertion-order
+			// stability at every anchor site. The branch row_number itself
+			// anchors on a nested union's ordinal when the branch input
+			// exposes one.
+			outputColumns = append(outputColumns, fmt.Sprintf(
+				"(%d + %s) AS \"%s\"",
+				int64(idx)*setOperationOrdinalStride,
+				setOperationOrdinalRowNumber(ctx, m1(item.Scan())),
+				setOperationOrdinalColumn,
+			))
 		}
 		query, err := newNode(item).FormatSQL(ctx)
 		if err != nil {
@@ -6495,10 +6539,7 @@ func (n *AnalyticScanNode) FormatSQL(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	rowIDExpr := "ROW_NUMBER() OVER()"
-	if scanExposesSetOperationOrdinal(ctx, inputScan) {
-		rowIDExpr = fmt.Sprintf("ROW_NUMBER() OVER(ORDER BY \"%s\")", setOperationOrdinalColumn)
-	}
+	rowIDExpr := setOperationOrdinalRowNumber(ctx, inputScan)
 	formattedInput, err := formatInput(input)
 	if err != nil {
 		return "", err
@@ -6867,8 +6908,14 @@ func (n *RecursiveScanNode) FormatSQL(ctx context.Context) (string, error) {
 		if err != nil {
 			return "", err
 		}
+		// The recursive scan's two arms are positional UNION operands — a
+		// fixed-column splice boundary. A branch whose own projection
+		// exposes the set-operation ordinal helper (a UNION ALL seed term)
+		// must be re-projected to its OutputColumnList or the seed arm
+		// renders one column wider than the recursive arm.
 		trimmed := strings.TrimSpace(scanSQL)
-		if strings.HasPrefix(trimmed, "SELECT") || strings.HasPrefix(trimmed, "WITH") {
+		if !scanExposesSetOperationOrdinal(ctx, m1(item.Scan())) &&
+			(strings.HasPrefix(trimmed, "SELECT") || strings.HasPrefix(trimmed, "WITH")) {
 			return scanSQL, nil
 		}
 		out := m1(item.OutputColumnList())
@@ -6955,7 +7002,16 @@ func (n *WithScanNode) FormatSQL(ctx context.Context) (string, error) {
 		}
 	}
 	subCtx := withCteRefCounts(ctx, refCounts)
-	subCtx = withCteSetOperationOrdinals(subCtx, map[string]bool{})
+	// Each WITH scope gets its own ordinal-carrying-CTE set, seeded with a
+	// COPY of the enclosing scope's entries: an outer union CTE referenced
+	// inside this subtree must keep re-exposing its ordinal (resetting to
+	// an empty map silently un-anchored such references), while entries
+	// added or shadowed here must not leak back out.
+	inheritedOrdinals := map[string]bool{}
+	for name, exposed := range cteSetOperationOrdinals(ctx) {
+		inheritedOrdinals[name] = exposed
+	}
+	subCtx = withCteSetOperationOrdinals(subCtx, inheritedOrdinals)
 	queries := []string{}
 	for _, entry := range m1(n.node.WithEntryList()) {
 		sql, err := newNode(entry).FormatSQL(subCtx)
@@ -7013,10 +7069,12 @@ func (n *WithEntryNode) FormatSQL(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if scanExposesSetOperationOrdinal(ctx, sub) {
-		if ordinals := cteSetOperationOrdinals(ctx); ordinals != nil {
-			ordinals[queryName] = true
-		}
+	// Record this CTE's exposure either way: scopes now inherit the
+	// enclosing scope's entries, so a CTE that SHADOWS an outer
+	// ordinal-carrying name with a non-union body must overwrite the
+	// inherited `true`.
+	if ordinals := cteSetOperationOrdinals(ctx); ordinals != nil {
+		ordinals[queryName] = scanExposesSetOperationOrdinal(ctx, sub)
 	}
 	tableToColumnList := tableNameToColumnListMap(ctx)
 	tableToColumnList[queryName] = m1(sub.MutableColumnList())
@@ -7038,6 +7096,37 @@ func (n *WithEntryNode) FormatSQL(ctx context.Context) (string, error) {
 	return fmt.Sprintf("\"%s\" AS%s ( %s )", queryName, hint, subquery), nil
 }
 
+// scanExposesSetOperationOrdinal reports whether the SQL rendered for
+// `scan` exposes the __gsx_setop_ordinal helper column in its own output
+// projection. This is THE structural source of truth for every decision
+// about the helper column — order anchors (`ORDER BY "__gsx_setop_ordinal"`)
+// and splice-boundary re-projection both derive from it; nothing may match
+// substrings of rendered SQL, because a nested-but-stripped ordinal literal
+// in the text does not mean the column is in scope (and vice versa).
+//
+// The classification mirrors each node's FormatSQL by construction:
+//
+//   - SetOperationScan(UNION ALL) mints the column (it appends the ordinal
+//     after its column map);
+//   - WithRefScan re-exposes it for CTEs recorded in the scope's
+//     cteSetOperationOrdinals set;
+//   - pass-through scans whose rendering forwards the input projection
+//     unchanged (FilterScan appends only WHERE; AssertScan / BarrierScan /
+//     SampleScan return the input verbatim; ArrayScan-with-input renders
+//     `SELECT * ... FROM input ...`) recurse into their input;
+//   - JoinScans rendered as plain joins (INNER / CROSS / RIGHT / FULL)
+//     keep both operands' columns in scope, so they expose the ordinal
+//     when exactly one side does (both sides would make the name ambiguous
+//     to DuckDB's binder, so that case must read as "not usable");
+//     LEFT joins go through formatLeftJoinPreservingLeftOrder, which
+//     projects join.ColumnList() — the helper column never crosses it;
+//   - WithScan renders as `WITH ... <query>`, so its exposure is the
+//     final query's exposure evaluated in a scope that has the entry
+//     CTEs' exposure recorded (same copy-inherit semantics as
+//     WithScanNode.FormatSQL installs);
+//   - every other scan (ProjectScan, AggregateScan, OrderByScan,
+//     LimitOffsetScan, AnalyticScan, RecursiveScan, TableScan, TVFScan,
+//     ...) re-projects its own ColumnList, which drops the helper column.
 func scanExposesSetOperationOrdinal(ctx context.Context, scan googlesql.ResolvedNode) bool {
 	if scan == nil {
 		return false
@@ -7048,8 +7137,71 @@ func scanExposesSetOperationOrdinal(ctx context.Context, scan googlesql.Resolved
 	case *googlesql.ResolvedWithRefScan:
 		name, _ := s.WithQueryName()
 		return cteSetOperationOrdinals(ctx)[name]
+	case *googlesql.ResolvedFilterScan:
+		return scanExposesSetOperationOrdinal(ctx, m1(s.InputScan()))
+	case *googlesql.ResolvedAssertScan:
+		return scanExposesSetOperationOrdinal(ctx, m1(s.InputScan()))
+	case *googlesql.ResolvedBarrierScan:
+		return scanExposesSetOperationOrdinal(ctx, m1(s.InputScan()))
+	case *googlesql.ResolvedSampleScan:
+		return scanExposesSetOperationOrdinal(ctx, m1(s.InputScan()))
+	case *googlesql.ResolvedArrayScan:
+		if m1(s.InputScan()) == nil {
+			// No input: ArrayScanNode projects the element/offset columns
+			// only.
+			return false
+		}
+		return scanExposesSetOperationOrdinal(ctx, m1(s.InputScan()))
+	case *googlesql.ResolvedJoinScan:
+		if m1(s.JoinType()) == googlesql.ResolvedJoinScanEnums_JoinTypeLeft {
+			return false
+		}
+		l := scanExposesSetOperationOrdinal(ctx, m1(s.LeftScan()))
+		r := scanExposesSetOperationOrdinal(ctx, m1(s.RightScan()))
+		return l != r
+	case *googlesql.ResolvedWithScan:
+		inner := map[string]bool{}
+		for k, v := range cteSetOperationOrdinals(ctx) {
+			inner[k] = v
+		}
+		innerCtx := withCteSetOperationOrdinals(ctx, inner)
+		for _, entry := range m1(s.WithEntryList()) {
+			name, _ := entry.WithQueryName()
+			inner[name] = scanExposesSetOperationOrdinal(innerCtx, m1(entry.WithSubquery()))
+		}
+		return scanExposesSetOperationOrdinal(innerCtx, m1(s.Query()))
 	}
 	return false
+}
+
+// reprojectScanColumns wraps an already-rendered scan SQL so its output is
+// exactly `cols`. Splice sites that paste a formatted scan into a
+// fixed-column context (INSERT ... SELECT, MERGE USING, recursive-CTE
+// union branches) call this whenever scanExposesSetOperationOrdinal says a
+// helper column may ride along, which guarantees by construction that the
+// consumer sees the resolver's column list and nothing else. `ctx` must be
+// the same context the scan was formatted under (uniqueColumnName depends
+// on its naming flags).
+func reprojectScanColumns(ctx context.Context, sql string, cols []*googlesql.ResolvedColumn) string {
+	names := make([]string, 0, len(cols))
+	for _, col := range cols {
+		names = append(names, fmt.Sprintf("\"%s\"", uniqueColumnName(ctx, col)))
+	}
+	return fmt.Sprintf("SELECT %s FROM (%s)", strings.Join(names, ","), sql)
+}
+
+// setOperationOrdinalRowNumber returns the row_number() window expression
+// used to stamp a deterministic per-row ordinal over `scan`'s rendered
+// rows: anchored on the set-operation ordinal when the scan exposes it,
+// engine row order otherwise. Shared by every stamp site (left-join
+// anchor, window row_id, aggregate input ordinal, array-subquery ordinal,
+// unnest input ordinal) so anchoring decisions stay AST-derived and
+// uniform.
+func setOperationOrdinalRowNumber(ctx context.Context, scan googlesql.ResolvedNode) string {
+	if scanExposesSetOperationOrdinal(ctx, scan) {
+		return fmt.Sprintf("row_number() OVER (ORDER BY \"%s\")", setOperationOrdinalColumn)
+	}
+	return "row_number() OVER ()"
 }
 
 // cteMaterializeHint returns either " MATERIALIZED" (with a leading
@@ -7133,9 +7285,25 @@ func (n *InsertStmtNode) FormatSQL(ctx context.Context) (string, error) {
 	}
 	query, _ := n.node.Query()
 	if query != nil {
-		stmt, err := newNode(query).FormatSQL(withUseColumnID(ctx))
+		queryCtx := withUseColumnID(ctx)
+		stmt, err := newNode(query).FormatSQL(queryCtx)
 		if err != nil {
 			return "", err
+		}
+		// INSERT consumes the spliced query positionally against a fixed
+		// column list, so the splice boundary must expose exactly the
+		// resolver's QueryOutputColumnList. When the query root's own
+		// projection carries the set-operation ordinal helper column
+		// (a bare `INSERT ... SELECT 1 UNION ALL SELECT 2` resolves to
+		// the SetOperationScan itself — no ProjectScan above it), the
+		// helper would land as an extra inserted column. Re-project by
+		// construction, keyed off the AST exposure signal.
+		if scanExposesSetOperationOrdinal(ctx, query) {
+			outCols := m1(n.node.QueryOutputColumnList())
+			if len(outCols) == 0 {
+				outCols = m1(query.MutableColumnList())
+			}
+			stmt = reprojectScanColumns(queryCtx, stmt, outCols)
 		}
 		// INSERT ... SELECT form: extending the column list would
 		// require rewriting the SELECT to project the defaults too.

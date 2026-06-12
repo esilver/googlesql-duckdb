@@ -2679,9 +2679,19 @@ func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, args []driv
 	if err != nil {
 		return nil, err
 	}
-	sourceTable, err := newNode(m1(node.FromScan())).FormatSQL(ctx)
+	fromScan := m1(node.FromScan())
+	sourceTable, err := newNode(fromScan).FormatSQL(ctx)
 	if err != nil {
 		return nil, err
+	}
+	// The merged-table materialization below consumes the source through
+	// `SELECT DISTINCT * FROM (source FULL OUTER JOIN target)` — a
+	// fixed-shape splice. When the source scan's own projection exposes
+	// the set-operation ordinal helper column (a bare UNION ALL source),
+	// re-project to the scan's column list so the helper neither becomes
+	// a merged-table column nor distorts the DISTINCT pair collapsing.
+	if scanExposesSetOperationOrdinal(ctx, fromScan) {
+		sourceTable = reprojectScanColumns(ctx, sourceTable, m1(fromScan.MutableColumnList()))
 	}
 	// A computed-subquery source (issue #17) formats as a bare
 	// `SELECT ...`; splicing that into `... FROM %s LEFT JOIN ...`
