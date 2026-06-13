@@ -6,8 +6,10 @@ Spanner — on the pure-Go DuckDB engine
 It is exposed as a `database/sql` driver, so any `database/sql` consumer gets
 a local GoogleSQL execution engine with no external services to run.
 
-The pure-Go DuckDB backend reaches 986/994 conformance specs with zero
-failures, builds with `CGO_ENABLED=0`, and does not require build flags. See
+The pure-Go DuckDB backend builds with `CGO_ENABLED=0` and does not require
+build flags. Its CI includes a named spec conformance gate that currently
+covers 707 spec files and 1,177 asserted cases, with the corpus categorized as
+697 implemented, 7 partial, and 3 unsupported specs. See
 [REPRODUCE-PURE-GO.md](REPRODUCE-PURE-GO.md) and
 [CLI-PURE-GO.md](CLI-PURE-GO.md).
 
