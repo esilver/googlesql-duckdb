@@ -7,7 +7,7 @@ BIN  := $(CURDIR)/bin
 LINT       := go tool -modfile=tools/go.mod golangci-lint
 GORELEASER := go tool -modfile=tools/go.mod goreleaser
 
-.PHONY: all build build-wasm test lint lint/fix validate spec/check spec/check/ci spec/coverage spec/upstream-sync bench release release/check identity-check clean
+.PHONY: all build build-wasm test test/ci-race lint lint/fix validate spec/check spec/check/ci spec/coverage spec/upstream-sync bench release release/check identity-check clean
 
 all: build
 
@@ -29,6 +29,12 @@ build-wasm: | $(BIN)
 
 test:
 	go test -race -timeout 30m ./...
+
+# CI runs TestSpec in a dedicated job that reports the conformance
+# count. Keep the broad race job focused on the remaining packages so
+# it does not spend the whole timeout re-running the spec suite.
+test/ci-race:
+	go test -race -timeout 30m -skip '^TestSpec$$' ./...
 
 lint:
 	$(LINT) run --timeout 30m

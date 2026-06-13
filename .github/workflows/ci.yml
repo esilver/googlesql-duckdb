@@ -85,7 +85,7 @@ jobs:
         run: make build
 
       - name: Test
-        run: make test
+        run: make test/ci-race
 
   spec:
     name: Spec conformance
