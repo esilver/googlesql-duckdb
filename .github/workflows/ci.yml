@@ -10,6 +10,12 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs on the same ref so the Actions tab is not cluttered
+# with stale in-progress runs when commits land in quick succession.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
