@@ -16,7 +16,7 @@ func JSON_ARRAY(args ...value.Value) (value.Value, error) {
 			parts = append(parts, "null")
 			continue
 		}
-		s, err := a.ToJSON()
+		s, err := ToJSONLiteral(a)
 		if err != nil {
 			return nil, err
 		}
@@ -27,7 +27,7 @@ func JSON_ARRAY(args ...value.Value) (value.Value, error) {
 
 // JSON_OBJECT(key, value, ...) builds a JSON object from
 // alternating key/value pairs. Keys must be STRING, values are
-// converted via ToJSON.
+// converted with the same TO_JSON encoding used by BigQuery's JSON family.
 func JSON_OBJECT(args ...value.Value) (value.Value, error) {
 	if len(args)%2 != 0 {
 		return nil, fmt.Errorf("JSON_OBJECT: needs an even argument count, got %d", len(args))
@@ -42,7 +42,7 @@ func JSON_OBJECT(args ...value.Value) (value.Value, error) {
 		if args[i+1] == nil {
 			valStr = "null"
 		} else {
-			s, err := args[i+1].ToJSON()
+			s, err := ToJSONLiteral(args[i+1])
 			if err != nil {
 				return nil, err
 			}

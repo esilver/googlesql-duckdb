@@ -1464,6 +1464,14 @@ func TestJSON_ARRAY(t *testing.T) {
 	if mustString(t, got) != "[]" {
 		t.Fatalf("got %q", mustString(t, got))
 	}
+
+	got, err = JSON_ARRAY(value.DatetimeValue(time.Date(2024, 2, 29, 12, 34, 56, 0, time.UTC)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mustString(t, got) != `["2024-02-29T12:34:56"]` {
+		t.Fatalf("got %q", mustString(t, got))
+	}
 }
 
 func TestJSON_OBJECT(t *testing.T) {
@@ -1483,6 +1491,17 @@ func TestJSON_OBJECT(t *testing.T) {
 		t.Fatal(err)
 	}
 	if mustString(t, got) != `{"a":null}` {
+		t.Fatalf("got %q", mustString(t, got))
+	}
+
+	got, err = JSON_OBJECT(
+		value.StringValue("dt"),
+		value.DatetimeValue(time.Date(2024, 2, 29, 12, 34, 56, 0, time.UTC)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mustString(t, got) != `{"dt":"2024-02-29T12:34:56"}` {
 		t.Fatalf("got %q", mustString(t, got))
 	}
 

@@ -34,7 +34,13 @@ func ToJSONLiteral(v value.Value) (string, error) {
 	switch vv := v.(type) {
 	case *value.SafeValue:
 		return ToJSONLiteral(vv.Value)
-	case value.DateValue, value.DatetimeValue, value.TimeValue, value.TimestampValue:
+	case value.DatetimeValue:
+		s, err := v.ToJSON()
+		if err != nil {
+			return "", err
+		}
+		return strconv.Quote(s), nil
+	case value.DateValue, value.TimeValue, value.TimestampValue:
 		s, err := v.ToString()
 		if err != nil {
 			return "", err

@@ -263,7 +263,7 @@ func DecodeValue(v any) (Value, error) {
 // UTC-pinned session). A non-midnight value on the epoch day reads as TIME
 // (true for every engine TIME cell). Everything else reads as DATETIME:
 // TIMESTAMP and DATETIME carriers are indistinguishable, and the civil
-// "2006-01-02T15:04:05" rendering is interpretation-neutral — it re-parses
+// "2006-01-02 15:04:05" rendering is interpretation-neutral — it re-parses
 // into both DuckDB TIMESTAMP and TIMESTAMPTZ as the same instant, whereas
 // an RFC3339 "Z" rendering would assert instant-ness a true DATETIME does
 // not have.

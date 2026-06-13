@@ -96,7 +96,7 @@ func TestDatetimeValue(t *testing.T) {
 		if got, _ := base.ToBytes(); string(got) != "2020-01-01 12:30:45" {
 			t.Fatalf("ToBytes: %s", got)
 		}
-		if got, _ := base.ToJSON(); got != "2020-01-01 12:30:45" {
+		if got, _ := base.ToJSON(); got != "2020-01-01T12:30:45" {
 			t.Fatalf("ToJSON: %s", got)
 		}
 		if got, _ := base.ToTime(); got.IsZero() {

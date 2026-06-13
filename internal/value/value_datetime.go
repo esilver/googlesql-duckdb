@@ -130,7 +130,7 @@ func (d DatetimeValue) ToStruct() (*StructValue, error) {
 }
 
 func (d DatetimeValue) ToJSON() (string, error) {
-	return d.ToString()
+	return time.Time(d).Format(datetimeFormat), nil
 }
 
 func (d DatetimeValue) ToTime() (time.Time, error) {
