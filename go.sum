@@ -87,6 +87,8 @@ github.com/esilver/duckdb-go-pure v0.3.11 h1:+Xy4hHMzydO1QnHgAs89o5xoUP75FfOOkvJ
 github.com/esilver/duckdb-go-pure v0.3.11/go.mod h1:ArM/CohRgBCoOLcKcDJjMuFoWvFHIL7FYNzI5aJs5VI=
 github.com/esilver/duckdb-go-pure v0.3.12 h1:9gY7KO0uxIYSyMUWRrI71eGQUW3Xmwd3ieonajCQaQI=
 github.com/esilver/duckdb-go-pure v0.3.12/go.mod h1:ArM/CohRgBCoOLcKcDJjMuFoWvFHIL7FYNzI5aJs5VI=
+github.com/esilver/duckdb-go-pure v0.3.13 h1:gNTlJ5R2qtwvBv4/WnYZu8GO9WVRw2tpm+Jw99ivanc=
+github.com/esilver/duckdb-go-pure v0.3.13/go.mod h1:ArM/CohRgBCoOLcKcDJjMuFoWvFHIL7FYNzI5aJs5VI=
 github.com/esilver/go-googlesql v0.2.4-finalizer.1.0.20260611225755-3bdff21371a3 h1:Tm09ZeN8KjwfBCt1myLlszltewYuGLff66rrfY0rBB4=
 github.com/esilver/go-googlesql v0.2.4-finalizer.1.0.20260611225755-3bdff21371a3/go.mod h1:0CUrO9fG9A5lAxOQDjCUr7ibzoRLiv2iaAwbGvESAhM=
 github.com/fatih/color v1.19.0 h1:Zp3PiM21/9Ld6FzSKyL5c/BULoe/ONr9KlbYVOfG8+w=
