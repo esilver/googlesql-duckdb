@@ -79,12 +79,12 @@ func (r *Rows) Next(dest []driver.Value) error {
 	}
 	if !r.rows.Next() {
 		if err := r.rows.Err(); err != nil {
-			return unwrapSQLiteUserError(err)
+			return err
 		}
 		return io.EOF
 	}
 	if err := r.rows.Err(); err != nil {
-		return unwrapSQLiteUserError(err)
+		return err
 	}
 	colTypes := r.columnTypes()
 	scanCols, err := r.rows.Columns()

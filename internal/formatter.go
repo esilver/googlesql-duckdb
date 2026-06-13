@@ -581,11 +581,11 @@ func (n *FunctionCallNode) FormatSQL(ctx context.Context) (string, error) {
 	if sql, ok := tryNativeScalarFunc(funcName, args); ok {
 		return sql, nil
 	}
-	// DuckDB path: the normalFuncMap is empty (RegisterFunctions only runs
-	// on the SQLite handle), so the resolver emits these builtins under
-	// their bare GoogleSQL names instead of the googlesqlite_<name> shell.
-	// Canonicalize them to the prefixed form the dispatch below keys on so
-	// the lazy-eval / error-handling lowerings still fire.
+	// When normalFuncMap has no entry for one of these builtins, the
+	// resolver emits it under its bare GoogleSQL name instead of the
+	// googlesqlite_<name> shell. Canonicalize them to the prefixed form
+	// the dispatch below keys on so the lazy-eval / error-handling
+	// lowerings still fire.
 	funcName = canonicalizeBuiltinFuncName(funcName)
 	switch funcName {
 	case "googlesqlite_from_proto":
@@ -3311,12 +3311,12 @@ var nativeWindowFuncMap = map[string]string{
 }
 
 // customNativeWindowFuncMap lists googlesql window functions whose
-// semantics don't have a SQLite built-in counterpart but whose
+// semantics don't have a native DuckDB built-in counterpart but whose
 // googlesqlite_window_<name> implementation has been refactored to
 // run incrementally (Step / Done over the active frame), making them
 // safe to invoke through native OVER syntax instead of the
 // per-output-row correlated-subquery emulation. The value is the
-// custom SQLite function name registered through sqlitex.
+// custom DuckDB window UDF name registered for that function.
 var customNativeWindowFuncMap = map[string]string{
 	"array_agg":  "googlesqlite_window_array_agg",
 	"string_agg": "googlesqlite_window_string_agg",

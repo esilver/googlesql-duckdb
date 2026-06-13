@@ -1040,7 +1040,7 @@ SELECT SUM(n) FROM seq`)
 
 // TestW_NativeWindowAggregators verifies that LOGICAL_OR /
 // LOGICAL_AND / BIT_AND / BIT_OR / BIT_XOR / ARRAY_CONCAT_AGG run
-// through native ncruces window UDFs (Step / Inverse / Done) instead
+// through native DuckDB window UDFs (Step / Inverse / Done) instead
 // of the predecessor's correlated-subquery emulation. F11 hardens
 // this so all built-in window aggregators dispatch natively.
 func TestW_NativeWindowAggregators(t *testing.T) {

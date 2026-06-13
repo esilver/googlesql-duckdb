@@ -11,9 +11,9 @@ import (
 // literals, plus native bool / int / float for primitive literals),
 // delegates to the shared pure-Go RANGE function body, and re-encodes the
 // result into the same wire form the rows-layer decoder expects. This is
-// the exact contract the legacy sqlitex registration used
-// (ConvertArgs -> BindFunc -> EncodeValue), retargeted onto duckdb-go so
-// the RANGE family resolves on the DuckDB engine.
+// the DuckDB UDF registration contract
+// (ConvertArgs -> BindFunc -> EncodeValue), so the RANGE family resolves
+// on the DuckDB engine.
 //
 // EncodeValue returns the natural Go shape for the result: a base64
 // VARCHAR for RANGE / ARRAY / DATE / DATETIME / TIMESTAMP results, and a

@@ -69,16 +69,18 @@ Keep the public surface minimal: only export what an external consumer
 actually needs. Functionality exercised solely by the in-repo test
 suite belongs in `export_test.go` (re-exported for the black-box
 `googlesqlite_test` package) rather than in the production API. The
-wasm runtime is configured through the `EnvWasm*` environment-variable
-constants, not a programmatic setter.
+GoogleSQL analyzer is a wasm2go-transpiled native-Go module
+(`googlesqlwasm2go`) with no wasm runtime to configure, so the
+`EnvWasm*` environment-variable constants are retained only as
+deprecated no-ops.
 
 Performance MUST NOT regress. The `bench/` suite exercises
 representative GoogleSQL workloads and is run before any release; it
 measures the driver against a saved baseline of its own previous run
 (`bench/RESULTS.md`) to catch regressions across revisions.
 Window-function-heavy queries in particular must stay fast, because
-this driver registers custom window aggregates natively rather than
-falling back to SQLite's built-in window functions.
+this driver registers custom window aggregates as native DuckDB window
+UDFs so window-heavy queries stay fast.
 
 ## Testdata is authoritative — never trim it to dodge a failure
 
@@ -114,8 +116,9 @@ This rule overrides any other progress incentive in this repository.
 .            top-level package googlesqlite (driver.go etc.) plus the
              black-box test suite (driver/query/ddl/dml/types/... _test.go)
 cmd/         executables (googlesqlite CLI, specctl)
-internal/    driver implementation: functions/, value/, sqlitex/,
-             specmeta/, plus the analyzer/formatter glue
+internal/    driver implementation: functions/, value/, duckdbgo/ (the
+             live DuckDB backend, imported at driver.go:17), specmeta/,
+             plus the analyzer/formatter glue
 docs/specs/  canonical, normalized spec markdown (one per function/type)
 testdata/    YAML test cases referenced by spec frontmatter
 bench/       performance corpus and runner

@@ -26,7 +26,7 @@ import (
 	"github.com/goccy/googlesqlite/internal/value"
 )
 
-// BindFunction is the signature ncruces' adapter expects from us:
+// BindFunction is the signature the DuckDB UDF adapter expects from us:
 // take an arg list of (possibly NULL) googlesqlite Values and return
 // either a Value or an error.
 type BindFunction = func(...value.Value) (value.Value, error)

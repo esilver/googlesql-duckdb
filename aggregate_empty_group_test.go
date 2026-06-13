@@ -10,16 +10,10 @@ import (
 // evaluated over zero input rows returns each aggregate's documented
 // zero value rather than NULL.
 //
-// Origin: aggregates were registered through ncruces'
-// CreateAggregateFunction, whose iter.Seq wrapper starts the user
-// coroutine lazily on the first Step. When a group has zero rows
-// SQLite invokes only the final callback, which stops the
-// never-started coroutine without ever running the aggregate, so the
-// function never calls ctx.Result* and SQLite reports NULL. As a
-// result COUNT(*) over an empty table returned NULL instead of 0.
-// RegisterAggregator now registers through CreateWindowFunction, which
-// constructs a fresh instance and calls Value even when Step never
-// ran. See internal/sqlitex.RegisterAggregator.
+// This guards the empty-group path of the DuckDB aggregate UDFs: a
+// group with zero rows must still emit the aggregate's documented zero
+// value (e.g. COUNT(*) over an empty table returns 0, not NULL) rather
+// than skipping the final value step.
 func TestRegression_AggregateOverEmptyGroup(t *testing.T) {
 	t.Parallel()
 	db, err := sql.Open("googlesqlite", ":memory:?_test=aggemptygroup")

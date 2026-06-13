@@ -4,11 +4,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/goccy/go-json"
-	sqlite3 "github.com/ncruces/go-sqlite3"
-
 	"github.com/goccy/googlesqlite/internal/functions/window"
-	"github.com/goccy/googlesqlite/internal/sqlitex"
 	"github.com/goccy/googlesqlite/internal/value"
 )
 
@@ -36,8 +32,8 @@ var (
 
 // populateFuncMaps fills the normal / aggregate / window function maps.
 // It is run exactly once, guarded by registerFuncOnce, and touches only
-// the global maps (no connection required), so both the SQLite path
-// (RegisterFunctions) and the DuckDB path (EnsureFuncMaps) can drive it.
+// the global maps (no connection required), so the DuckDB path
+// (EnsureFuncMaps) can drive it.
 func populateFuncMaps() {
 	for _, info := range normalFuncs {
 		setupNormalFuncMap(info)
@@ -141,9 +137,7 @@ var ensureDuckDBFuncMapOnce sync.Once
 // getFuncNameAndArgs lowers a builtin to its googlesqlite_<name> shell only
 // when the name is present in normalFuncMap; populating just the registered
 // subset keeps every other builtin on its bare DuckDB-native lowering (so an
-// unported function does not lower to a UDF that was never created). The
-// SQLite path uses RegisterFunctions, which fills the full maps; the two
-// paths never run in the same process.
+// unported function does not lower to a UDF that was never created).
 func EnsureFuncMaps() {
 	ensureDuckDBFuncMapOnce.Do(func() {
 		funcMapMu.Lock()
@@ -169,107 +163,6 @@ var duckdbPortedFuncNames = func() map[string]struct{} {
 	}
 	return m
 }()
-
-func RegisterFunctions(conn *sqlite3.Conn) error {
-	funcMapMu.RLock()
-	defer funcMapMu.RUnlock()
-
-	registerFuncOnce.Do(populateFuncMaps)
-
-	deterministic := sqlitex.FunctionFlags{Deterministic: true}
-
-	if err := sqlitex.RegisterFunc(conn, "googlesqlite_decode_array", func(v any) (string, error) {
-		decoded, err := DecodeValue(v)
-		if err != nil {
-			return "", err
-		}
-		if decoded == nil {
-			return "[]", nil
-		}
-		array, err := decoded.ToArray()
-		if err != nil {
-			return "", err
-		}
-		encodedValues := make([]any, 0, len(array.Values))
-		for _, value := range array.Values {
-			v, err := EncodeValue(value)
-			if err != nil {
-				return "", err
-			}
-			encodedValues = append(encodedValues, v)
-		}
-		b, err := json.Marshal(encodedValues)
-		if err != nil {
-			return "", err
-		}
-		return string(b), err
-	}, deterministic); err != nil {
-		return fmt.Errorf("failed to register decode_array function: %w", err)
-	}
-
-	if err := sqlitex.RegisterFunc(conn, "googlesqlite_group_by", func(v any) (any, error) {
-		decoded, err := DecodeValue(v)
-		if err != nil {
-			return "", err
-		}
-		if decoded == nil {
-			return nil, nil
-		}
-		return decoded.Interface(), nil
-	}, deterministic); err != nil {
-		return fmt.Errorf("failed to register group_by function: %w", err)
-	}
-
-	if err := sqlitex.RegisterCollation(conn, "googlesqlite_collate", func(a, b string) int {
-		va, _ := DecodeValue(a)
-		vb, _ := DecodeValue(b)
-		eq, _ := va.EQ(vb)
-		if eq {
-			return 0
-		}
-		cond, _ := va.GT(vb)
-		if cond {
-			return 1
-		}
-		return -1
-	}); err != nil {
-		return fmt.Errorf("failed to register collate function: %w", err)
-	}
-
-	for _, values := range normalFuncMap {
-		for _, v := range values {
-			flags := deterministic
-			if v.NonDeterministic {
-				flags = sqlitex.FunctionFlags{}
-			}
-			if err := sqlitex.RegisterFunc(conn, v.Name, v.Func, flags); err != nil {
-				return fmt.Errorf("failed to register function %s: %w", v.Name, err)
-			}
-		}
-	}
-	for _, values := range aggregateFuncMap {
-		for _, v := range values {
-			if err := sqlitex.RegisterAggregator(conn, v.Name, v.Func, deterministic); err != nil {
-				return fmt.Errorf("failed to register aggregate function %s: %w", v.Name, err)
-			}
-		}
-	}
-	// Window-aggregate functions register through CreateWindowFunction
-	// so they participate in native OVER frame iteration. Functions
-	// that the formatter still routes via the predecessor's
-	// correlated-subquery emulation (DISTINCT, IGNORE NULLS,
-	// non-native ARRAY_AGG/STDDEV/etc.) keep working because
-	// CreateWindowFunction also accepts plain aggregate-shaped
-	// instances.
-	for _, values := range windowFuncMap {
-		for _, v := range values {
-			if err := sqlitex.RegisterWindow(conn, v.Name, v.Func, deterministic); err != nil {
-				return fmt.Errorf("failed to register window function %s: %w", v.Name, err)
-			}
-		}
-	}
-	return nil
-}
 
 func setupNormalFuncMap(info *funcInfo) {
 	normalFuncMap[info.Name] = append(normalFuncMap[info.Name], &nameAndFunc{

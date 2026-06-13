@@ -22,7 +22,7 @@ git clone https://github.com/esilver/googlesqlite
 cd googlesqlite
 
 # Run the emulator with NO cgo (no build flags required):
-CGO_ENABLED=0 go run ./cmd/t0boot
+CGO_ENABLED=0 go run ./cmd/googlesqlite :memory:
 ```
 
 (Engine developers hacking on the transpiler output can still point the engine
@@ -62,9 +62,10 @@ afterwards.)
   HAVING, googlesqlite_agg, ST_*_AGG, st_clusterdbscan, tf_idf, and both
   differential-privacy families) register as arity bands of ANY-parameter
   overloads through the engine's `RegisterAggregateBandConn`, with the same
-  collect / concat / replay state model. Verified by `cmd/t2boot` (9/9
-  corpus-derived aggregate queries, including HLL INIT+MERGE over struct
-  UNNEST and the noiseless `WITH ANONYMIZATION ANON_COUNT(*)` rewrite).
+  collect / concat / replay state model. Verified by the aggregate spec
+  suite (`CGO_ENABLED=0 go run ./cmd/googlesqlite :memory:` reproduces
+  individual cases), including HLL INIT+MERGE over struct UNNEST and the
+  noiseless `WITH ANONYMIZATION ANON_COUNT(*)` rewrite.
 - `doLoadSpatialExtension` is a no-op (geography lowers to pure-Go
   `googlesqlite_st_*`/`s2_*` UDFs, so the native `INSTALL spatial` was a dead probe).
 
@@ -81,19 +82,19 @@ surface the emulator already uses. (See `SWAP-BLUEPRINT.md` in the PoC repo.)
 
 - ✅ Compiles `CGO_ENABLED=0`; T0 (data path, DDL/DML, cross-conn) + scalar UDFs
   (GoogleSQL string/math/`SAFE_*` builtins) run pure-Go.
-- ✅ T2 aggregates: all 32 specs registered and exercised (`cmd/t2boot`, 9/9).
+- ✅ T2 aggregates: all 32 specs registered and exercised by the spec
+  test suite.
   Needs an engine built WITH the json + icu extensions (the UNNEST lowering
   rides `json_each`; timezone-aware temporals need icu) — the PoC repo's
   `rebuild_fs_all.sh` produces it.
-- ✅ **Conformance: 986 PASS / 0 FAIL / 8 SKIP over 994 — EXCEEDS the cgo
-  baseline (972/994).** The cgo build's 14 `bigquery/functions/{search,
-  objectref}` failures turned out to be a wiring gap, not external-service
-  scope: the pure-Go bodies (textfn.BindSearch, extras.BindObj*) always
-  existed — they were never routed on the DuckDB path. A formatter retarget
-  (trySearchObjectRefFunc) plus five entries in the DuckDB UDF allow-list
-  (SEARCH declared BOOL) fixed all 14; the same patch would fix the cgo
-  backend. The 8 skips are proto/graph features with no assertable cases.
-  Run it pure-Go with:
+- ✅ **Conformance:** the named spec gate covers 707 spec files and 1,177
+  asserted cases, with the corpus categorized as 697 implemented, 7 partial,
+  and 3 unsupported specs. See the status section in
+  [README.md](README.md) for the authoritative figures. The
+  `bigquery/functions/{search, objectref}` family runs on pure-Go bodies
+  (textfn.BindSearch, extras.BindObj*) routed through the formatter retarget
+  (trySearchObjectRefFunc) plus the DuckDB UDF allow-list entries
+  (SEARCH declared BOOL). Run the gate pure-Go with:
   `CGO_ENABLED=0 go test -vet=off
   -run 'TestSpec/(googlesql|bigquery)' -test.parallel 4 -timeout 2400s .`
 - Known latent issue (backend-independent): a DuckDB-level failure inside

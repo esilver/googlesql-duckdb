@@ -10,7 +10,7 @@ import (
 )
 
 // aggregateFuncs lists every aggregate function the driver registers
-// through sqlitex.RegisterAggregator. The functions are grouped by
+// as a DuckDB aggregate UDF. The functions are grouped by
 // their GoogleSQL reference category page:
 //
 //   - aggregate_functions.md

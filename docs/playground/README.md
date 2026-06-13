@@ -80,5 +80,5 @@ Measured (node26/V8, M-series):
 | CREATE / INSERT / aggregate | 0.1-0.4 s |
 | memory | ~4.8 GB RSS |
 
-Build it with `make build/wasm` (or let `make dev` do it). Requires node 26
-(`/opt/homebrew/opt/node/bin` on this box; node@22 is broken).
+Build it with `make build/wasm` (or let `make dev` do it). Requires Node 26,
+matching `.github/workflows/release.yml`.

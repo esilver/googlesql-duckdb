@@ -17,15 +17,14 @@ import (
 	"github.com/goccy/googlesqlite/internal/value"
 )
 
-// registerDuckDBUDFs installs the minimal set of googlesqlite_* scalar
-// UDFs that the Milestone-0 boot/critical path needs onto a DuckDB
-// database handle. Today that is only googlesqlite_in_array, which the
-// formatter emits when lowering `IN UNNEST(@param)` (used by every
-// metadata FindProject/FindDataset/... query, so it is on the boot and
-// per-request path). The full ~348-function surface (function_register_*)
-// stays on the SQLite-coupled sqlitex adapter and is the Milestone-1
-// retarget; this file only proves the registration + value round-trip
-// mechanism works against duckdb-go.
+// registerDuckDBUDFs installs the googlesqlite_* scalar UDFs onto a
+// DuckDB database handle. It calls internal.EnsureFuncMaps so the
+// formatter lowers exactly the builtins that get registered here, then
+// registers each UDF against the DuckDB connection (googlesqlite_in_array,
+// the decode/encode envelope helpers, and the value-layer string-family
+// UDFs). googlesqlite_in_array is the formatter's lowering of
+// `IN UNNEST(@param)`, which every metadata FindProject/FindDataset/...
+// query uses, so it is on the boot and per-request path.
 //
 // Registration happens once per inner *sql.DB. DuckDB registers scalar
 // functions at catalog scope, so a single registration is visible to all
@@ -753,7 +752,7 @@ func (u *rangeUDF) Executor() duckdb.ScalarFuncExecutor {
 // registerRangeUDFs installs the RANGE-family scalar UDFs onto a DuckDB
 // connection. The names match exactly what the formatter emits for the
 // resolved GoogleSQL RANGE functions (the bare lowered names, since the
-// legacy sqlitex normalFuncMap is not populated on the DuckDB path).
+// RANGE builtins are not entered into normalFuncMap on the DuckDB path).
 func registerRangeUDFs(conn *sql.Conn) error {
 	udfs := []struct {
 		name string

@@ -135,13 +135,13 @@ func duckdbDSN(name string) string {
 		}
 	}
 	duckParams := duckDBQueryParams(query)
-	// Any in-memory variant -> DuckDB in-memory. The ncruces "memdb"
-	// VFS (the CLI's default DSN, file:/NAME?vfs=memdb) is a
-	// process-shared in-memory database keyed by its path; mapping it
-	// to a root-level on-disk file fails on DuckDB (errno 30). The
-	// DSN-keyed *sql.DB cache in newDBAndCatalog already shares one
-	// engine per full DSN string, which reproduces memdb's
-	// shared-by-name semantics on a DuckDB in-memory database.
+	// Any in-memory variant -> DuckDB in-memory. The supported
+	// file:/NAME?vfs=memdb form names a process-shared in-memory
+	// database keyed by its path. Mapping it to a root-level on-disk
+	// file fails on DuckDB (errno 30), so it collapses to a DuckDB
+	// in-memory DSN. The DSN-keyed *sql.DB cache in newDBAndCatalog
+	// already shares one engine per full DSN string, which reproduces
+	// the shared-by-name semantics on a DuckDB in-memory database.
 	if path == ":memory:" ||
 		strings.HasPrefix(name, "file::memory:") ||
 		strings.Contains(name, "mode=memory") ||
@@ -184,13 +184,11 @@ func duckDBQueryParams(query string) string {
 	return out.Encode()
 }
 
-// internalDuckDBDriver runs formatter-emitted SQL on duckdb-go. The
-// SQLite-specific connection setup (DQS config, TRUSTED_SCHEMA, the ~348
-// googlesqlite_* UDF registrations and INFORMATION_SCHEMA vtab modules)
-// is intentionally omitted for the Milestone-0 spine: the tracer-bullet
-// queries (SELECT 1, CREATE/INSERT/COUNT over scalar columns) use only
-// native DuckDB SQL and bind no googlesqlite_* function. Retargeting the
-// UDF layer to DuckDB scalar/aggregate UDFs is the Milestone-1 work item.
+// internalDuckDBDriver runs formatter-emitted SQL on duckdb-go. Each
+// connection registers the googlesqlite_* scalar and aggregate UDFs
+// against the DuckDB handle via registerDuckDBUDFs in duckdb_udf.go,
+// which calls internal.EnsureFuncMaps so the formatter lowers exactly
+// the builtins that are registered.
 type internalDuckDBDriver struct{}
 
 // internalDuckDBDriver must implement driver.DriverContext: without

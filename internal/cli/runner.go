@@ -19,7 +19,6 @@ import (
 	googlesql "github.com/goccy/go-googlesql"
 	_ "github.com/goccy/googlesqlite" // register the googlesqlite driver
 	"github.com/goccy/googlesqlite/internal"
-	_ "github.com/ncruces/go-sqlite3/vfs/memdb" // register the memdb VFS
 )
 
 const (
@@ -30,12 +29,13 @@ const (
 	// for the .tables / .functions dot-commands.
 	rawDriverName = "googlesqlite_duckdb"
 
-	// DefaultMemoryDSN is the CLI's default data source: an in-memory
-	// database on the ncruces "memdb" VFS. Unlike a bare :memory: DSN,
-	// a memdb database is shared between connections in the process, so
-	// the short-lived connection that .tables / .functions open to read
-	// the catalog sees the same data as the session connection.
-	DefaultMemoryDSN = "file:/googlesqlite_cli.db?vfs=memdb"
+	// DefaultMemoryDSN is the CLI's default data source: a DuckDB
+	// in-memory database. The DuckDB driver shares one underlying
+	// in-memory database across every connection minted from a
+	// connector, so the short-lived connection that .tables / .functions
+	// open to read the catalog sees the same data as the session
+	// connection.
+	DefaultMemoryDSN = ":memory:"
 )
 
 // Result is the structured outcome of executing a single statement.

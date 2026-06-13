@@ -1220,8 +1220,8 @@ func TestPanicInDriverConvertsToError(t *testing.T) {
 //   - Committed rows survive after Tx.Commit.
 //   - Rolled-back rows are gone after Tx.Rollback.
 //
-// These invariants are general-DB contracts and match SQLite's
-// behaviour exactly per googlesqlite/internal/sqlitex.
+// These invariants are general-DB contracts and hold on the DuckDB
+// backend exactly as on any transactional engine.
 func TestTransactionCommitAndRollback(t *testing.T) {
 	db, err := sql.Open("googlesqlite", ":memory:?_test=tx_commit_rollback")
 	if err != nil {

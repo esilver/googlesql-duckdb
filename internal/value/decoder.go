@@ -46,8 +46,8 @@ func coerceJSONNumber(v any) any {
 	return v
 }
 
-// ConvertArgs decodes a sequence of SQLite-side Go values (the form
-// the ncruces driver hands us in Step / scalar callbacks) into a slice
+// ConvertArgs decodes a sequence of Go values (the form the DuckDB
+// engine hands us in Step / scalar UDF callbacks) into a slice
 // of googlesqlite Values. It is a thin loop around DecodeValue.
 func ConvertArgs(args ...any) ([]Value, error) {
 	values := make([]Value, 0, len(args))
