@@ -529,6 +529,9 @@ func TestCoverage_Text(t *testing.T) {
 	if !strings.Contains(res.stdout, "Specs:") {
 		t.Errorf("expected coverage summary; got %s", res.stdout)
 	}
+	if !strings.Contains(res.stdout, "Asserted test cases:    1") {
+		t.Errorf("expected asserted test case count; got %s", res.stdout)
+	}
 	if !strings.Contains(res.stdout, "drafted") {
 		t.Errorf("expected drafted status row; got %s", res.stdout)
 	}
@@ -583,6 +586,9 @@ func TestCoverage_JSON(t *testing.T) {
 	}
 	if _, ok := body["by_status"]; !ok {
 		t.Errorf("expected by_status field; got %s", res.stdout)
+	}
+	if body["asserted_cases"] != float64(1) {
+		t.Errorf("expected asserted_cases=1; got %s", res.stdout)
 	}
 }
 

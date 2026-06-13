@@ -66,6 +66,8 @@ func runCoverage(_ context.Context, args []string) error {
 //     missing or empty
 type coverageReport struct {
 	total           int
+	totalCases      int
+	assertedCases   int
 	byStatus        map[specmeta.Status]int
 	byCategory      map[string]*categoryStat
 	missingTestdata []string
@@ -122,13 +124,22 @@ func buildCoverageReport(root string, specs []specmeta.Spec) *coverageReport {
 					r.statusMismatch = append(r.statusMismatch, sp.Path)
 				}
 			}
-		} else if readyStatus {
-			// status claims tested/implemented; sanity-check that the
-			// testdata file isn't empty and parses as YAML with at
-			// least one case.
+		} else {
+			// Count every parseable testdata case, and separately count
+			// ready-status cases. TestSpec asserts the ready-status set,
+			// so a passing TestSpec run proves all assertedCases passed.
 			tdRel := filepath.ToSlash(td)
 			parsed, err := specmeta.LoadTestdata(root, tdRel)
-			if err != nil || len(parsed.Cases) == 0 {
+			if err == nil {
+				r.totalCases += len(parsed.Cases)
+				if readyStatus {
+					r.assertedCases += len(parsed.Cases)
+				}
+			}
+			if readyStatus && (err != nil || len(parsed.Cases) == 0) {
+				// status claims tested/implemented; sanity-check that
+				// the testdata file isn't empty and parses as YAML with
+				// at least one case.
 				r.statusMismatch = append(r.statusMismatch, sp.Path)
 			}
 		}
@@ -185,6 +196,8 @@ func isReadyStatus(s specmeta.Status) bool {
 // "... and X more" trailer.
 func (r *coverageReport) printText(w *os.File, capHidden int) {
 	fmt.Fprintf(w, "Specs:                  %d\n", r.total)
+	fmt.Fprintf(w, "Testdata cases:         %d\n", r.totalCases)
+	fmt.Fprintf(w, "Asserted test cases:    %d\n", r.assertedCases)
 
 	statuses := make([]specmeta.Status, 0, len(r.byStatus))
 	for s := range r.byStatus {
@@ -242,6 +255,8 @@ func (r *coverageReport) printJSON(w *os.File) error {
 	}
 	type body struct {
 		Total           int                 `json:"total"`
+		TotalCases      int                 `json:"total_cases"`
+		AssertedCases   int                 `json:"asserted_cases"`
 		ByStatus        map[string]int      `json:"by_status"`
 		ByCategory      map[string]catEntry `json:"by_category"`
 		MissingTestdata []string            `json:"missing_testdata"`
@@ -250,6 +265,8 @@ func (r *coverageReport) printJSON(w *os.File) error {
 	}
 	b := body{
 		Total:           r.total,
+		TotalCases:      r.totalCases,
+		AssertedCases:   r.assertedCases,
 		ByStatus:        map[string]int{},
 		ByCategory:      map[string]catEntry{},
 		MissingTestdata: r.missingTestdata,

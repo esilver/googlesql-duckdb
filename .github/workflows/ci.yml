@@ -79,6 +79,55 @@ jobs:
       - name: Test
         run: make test
 
+  spec:
+    name: Spec conformance
+    runs-on: ubuntu-latest
+    env:
+      GOOGLESQLITE_WASM_COMPILATION_MODE: compiler
+      GOOGLESQLITE_WASM_CACHE_DIR: ${{ github.workspace }}/.wasm-cache
+      GOMAXPROCS: "2"
+      GOMEMLIMIT: 4GiB
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-spec-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-mod-spec-${{ runner.os }}-
+
+      - name: Cache Go build cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/go-build
+          key: go-build-spec-${{ runner.os }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-build-spec-${{ runner.os }}-${{ hashFiles('go.sum') }}-
+            go-build-spec-${{ runner.os }}-
+
+      - name: Cache wasm compilation
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.wasm-cache
+          key: wasm-cache-${{ runner.os }}-go-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            wasm-cache-${{ runner.os }}-go-
+
+      - name: Run spec suite
+        run: go test -count=1 -timeout 30m -parallel 4 -run '^TestSpec$' .
+
+      - name: Report spec coverage
+        run: go run ./cmd/specctl coverage --limit 0
+
   lint:
     runs-on: ubuntu-latest
     steps:
