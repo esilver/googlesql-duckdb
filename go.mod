@@ -12,7 +12,7 @@ require (
 	github.com/esilver/duckdb-go-pure v0.3.13
 	github.com/fatih/color v1.19.0
 	github.com/fsouza/fake-gcs-server v1.54.0
-	github.com/goccy/go-googlesql v0.2.3-0.20260610151139-eb229fca73e7
+	github.com/goccy/go-googlesql v0.3.0
 	github.com/goccy/go-json v0.10.6
 	github.com/goccy/go-yaml v1.11.0
 	github.com/golang/geo v0.0.0-20260505155700-1c5af9662e82
