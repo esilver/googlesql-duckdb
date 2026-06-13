@@ -1,8 +1,8 @@
-//go:build duckdb_cgo
+//go:build ignore
 
 package googlesqlite
 
-// This file is a CONTAINED cgo bridge that registers GoogleSQL aggregate /
+// This historical file is a retired cgo bridge that registers GoogleSQL aggregate /
 // window UDFs against DuckDB through the C aggregate-function API
 // (duckdb_create_aggregate_function / duckdb_register_aggregate_function and
 // the duckdb_aggregate_function_set_functions setters). duckdb-go (v2) only
@@ -19,6 +19,12 @@ package googlesqlite
 // wire form and a Done() that re-encodes it. We do not reimplement any
 // aggregate math here; we only adapt DuckDB's parallel state model onto the
 // Step/Done shape.
+//
+// It is intentionally excluded from supported builds. The active implementation
+// is duckdb_aggregate_udf_purego.go, backed by github.com/esilver/duckdb-go-pure.
+// The old duckdb_cgo tag depended on duckdb-go internals that no longer exist in
+// this fork's pure-Go duckdbgo facade, so keeping it selectable made `-tags
+// duckdb_cgo` a broken configuration.
 //
 // State model: DuckDB drives aggregates with a fixed-size per-group state
 // buffer plus init / update / combine / finalize / destroy callbacks, and may

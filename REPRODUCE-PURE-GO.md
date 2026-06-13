@@ -56,9 +56,9 @@ afterwards.)
   `duckdb-go/v2` API subset the emulator consumes (`Driver`, `Decimal`,
   `Type`/`TypeInfo`, `RegisterScalarUDF`, `RegisterTableUDF`, …) backed by the
   pure-Go engine. Call sites are unchanged apart from the import path.
-- The historical cgo translation unit `duckdb_aggregate_udf.go` is build-tagged
-  `//go:build duckdb_cgo`; `duckdb_aggregate_udf_purego.go` is the
-  pure-Go port of the same bridge: all 32 aggregate specs (KLL, HLL, ANY_VALUE
+- The historical cgo translation unit `duckdb_aggregate_udf.go` is archived
+  behind `//go:build ignore`; `duckdb_aggregate_udf_purego.go` is the
+  supported pure-Go bridge: all 32 aggregate specs (KLL, HLL, ANY_VALUE
   HAVING, googlesqlite_agg, ST_*_AGG, st_clusterdbscan, tf_idf, and both
   differential-privacy families) register as arity bands of ANY-parameter
   overloads through the engine's `RegisterAggregateBandConn`, with the same

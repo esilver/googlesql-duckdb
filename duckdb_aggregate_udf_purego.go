@@ -1,14 +1,11 @@
-//go:build !duckdb_cgo
-
 package googlesqlite
 
-// This file is the default pure-Go counterpart of duckdb_aggregate_udf.go
-// (which is tagged //go:build duckdb_cgo): it registers the same GoogleSQL aggregate /
+// This file is the pure-Go aggregate bridge. It registers the GoogleSQL aggregate /
 // window UDF surface against the wasm2go pure-Go DuckDB engine through
 // github.com/esilver/duckdb-go-pure's RegisterAggregateBandConn instead of the C aggregate
-// API. The two files are mutually exclusive by build tag and intentionally share
-// helper names (aggSpec, duckdbAggSpecs, normalizeJSONScalar, toFloat64Result,
-// toInt64Result, ...) so they stay textually comparable.
+// API. The historical cgo bridge is archived behind //go:build ignore; this file
+// is the supported implementation for normal builds, including accidental
+// `-tags duckdb_cgo` builds.
 //
 // Engine-side differences from the cgo bridge:
 //   - No C trampolines: the engine injects the aggregate callbacks as Go
