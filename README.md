@@ -13,9 +13,10 @@ covers 707 spec files and 1,177 asserted cases, with the corpus categorized as
 [REPRODUCE-PURE-GO.md](REPRODUCE-PURE-GO.md) and
 [CLI-PURE-GO.md](CLI-PURE-GO.md).
 
-GoogleSQL parsing and analysis is provided by
-[`goccy/go-googlesql`](https://github.com/goccy/go-googlesql), and query
-execution runs on
+GoogleSQL parsing and analysis is provided by the forked
+[`esilver/go-googlesql`](https://github.com/esilver/go-googlesql) bridge
+through the compatibility module path `github.com/goccy/go-googlesql`, and
+query execution runs on
 [`duckdb-go-pure`](https://github.com/esilver/duckdb-go-pure). Both the
 analysis layer and execution backend are implemented in pure Go, so no cgo is
 required.
