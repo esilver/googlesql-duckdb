@@ -2115,6 +2115,7 @@ func (a *Analyzer) newDropFunctionStmtAction(ctx context.Context, query string, 
 	return &DropStmtAction{
 		name:       name,
 		objectType: "FUNCTION",
+		ifExists:   m1(node.IsIfExists()),
 		funcMap:    funcMapFromContext(ctx),
 		catalog:    a.catalog,
 		query:      query,

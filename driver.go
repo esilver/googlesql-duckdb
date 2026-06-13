@@ -417,7 +417,8 @@ var _ driver.DriverContext = (*Driver)(nil)
 
 type Conn struct {
 	conn           *sql.Conn
-	tx             *sql.Tx
+	txActive       bool
+	txReset        string
 	analyzer       *internal.Analyzer
 	catalog        *internal.Catalog
 	systemVars     map[string]string
@@ -446,23 +447,9 @@ type Conn struct {
 // it on every pool fetch before handing the Conn to the next caller —
 // returning false makes the pool discard us and pull a fresh one
 // instead of letting us surface a confusing "sql: connection is
-// already closed" error inside the next request. The flag is set by
-// translateConnDone whenever an earlier operation observed the inner
-// handle had been closed (typically by a request whose context was
-// cancelled mid-statement; database/sql's tx watcher then ran
-// Rollback(discardConn=true) on the inner connection).
-//
-// A non-nil c.tx at validation time is the second poisoned state: a
-// driver conn can only re-enter the pool with an open driver-level
-// transaction when the OUTER tx was discarded by its context watcher
-// (expiry/cancel mid-statement — e.g. a watchdog budget interrupting a
-// runaway statement) WITHOUT calling Tx.Rollback on us. The inner tx
-// watcher has closed (or is about to close) the inner conn, so the
-// next caller would eat one "driver: bad connection" — fatal on a
-// dedicated sql.Conn, where database/sql cannot retry. Reporting
-// invalid here makes the pool prune us at put-back/fetch instead.
+// already closed" error inside the next request.
 func (c *Conn) IsValid() bool {
-	return !c.dead.Load() && c.tx == nil
+	return !c.dead.Load() && !c.txActive
 }
 
 // ResetSession implements driver.SessionResetter as a second line of
@@ -471,7 +458,7 @@ func (c *Conn) IsValid() bool {
 // conn when it reports driver.ErrBadConn, so the caller never observes
 // the dead conn even if it slipped past put-back validation.
 func (c *Conn) ResetSession(_ context.Context) error {
-	if c.dead.Load() || c.tx != nil {
+	if c.dead.Load() || c.txActive {
 		return driver.ErrBadConn
 	}
 	return nil
@@ -482,12 +469,9 @@ func (c *Conn) ResetSession(_ context.Context) error {
 // sentinel.
 //
 // The inner *sql.Conn we hold can become done while still appearing
-// healthy to database/sql's outer pool: a cancelled request triggers
-// the inner-tx watcher's Rollback(discardConn=true), which closes the
-// inner conn, but the outer pool doesn't know because the failure
-// hasn't surfaced yet. The first operation on the poisoned Conn then
-// fails with sql.ErrConnDone — which to a caller looks like a server
-// error, not a transient retryable condition. Mapping it to
+// healthy to database/sql's outer pool. The first operation on the
+// poisoned Conn then fails with sql.ErrConnDone — which to a caller
+// looks like a server error, not a transient retryable condition. Mapping it to
 // driver.ErrBadConn tells database/sql to drop the Conn from the pool
 // and retry on a fresh one (when the call has not yet sent data),
 // hiding the transient from the caller; setting dead=true means the
@@ -508,23 +492,6 @@ func (c *Conn) translateConnDone(err error) error {
 	return err
 }
 
-// markDeadOnExpiredTx marks the Conn dead when an operation failed
-// inside an open driver-level transaction whose context has expired.
-// The inner tx was begun on that same context, so database/sql's inner
-// tx watcher is guaranteed to discard the inner connection — but the
-// discard races the operation's return, and at put-back time the Conn
-// can look healthy (the watcher's driver Rollback has already cleared
-// c.tx, dead is unset). Without this, the conn re-enters the pool and
-// the NEXT caller eats one "driver: bad connection" — fatal on a
-// dedicated sql.Conn, where database/sql cannot retry. Observed behind
-// the bigquery-emulator statement watchdog: the v0.3.5 engine interrupt
-// kills the runaway statement, then the very next request failed.
-func (c *Conn) markDeadOnExpiredTx(ctx context.Context, e *error) {
-	if *e != nil && c.tx != nil && ctx.Err() != nil {
-		c.dead.Store(true)
-	}
-}
-
 // Static contract check: database/sql's pool only calls IsValid via a
 // type assertion against driver.Validator. Failing this assertion at
 // compile time keeps a future refactor that drops the method visible
@@ -537,7 +504,7 @@ var (
 func newConn(db *sql.DB, catalog *internal.Catalog) (*Conn, error) {
 	conn, err := db.Conn(context.Background())
 	if err != nil {
-		return nil, fmt.Errorf("failed to get sqlite3 connection: %w", err)
+		return nil, fmt.Errorf("failed to get DuckDB connection: %w", err)
 	}
 	analyzer, err := internal.NewAnalyzer(catalog)
 	if err != nil {
@@ -651,9 +618,9 @@ func (c *Conn) recoverPanicPoison(e *error) {
 // catalog sync). Issuing a best-effort ROLLBACK clears the dangling
 // transaction; if none is open the ROLLBACK itself fails harmlessly
 // and is discarded. Never called while an explicit user transaction
-// (c.tx) is open — rolling that back is the user's decision.
+// (txActive) is open — rolling that back is the user's decision.
 func (c *Conn) rollbackDanglingTx() {
-	if c.tx != nil {
+	if c.txActive {
 		return
 	}
 	// context.Background() deliberately: the statement's ctx may be the
@@ -664,14 +631,13 @@ func (c *Conn) rollbackDanglingTx() {
 
 func (c *Conn) PrepareContext(ctx context.Context, query string) (s driver.Stmt, e error) {
 	defer func() { e = c.translateConnDone(e) }()
-	defer c.markDeadOnExpiredTx(ctx, &e)
 	defer func() {
 		if e != nil {
 			c.rollbackDanglingTx()
 		}
 	}()
 	defer c.recoverPanicPoison(&e)
-	conn := internal.NewConnWithOptions(c.conn, c.tx, c.systemVars, c.scriptVars, c.materializeCTE)
+	conn := internal.NewConnWithOptions(c.conn, nil, c.systemVars, c.scriptVars, c.materializeCTE)
 	actionFuncs, err := c.analyzer.Analyze(ctx, conn, query, nil)
 	if err != nil {
 		return nil, err
@@ -693,14 +659,13 @@ func (c *Conn) PrepareContext(ctx context.Context, query string) (s driver.Stmt,
 
 func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (r driver.Result, e error) {
 	defer func() { e = c.translateConnDone(e) }()
-	defer c.markDeadOnExpiredTx(ctx, &e)
 	defer func() {
 		if e != nil {
 			c.rollbackDanglingTx()
 		}
 	}()
 	defer c.recoverPanicPoison(&e)
-	conn := internal.NewConnWithOptions(c.conn, c.tx, c.systemVars, c.scriptVars, c.materializeCTE)
+	conn := internal.NewConnWithOptions(c.conn, nil, c.systemVars, c.scriptVars, c.materializeCTE)
 	actionFuncs, err := c.analyzer.Analyze(ctx, conn, query, args)
 	if err != nil {
 		return nil, err
@@ -735,14 +700,13 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 
 func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (r driver.Rows, e error) {
 	defer func() { e = c.translateConnDone(e) }()
-	defer c.markDeadOnExpiredTx(ctx, &e)
 	defer func() {
 		if e != nil {
 			c.rollbackDanglingTx()
 		}
 	}()
 	defer c.recoverPanicPoison(&e)
-	conn := internal.NewConnWithOptions(c.conn, c.tx, c.systemVars, c.scriptVars, c.materializeCTE)
+	conn := internal.NewConnWithOptions(c.conn, nil, c.systemVars, c.scriptVars, c.materializeCTE)
 	actionFuncs, err := c.analyzer.Analyze(ctx, conn, query, args)
 	if err != nil {
 		return nil, err
@@ -781,63 +745,86 @@ func (c *Conn) Close() error {
 
 func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (t driver.Tx, e error) {
 	defer func() { e = c.translateConnDone(e) }()
-	tx, err := c.conn.BeginTx(ctx, &sql.TxOptions{
-		Isolation: sql.IsolationLevel(opts.Isolation),
-		ReadOnly:  opts.ReadOnly,
-	})
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	txReset, err := c.beginExplicitTx(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
-	c.tx = tx
+	c.txActive = true
+	c.txReset = txReset
 	return &Tx{
-		tx:   tx,
 		conn: c,
 	}, nil
 }
 
 func (c *Conn) Begin() (t driver.Tx, e error) {
 	defer func() { e = c.translateConnDone(e) }()
-	tx, err := c.conn.BeginTx(context.Background(), nil)
+	txReset, err := c.beginExplicitTx(context.Background(), driver.TxOptions{})
 	if err != nil {
 		return nil, err
 	}
-	c.tx = tx
+	c.txActive = true
+	c.txReset = txReset
 	return &Tx{
-		tx:   tx,
 		conn: c,
 	}, nil
 }
 
+// beginExplicitTx uses the request context only while running BEGIN.
+// It deliberately avoids creating an inner *sql.Tx, whose cancel
+// watcher can close the inner *sql.Conn asynchronously after statement
+// cancellation and leave the outer driver Conn poisoned.
+func (c *Conn) beginExplicitTx(ctx context.Context, opts driver.TxOptions) (string, error) {
+	if opts.ReadOnly {
+		return "", errors.New("googlesqlite: read-only transactions are not supported by the DuckDB backend")
+	}
+	if opts.Isolation != driver.IsolationLevel(sql.LevelDefault) {
+		return "", fmt.Errorf("googlesqlite: unsupported isolation level %d on the DuckDB backend", opts.Isolation)
+	}
+	if _, err := c.conn.ExecContext(ctx, "BEGIN TRANSACTION"); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
+		return "", err
+	}
+	return "", nil
+}
+
 type Tx struct {
-	tx   *sql.Tx
 	conn *Conn
 }
 
 func (tx *Tx) Commit() error {
 	defer func() {
-		tx.conn.tx = nil
+		tx.conn.txActive = false
+		tx.conn.txReset = ""
 	}()
-	return tx.conn.markDeadOnLostTx(tx.tx.Commit())
+	err := tx.conn.execTxEnd("COMMIT")
+	if err != nil {
+		_ = tx.conn.execTxEnd("ROLLBACK")
+	}
+	return err
 }
 
 func (tx *Tx) Rollback() error {
 	defer func() {
-		tx.conn.tx = nil
+		tx.conn.txActive = false
+		tx.conn.txReset = ""
 	}()
-	return tx.conn.markDeadOnLostTx(tx.tx.Rollback())
+	return tx.conn.execTxEnd("ROLLBACK")
 }
 
-// markDeadOnLostTx inspects a driver-level Commit/Rollback result: at
-// this level database/sql calls each exactly once, so ErrTxDone means
-// the INNER tx watcher finished the transaction first (context expiry
-// mid-transaction) and has discarded — or is discarding — the inner
-// connection. ErrConnDone is the same story observed later. Either way
-// this Conn must not return to the pool; see markDeadOnExpiredTx for
-// the statement-time twin of this put-back-time check.
-func (c *Conn) markDeadOnLostTx(err error) error {
-	if err != nil && (errors.Is(err, sql.ErrTxDone) || errors.Is(err, sql.ErrConnDone)) {
-		c.dead.Store(true)
+func (c *Conn) execTxEnd(command string) error {
+	if !c.txActive {
+		return sql.ErrTxDone
 	}
+	query := command
+	if c.txReset != "" {
+		query += "; " + c.txReset
+	}
+	_, err := c.conn.ExecContext(context.Background(), query)
 	return err
 }
 
