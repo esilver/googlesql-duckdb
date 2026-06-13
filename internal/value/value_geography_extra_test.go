@@ -21,7 +21,7 @@ func TestGeographyConstructorsAndAccessors(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if wkt != "POINT (1 2)" {
+		if wkt != "POINT(1 2)" {
 			t.Fatalf("WKT: %s", wkt)
 		}
 		lon, lat, ok := g.PointCoordinates()
@@ -47,7 +47,7 @@ func TestGeographyConstructorsAndAccessors(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if wkt != "LINESTRING (1 2, 3 4)" {
+		if wkt != "LINESTRING(1 2, 3 4)" {
 			t.Fatalf("WKT: %s", wkt)
 		}
 	})
@@ -65,7 +65,7 @@ func TestGeographyConstructorsAndAccessors(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if wkt != "POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0))" {
+		if wkt != "POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))" {
 			t.Fatalf("WKT: %s", wkt)
 		}
 		// POLYGON EMPTY branch
@@ -303,32 +303,32 @@ func TestGeographyConstructorsAndAccessors(t *testing.T) {
 	t.Run("ToString/ToBytes/ToJSON/Format/Interface", func(t *testing.T) {
 		g := value.NewGeographyPoint(1, 2)
 		s, _ := g.ToString()
-		if s != "POINT (1 2)" {
+		if s != "POINT(1 2)" {
 			t.Fatalf("ToString: %s", s)
 		}
 		b, _ := g.ToBytes()
-		if string(b) != "POINT (1 2)" {
+		if string(b) != "POINT(1 2)" {
 			t.Fatalf("ToBytes: %s", b)
 		}
 		j, _ := g.ToJSON()
-		if j != `"POINT (1 2)"` {
+		if j != `"POINT(1 2)"` {
 			t.Fatalf("ToJSON: %s", j)
 		}
-		if got := g.Format('t'); got != "POINT (1 2)" {
+		if got := g.Format('t'); got != "POINT(1 2)" {
 			t.Fatalf("Format t: %s", got)
 		}
-		if got := g.Format('T'); got != `GEOGRAPHY "POINT (1 2)"` {
+		if got := g.Format('T'); got != `GEOGRAPHY "POINT(1 2)"` {
 			t.Fatalf("Format T: %s", got)
 		}
-		if got := g.Format('x'); got != "POINT (1 2)" {
+		if got := g.Format('x'); got != "POINT(1 2)" {
 			t.Fatalf("Format default: %s", got)
 		}
-		if got, ok := g.Interface().(string); !ok || got != "POINT (1 2)" {
+		if got, ok := g.Interface().(string); !ok || got != "POINT(1 2)" {
 			t.Fatalf("Interface: %v (%T)", g.Interface(), g.Interface())
 		}
 		// String() returns the WKT.
 		str, _ := g.String()
-		if str != "POINT (1 2)" {
+		if str != "POINT(1 2)" {
 			t.Fatalf("String: %s", str)
 		}
 	})

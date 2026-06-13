@@ -7,4 +7,4 @@ cases:
     sql: SELECT ST_ASTEXT(ST_GEOGFROMKML('<Point><coordinates>1,2</coordinates></Point>')) AS s
     expected:
       rows:
-        - ['POINT (1 2)']
+        - ['POINT(1 2)']

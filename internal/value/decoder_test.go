@@ -197,7 +197,7 @@ func TestDecodeValue(t *testing.T) {
 			t.Fatalf("type: %T", got)
 		}
 		s, _ := gv.ToWKT()
-		if s != "POINT (1 2)" {
+		if s != "POINT(1 2)" {
 			t.Fatalf("WKT: %s", s)
 		}
 	})

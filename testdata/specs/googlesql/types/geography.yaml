@@ -1,10 +1,14 @@
 spec: docs/specs/googlesql/types/geography.md
 dialect: googlesql
-# Sourced from googlesql-wasm/googlesql/.../compliance/testdata
-# (Apache-2.0 derivative) -- ST_GEOGFROMTEXT round-trip via ST_ASTEXT.
+# Round-trip a point through WKT via ST_GEOGFROMTEXT + ST_ASTEXT.
+# Expected value verified against production BigQuery, whose ST_ASTEXT
+# omits the space after the geometry tag ("POINT(1 2)"). This diverges
+# from the GoogleSQL compliance/testdata fixtures (Apache-2.0), which
+# render "POINT (1 2)" with a space via the open-source S2 formatter.
+# A BigQuery emulator matches BigQuery, so the BQ rendering is canonical.
 cases:
   - desc: round-trip point through WKT
     sql: SELECT ST_ASTEXT(ST_GEOGFROMTEXT('POINT(1 2)')) AS wkt
     expected:
       rows:
-        - ['POINT (1 2)']
+        - ['POINT(1 2)']

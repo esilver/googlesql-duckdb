@@ -4018,14 +4018,29 @@ func (n *CastNode) tryNativeCast(ctx context.Context) (string, bool, error) {
 		}
 		switch fromKind {
 		case googlesql.TypeKindTypeDatetime:
-			return fmt.Sprintf("strftime(%s, '%%Y-%%m-%%d %%H:%%M:%%S')", expr), true, nil
+			// BigQuery emits fractional seconds only when non-zero, at
+			// millisecond (3-digit) or microsecond (6-digit) resolution.
+			// DuckDB strftime %f always emits 6 digits with trailing
+			// zeros, so branch on the sub-second microseconds.
+			// microsecond() returns SS*1e6+micros, hence the modulo.
+			return fmt.Sprintf("CASE "+
+				"WHEN microsecond(%[1]s) %% 1000000 = 0 THEN strftime(%[1]s, '%%Y-%%m-%%d %%H:%%M:%%S') "+
+				"WHEN microsecond(%[1]s) %% 1000 = 0 THEN strftime(%[1]s, '%%Y-%%m-%%d %%H:%%M:%%S.') || substr(strftime(%[1]s, '%%f'), 1, 3) "+
+				"ELSE strftime(%[1]s, '%%Y-%%m-%%d %%H:%%M:%%S.%%f') END", expr), true, nil
 		case googlesql.TypeKindTypeDate:
 			return fmt.Sprintf("strftime(%s, '%%Y-%%m-%%d')", expr), true, nil
 		case googlesql.TypeKindTypeTime:
 			// DuckDB CAST(TIME AS VARCHAR) already yields HH:MM:SS[.ffffff].
 			return fmt.Sprintf("CAST(%s AS VARCHAR)", expr), true, nil
 		case googlesql.TypeKindTypeTimestamp:
-			return fmt.Sprintf("strftime(%s AT TIME ZONE 'UTC', '%%Y-%%m-%%d %%H:%%M:%%S+00')", expr), true, nil
+			// As with DATETIME above, emit fractional seconds only when
+			// non-zero and trim to milli/micro resolution; the literal
+			// "+00" UTC offset follows the (optional) fraction.
+			utc := fmt.Sprintf("%s AT TIME ZONE 'UTC'", expr)
+			return fmt.Sprintf("CASE "+
+				"WHEN microsecond(%[1]s) %% 1000000 = 0 THEN strftime(%[1]s, '%%Y-%%m-%%d %%H:%%M:%%S+00') "+
+				"WHEN microsecond(%[1]s) %% 1000 = 0 THEN strftime(%[1]s, '%%Y-%%m-%%d %%H:%%M:%%S.') || substr(strftime(%[1]s, '%%f'), 1, 3) || '+00' "+
+				"ELSE strftime(%[1]s, '%%Y-%%m-%%d %%H:%%M:%%S.%%f+00') END", utc), true, nil
 		}
 	}
 

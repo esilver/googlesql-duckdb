@@ -9,4 +9,4 @@ cases:
     sql: SELECT ST_ASTEXT(ST_CENTROID(ST_GEOGFROMTEXT('POINT(0 0)'))) AS s
     expected:
       rows:
-        - ['POINT (0 0)']
+        - ['POINT(0 0)']

@@ -5,4 +5,4 @@ cases:
     sql: SELECT ST_ASTEXT(ST_GEOGPOINT(1.5, 2.5))
     expected:
       rows:
-        - ['POINT (1.5 2.5)']
+        - ['POINT(1.5 2.5)']

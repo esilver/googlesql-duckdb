@@ -86,7 +86,7 @@ func TestBindStStartEndPoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mustString(t, got) != "POINT (0 0)" {
+	if mustString(t, got) != "POINT(0 0)" {
 		t.Fatalf("got %q", mustString(t, got))
 	}
 
@@ -94,7 +94,7 @@ func TestBindStStartEndPoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mustString(t, got) != "POINT (2 2)" {
+	if mustString(t, got) != "POINT(2 2)" {
 		t.Fatalf("got %q", mustString(t, got))
 	}
 
@@ -130,7 +130,7 @@ func TestBindStPointN(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mustString(t, got) != "POINT (0 0)" {
+	if mustString(t, got) != "POINT(0 0)" {
 		t.Fatalf("got %q", mustString(t, got))
 	}
 
@@ -138,7 +138,7 @@ func TestBindStPointN(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mustString(t, got) != "POINT (1 1)" {
+	if mustString(t, got) != "POINT(1 1)" {
 		t.Fatalf("got %q", mustString(t, got))
 	}
 
@@ -147,7 +147,7 @@ func TestBindStPointN(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mustString(t, got) != "POINT (2 2)" {
+	if mustString(t, got) != "POINT(2 2)" {
 		t.Fatalf("got %q", mustString(t, got))
 	}
 
@@ -459,7 +459,7 @@ func TestBindStCentroid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mustString(t, got) != "POINT (10 20)" {
+	if mustString(t, got) != "POINT(10 20)" {
 		t.Fatalf("got %q", mustString(t, got))
 	}
 
@@ -667,7 +667,7 @@ func TestBindStGeogFromGeoJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mustString(t, got) != "POINT (1 2)" {
+	if mustString(t, got) != "POINT(1 2)" {
 		t.Fatalf("got %q", mustString(t, got))
 	}
 
@@ -690,7 +690,7 @@ func TestBindStAsBinaryRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mustString(t, back) != "POINT (1 2)" {
+	if mustString(t, back) != "POINT(1 2)" {
 		t.Fatalf("got %q", mustString(t, back))
 	}
 
@@ -715,7 +715,7 @@ func TestBindStAsText(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mustString(t, got) != "POINT (1 2)" {
+	if mustString(t, got) != "POINT(1 2)" {
 		t.Fatalf("got %q", mustString(t, got))
 	}
 
@@ -1719,7 +1719,7 @@ func TestBindStGeogPointInputs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mustString(t, got) != "POINT (10 20)" {
+	if mustString(t, got) != "POINT(10 20)" {
 		t.Fatalf("got %q", mustString(t, got))
 	}
 
@@ -1749,7 +1749,7 @@ func TestBindStGeogFromText(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mustString(t, got) != "POINT (1 2)" {
+	if mustString(t, got) != "POINT(1 2)" {
 		t.Fatalf("got %q", mustString(t, got))
 	}
 

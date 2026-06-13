@@ -369,8 +369,8 @@ func TestW_GeographyExtra(t *testing.T) {
 				if err := row.Scan(&got); err != nil {
 					t.Fatal(err)
 				}
-				if got != "POINT (1 2)" {
-					t.Errorf("got %q want %q", got, "POINT (1 2)")
+				if got != "POINT(1 2)" {
+					t.Errorf("got %q want %q", got, "POINT(1 2)")
 				}
 			},
 		},
@@ -747,15 +747,19 @@ func TestW_GeographyNonPoint(t *testing.T) {
 	defer db.Close()
 	ctx := context.Background()
 
+	// wkt is the (space-form) WKT input ST_GEOGFROMTEXT must accept;
+	// want is the canonical ST_ASTEXT rendering BigQuery returns, which
+	// omits the space after the geometry tag.
 	cases := []struct {
 		name string
 		wkt  string
+		want string
 	}{
-		{"linestring", "LINESTRING (0 0, 1 1, 2 2)"},
-		{"polygon", "POLYGON ((0 0, 4 0, 4 4, 0 4, 0 0), (1 1, 2 1, 2 2, 1 2, 1 1))"},
-		{"multipoint", "MULTIPOINT (0 0, 1 1, 2 2)"},
-		{"multilinestring", "MULTILINESTRING ((0 0, 1 1), (2 2, 3 3))"},
-		{"multipolygon", "MULTIPOLYGON (((0 0, 1 0, 1 1, 0 1, 0 0)), ((2 2, 3 2, 3 3, 2 3, 2 2)))"},
+		{"linestring", "LINESTRING (0 0, 1 1, 2 2)", "LINESTRING(0 0, 1 1, 2 2)"},
+		{"polygon", "POLYGON ((0 0, 4 0, 4 4, 0 4, 0 0), (1 1, 2 1, 2 2, 1 2, 1 1))", "POLYGON((0 0, 4 0, 4 4, 0 4, 0 0), (1 1, 2 1, 2 2, 1 2, 1 1))"},
+		{"multipoint", "MULTIPOINT (0 0, 1 1, 2 2)", "MULTIPOINT(0 0, 1 1, 2 2)"},
+		{"multilinestring", "MULTILINESTRING ((0 0, 1 1), (2 2, 3 3))", "MULTILINESTRING((0 0, 1 1), (2 2, 3 3))"},
+		{"multipolygon", "MULTIPOLYGON (((0 0, 1 0, 1 1, 0 1, 0 0)), ((2 2, 3 2, 3 3, 2 3, 2 2)))", "MULTIPOLYGON(((0 0, 1 0, 1 1, 0 1, 0 0)), ((2 2, 3 2, 3 3, 2 3, 2 2)))"},
 	}
 	for _, tc := range cases {
 		t.Run("round-trip "+tc.name, func(t *testing.T) {
@@ -765,8 +769,8 @@ func TestW_GeographyNonPoint(t *testing.T) {
 			if err := row.Scan(&got); err != nil {
 				t.Fatalf("scan: %v", err)
 			}
-			if got != tc.wkt {
-				t.Errorf("got %q want %q", got, tc.wkt)
+			if got != tc.want {
+				t.Errorf("got %q want %q", got, tc.want)
 			}
 		})
 	}

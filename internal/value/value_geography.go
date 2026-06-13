@@ -418,7 +418,7 @@ func (g *geographyPoint) ToWKT() (string, error) {
 	if g.empty {
 		return "POINT EMPTY", nil
 	}
-	return fmt.Sprintf("POINT (%s %s)", formatCoord(g.longitude), formatCoord(g.latitude)), nil
+	return fmt.Sprintf("POINT(%s %s)", formatCoord(g.longitude), formatCoord(g.latitude)), nil
 }
 func (g *geographyPoint) equal(o geographyType) bool {
 	other, ok := o.(*geographyPoint)
@@ -440,7 +440,7 @@ type geographyLineString struct {
 
 func (g *geographyLineString) Kind() string { return "LINESTRING" }
 func (g *geographyLineString) ToWKT() (string, error) {
-	return "LINESTRING " + formatCoordList(g.points), nil
+	return "LINESTRING" + formatCoordList(g.points), nil
 }
 func (g *geographyLineString) equal(o geographyType) bool {
 	other, ok := o.(*geographyLineString)
@@ -488,7 +488,7 @@ func (g *geographyPolygon) ToWKT() (string, error) {
 	for i, r := range g.rings {
 		parts[i] = formatCoordList(r)
 	}
-	return "POLYGON (" + strings.Join(parts, ", ") + ")", nil
+	return "POLYGON(" + strings.Join(parts, ", ") + ")", nil
 }
 func (g *geographyPolygon) equal(o geographyType) bool {
 	other, ok := o.(*geographyPolygon)
@@ -509,7 +509,7 @@ type geographyMultiPoint struct {
 
 func (g *geographyMultiPoint) Kind() string { return "MULTIPOINT" }
 func (g *geographyMultiPoint) ToWKT() (string, error) {
-	return "MULTIPOINT " + formatCoordList(g.points), nil
+	return "MULTIPOINT" + formatCoordList(g.points), nil
 }
 func (g *geographyMultiPoint) equal(o geographyType) bool {
 	other, ok := o.(*geographyMultiPoint)
@@ -536,7 +536,7 @@ func (g *geographyMultiLineString) ToWKT() (string, error) {
 	for i, ls := range g.lines {
 		parts[i] = formatCoordList(ls)
 	}
-	return "MULTILINESTRING (" + strings.Join(parts, ", ") + ")", nil
+	return "MULTILINESTRING(" + strings.Join(parts, ", ") + ")", nil
 }
 func (g *geographyMultiLineString) equal(o geographyType) bool {
 	other, ok := o.(*geographyMultiLineString)
@@ -568,7 +568,7 @@ func (g *geographyMultiPolygon) ToWKT() (string, error) {
 		}
 		parts[i] = "(" + strings.Join(ringStrs, ", ") + ")"
 	}
-	return "MULTIPOLYGON (" + strings.Join(parts, ", ") + ")", nil
+	return "MULTIPOLYGON(" + strings.Join(parts, ", ") + ")", nil
 }
 func (g *geographyMultiPolygon) equal(o geographyType) bool {
 	other, ok := o.(*geographyMultiPolygon)
@@ -602,7 +602,7 @@ func (g *geographyCollection) ToWKT() (string, error) {
 		}
 		parts[i] = s
 	}
-	return "GEOMETRYCOLLECTION (" + strings.Join(parts, ", ") + ")", nil
+	return "GEOMETRYCOLLECTION(" + strings.Join(parts, ", ") + ")", nil
 }
 func (g *geographyCollection) equal(o geographyType) bool {
 	other, ok := o.(*geographyCollection)

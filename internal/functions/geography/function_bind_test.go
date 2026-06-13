@@ -22,7 +22,7 @@ func Test_FunctionBind_bindStGeogPoint(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if res != "POINT (1 2)" {
+		if res != "POINT(1 2)" {
 			t.Fatalf("unexpected result: %s", res)
 		}
 	})
@@ -53,7 +53,7 @@ func Test_FunctionBind_bindStGeogFromText(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if res != "POINT (0 -49.23)" {
+		if res != "POINT(0 -49.23)" {
 			t.Fatalf("unexpected result: %s", res)
 		}
 	})

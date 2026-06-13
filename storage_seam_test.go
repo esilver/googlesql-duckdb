@@ -317,6 +317,21 @@ func TestStorageSeam_Datetime(t *testing.T) {
 	wantString(t, db, "SELECT CAST(c AS STRING) FROM t", "2024-03-15 12:34:56")
 }
 
+func TestStorageSeam_DatetimeSubsecond(t *testing.T) {
+	t.Parallel()
+	db := openSeamDB(t, "datetime_subsecond")
+	seamExec(t, db,
+		"CREATE TABLE t (c DATETIME)",
+		"INSERT INTO t (c) VALUES (DATETIME '2024-03-15 12:30:45.5')",
+	)
+	// BigQuery renders sub-second DATETIME with a space separator and
+	// pads/trims the fraction to millisecond (3-digit) resolution:
+	// CAST(DATETIME '2024-03-15 12:30:45.5' AS STRING) -> "...45.500".
+	// Whole-second values carry no fraction at all.
+	wantString(t, db, "SELECT CAST(c AS STRING) FROM t", "2024-03-15 12:30:45.500")
+	wantString(t, db, "SELECT CAST(CAST(c AS DATETIME) AS STRING) FROM t", "2024-03-15 12:30:45.500")
+}
+
 func TestStorageSeam_Timestamp(t *testing.T) {
 	t.Parallel()
 	db := openSeamDB(t, "timestamp")
@@ -333,6 +348,19 @@ func TestStorageSeam_Timestamp(t *testing.T) {
 	wantInt64(t, db, "SELECT UNIX_SECONDS(c) FROM t",
 		time.Date(2024, 3, 15, 12, 34, 56, 0, time.UTC).Unix())
 	wantInt64(t, db, "SELECT COUNT(*) FROM t WHERE c < CURRENT_TIMESTAMP()", 1)
+}
+
+func TestStorageSeam_TimestampSubsecond(t *testing.T) {
+	t.Parallel()
+	db := openSeamDB(t, "timestamp_subsecond")
+	seamExec(t, db,
+		"CREATE TABLE t (c TIMESTAMP)",
+		"INSERT INTO t (c) VALUES (TIMESTAMP '2024-03-15 12:30:45.5+00')",
+	)
+	// CAST(TIMESTAMP '2024-03-15 12:30:45.5 UTC' AS STRING) ->
+	// "2024-03-15 12:30:45.500+00" in BigQuery: the fraction is padded to
+	// millisecond resolution and the literal "+00" UTC offset follows it.
+	wantString(t, db, "SELECT CAST(c AS STRING) FROM t", "2024-03-15 12:30:45.500+00")
 }
 
 // ---------------------------------------------------------------------
@@ -459,18 +487,7 @@ func TestStorageSeam_Geography(t *testing.T) {
 	wantFloat64(t, db, "SELECT ST_Y(c) FROM t", 2)
 	// WKT rendering: BigQuery's ST_ASTEXT emits "POINT(1 2)" (no space
 	// after the geometry tag) per geography_functions.md examples.
-	//
-	// KNOWN BUG (caught by this suite, 2026-06-10, do not paper over):
-	// the stored column renders the engine's spatial form "POINT (1 2)"
-	// (space after POINT). xfail until ST_ASTEXT output is
-	// canonicalized.
-	if got := seamString(t, db, "SELECT ST_ASTEXT(c) FROM t"); got != "POINT(1 2)" {
-		if got == "POINT (1 2)" {
-			t.Skipf("KNOWN BUG (storage seam): ST_ASTEXT renders %q; "+
-				"want BigQuery canonical %q", got, "POINT(1 2)")
-		}
-		t.Errorf("got %q want %q\nsql: SELECT ST_ASTEXT(c) FROM t", got, "POINT(1 2)")
-	}
+	wantString(t, db, "SELECT ST_ASTEXT(c) FROM t", "POINT(1 2)")
 }
 
 func TestStorageSeam_Interval(t *testing.T) {

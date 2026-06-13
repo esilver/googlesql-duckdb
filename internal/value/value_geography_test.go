@@ -18,7 +18,7 @@ func Test_ValueGeography_GeographyFromWKT(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if wkt != "POINT (-1 2)" {
+		if wkt != "POINT(-1 2)" {
 			t.Fatalf("unexpected WKT: %s", wkt)
 		}
 	})
@@ -36,7 +36,7 @@ func Test_ValueGeography_GeographyFromWKT(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if wkt != "POINT (-10.5 42)" {
+		if wkt != "POINT(-10.5 42)" {
 			t.Fatalf("unexpected WKT: %s", wkt)
 		}
 	})
