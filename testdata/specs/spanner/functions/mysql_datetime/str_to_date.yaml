@@ -14,7 +14,7 @@ cases:
     sql: SELECT CAST(CAST(mysql.str_to_date('2020-12-25 09:30:17', '%Y-%m-%d %h:%i:%s') AS DATETIME) AS STRING) AS dt
     expected:
       rows:
-        - ['2020-12-25T09:30:17']
+        - ['2020-12-25 09:30:17']
   - desc: parse full month name with MySQL percent-M token
     sql: SELECT CAST(mysql.str_to_date('December 25 2020', '%M %d %Y') AS DATE) AS d
     expected:
