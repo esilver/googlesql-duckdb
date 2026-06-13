@@ -104,6 +104,11 @@ var (
 	nameToCatalogMap = map[string]*internal.Catalog{}
 	nameToDBMap      = map[string]*sql.DB{}
 	nameToValueMapMu sync.Mutex
+
+	// DuckDB extension/UDF registration mutates per-database catalogs through
+	// the pure-Go DuckDB bridge. Keep that registration path single-threaded;
+	// callers may still open/query already-registered databases concurrently.
+	duckDBRegistrationMu sync.Mutex
 )
 
 // internalDriverName is the database/sql driver name for the raw
@@ -232,25 +237,35 @@ func newDBAndCatalog(name string) (*sql.DB, *internal.Catalog, error) {
 	// connection is visible to queries on another. We deliberately do NOT
 	// pin MaxOpenConns(1): the engine issues nested statements during
 	// query execution, and a single-connection pool deadlocks them.
-	if err := registerDuckDBUDFs(db); err != nil {
-		return nil, nil, err
-	}
-	if err := registerDuckDBJSONUDFs(db); err != nil {
-		return nil, nil, err
-	}
-	if err := registerDuckDBGeography(db); err != nil {
-		return nil, nil, err
-	}
-	if err := registerDuckDBAggregates(db); err != nil {
-		return nil, nil, err
-	}
-	if err := registerKLLExtractScalars(db); err != nil {
+	if err := registerDuckDBExtensions(db); err != nil {
 		return nil, nil, err
 	}
 	catalog := internal.NewCatalog(db)
 	nameToDBMap[name] = db
 	nameToCatalogMap[name] = catalog
 	return db, catalog, nil
+}
+
+func registerDuckDBExtensions(db *sql.DB) error {
+	duckDBRegistrationMu.Lock()
+	defer duckDBRegistrationMu.Unlock()
+
+	if err := registerDuckDBUDFs(db); err != nil {
+		return err
+	}
+	if err := registerDuckDBJSONUDFs(db); err != nil {
+		return err
+	}
+	if err := registerDuckDBGeography(db); err != nil {
+		return err
+	}
+	if err := registerDuckDBAggregates(db); err != nil {
+		return err
+	}
+	if err := registerKLLExtractScalars(db); err != nil {
+		return err
+	}
+	return nil
 }
 
 type Driver struct {
@@ -321,19 +336,7 @@ func (d *Driver) OpenConnector(name string) (driver.Connector, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to open database by %s: %w", name, err)
 		}
-		if err := registerDuckDBUDFs(inner); err != nil {
-			return nil, err
-		}
-		if err := registerDuckDBJSONUDFs(inner); err != nil {
-			return nil, err
-		}
-		if err := registerDuckDBGeography(inner); err != nil {
-			return nil, err
-		}
-		if err := registerDuckDBAggregates(inner); err != nil {
-			return nil, err
-		}
-		if err := registerKLLExtractScalars(inner); err != nil {
+		if err := registerDuckDBExtensions(inner); err != nil {
 			return nil, err
 		}
 		catalog := internal.NewCatalog(inner)
