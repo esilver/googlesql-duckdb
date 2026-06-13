@@ -4018,7 +4018,7 @@ func (n *CastNode) tryNativeCast(ctx context.Context) (string, bool, error) {
 		}
 		switch fromKind {
 		case googlesql.TypeKindTypeDatetime:
-			return fmt.Sprintf("strftime(%s, '%%Y-%%m-%%dT%%H:%%M:%%S')", expr), true, nil
+			return fmt.Sprintf("strftime(%s, '%%Y-%%m-%%d %%H:%%M:%%S')", expr), true, nil
 		case googlesql.TypeKindTypeDate:
 			return fmt.Sprintf("strftime(%s, '%%Y-%%m-%%d')", expr), true, nil
 		case googlesql.TypeKindTypeTime:

@@ -314,20 +314,7 @@ func TestStorageSeam_Datetime(t *testing.T) {
 	wantInt64(t, db, "SELECT COUNT(*) FROM t WHERE c >= DATETIME '2024-03-15 00:00:00'", 1)
 	// Canonical rendering: CAST(DATETIME AS STRING) uses a space
 	// separator per data-types.md / conversion_functions.md examples.
-	//
-	// KNOWN BUG (caught by this suite, 2026-06-10, do not paper over):
-	// CAST on the stored column renders the engine's native ISO form
-	// "2024-03-15T12:34:56" ('T' separator) instead of the GoogleSQL
-	// canonical "2024-03-15 12:34:56". xfail until the cast lowering
-	// canonicalizes the separator.
-	if got := seamString(t, db, "SELECT CAST(c AS STRING) FROM t"); got != "2024-03-15 12:34:56" {
-		if got == "2024-03-15T12:34:56" {
-			t.Skipf("KNOWN BUG (storage seam): CAST(stored DATETIME AS STRING) renders %q; "+
-				"want canonical space-separated form", got)
-		}
-		t.Errorf("got %q want %q\nsql: SELECT CAST(c AS STRING) FROM t",
-			got, "2024-03-15 12:34:56")
-	}
+	wantString(t, db, "SELECT CAST(c AS STRING) FROM t", "2024-03-15 12:34:56")
 }
 
 func TestStorageSeam_Timestamp(t *testing.T) {
@@ -725,7 +712,7 @@ func TestStorageSeam_AggregateTemporal(t *testing.T) {
 	wantString(t, db, "SELECT CAST(MIN(d) AS STRING) FROM t", "2023-01-01")
 	wantString(t, db, "SELECT CAST(MAX(d) AS STRING) FROM t", "2024-03-15")
 	wantString(t, db, "SELECT CAST(MIN(ts) AS STRING) FROM t", "2023-01-01 00:00:00+00")
-	wantString(t, db, "SELECT CAST(MAX(dt) AS STRING) FROM t", "2024-03-15T10:00:00")
+	wantString(t, db, "SELECT CAST(MAX(dt) AS STRING) FROM t", "2024-03-15 10:00:00")
 	wantString(t, db, "SELECT CAST(MAX(tm) AS STRING) FROM t", "23:59:59")
 	wantInt64(t, db, "SELECT COUNT(d) FROM t", 2)
 }
