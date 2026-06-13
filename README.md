@@ -1,5 +1,7 @@
 # GoogleSQLite
 
+[![CI](https://github.com/esilver/googlesqlite/actions/workflows/ci.yml/badge.svg)](https://github.com/esilver/googlesqlite/actions/workflows/ci.yml)
+
 This fork runs GoogleSQL — the SQL dialect used by BigQuery and Cloud
 Spanner — on the pure-Go DuckDB engine
 [`github.com/esilver/duckdb-go-pure`](https://github.com/esilver/duckdb-go-pure).
@@ -107,26 +109,11 @@ make spec/upstream-sync   # refresh docs/third_party/googlesql-docs from upstrea
 
 ## Sponsorship
 
-This is a personal project. It is developed by referencing the
-open-source GoogleSQL repository, but it receives no support of any kind
-from Google — no sponsorship, no contributions, no promotion.
+The upstream `googlesqlite` engine and the `bigquery-emulator` it powers
+were created and are maintained by [@goccy](https://github.com/goccy)
+(Masaaki Goshima). This repository is a fork that retargets the engine
+from a SQLite backend to a pure-Go DuckDB backend; the upstream GoogleSQL
+engine work it builds on is goccy's.
 
-For example, Google has had a request for a BigQuery emulator open on
-its Issue Tracker
-([issue 129248927](https://issuetracker.google.com/issues/129248927))
-for seven years without taking any action. Unable to watch that any
-longer, in 2022 I built
-[`goccy/bigquery-emulator`](https://github.com/goccy/bigquery-emulator)
-— the only BigQuery emulator in the world — and have maintained it ever
-since.
-
-This project is used by that `bigquery-emulator`. I do not use BigQuery
-in my own job, however. I simply happen to have the skills to build
-this, noticed how many people are struggling without it, and so I spend
-my personal time and money on it.
-
-Because of that, keeping this project alive needs your help. Emulating
-BigQuery locally brings many benefits to development and can
-significantly cut development costs. Could you return a small part of
-those savings to me? I believe doing so leads to a better future for
-both me and your company.
+If this project is useful to you, please consider sponsoring the upstream
+author: <https://github.com/sponsors/goccy>.
