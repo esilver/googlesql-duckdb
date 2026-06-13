@@ -6643,9 +6643,15 @@ WITH example AS (
 		},
 
 		{
-			name:         "datetime_trunc with quarter",
-			query:        `SELECT DATETIME_TRUNC(DATETIME "2017-01-05", QUARTER), DATETIME_TRUNC(DATETIME "2017-02-05", QUARTER), DATETIME_TRUNC(DATETIME "2017-08-05", QUARTER), DATETIME_TRUNC(DATETIME "2017-11-05", QUARTER), DATETIME_TRUNC(DATETIME "2017-12-31", QUARTER)`,
-			expectedRows: [][]any{{"2017-01-01 00:00:00", "2017-01-01 00:00:00", "2017-07-01 00:00:00", "2017-10-01 00:00:00", "2017-10-01 00:00:00"}},
+			name:  "datetime_trunc with quarter",
+			query: `SELECT DATETIME_TRUNC(DATETIME "2017-01-05", QUARTER), DATETIME_TRUNC(DATETIME "2017-02-05", QUARTER), DATETIME_TRUNC(DATETIME "2017-08-05", QUARTER), DATETIME_TRUNC(DATETIME "2017-11-05", QUARTER), DATETIME_TRUNC(DATETIME "2017-12-31", QUARTER)`,
+			expectedRows: [][]any{{
+				createDatetimeWireFormatFromString("2017-01-01 00:00:00"),
+				createDatetimeWireFormatFromString("2017-01-01 00:00:00"),
+				createDatetimeWireFormatFromString("2017-07-01 00:00:00"),
+				createDatetimeWireFormatFromString("2017-10-01 00:00:00"),
+				createDatetimeWireFormatFromString("2017-10-01 00:00:00"),
+			}},
 		},
 		{
 			name:  "timestamp_trunc with quarter",
@@ -6661,7 +6667,7 @@ WITH example AS (
 		{
 			name:         "datetime_trunc with day weekday",
 			query:        `SELECT DATETIME_TRUNC(DATETIME "2024-03-29", WEEK(MONDAY))`,
-			expectedRows: [][]any{{"2024-03-25 00:00:00"}},
+			expectedRows: [][]any{{createDatetimeWireFormatFromString("2024-03-25 00:00:00")}},
 		},
 		{
 			name: "datetime_trunc isoyear",
@@ -6669,7 +6675,7 @@ WITH example AS (
   DATETIME_TRUNC('2015-06-15', ISOYEAR) AS isoyear_boundary,
   EXTRACT(ISOYEAR FROM DATE '2015-06-15') AS isoyear_number;
 `,
-			expectedRows: [][]any{{"2014-12-29 00:00:00", int64(2015)}},
+			expectedRows: [][]any{{createDatetimeWireFormatFromString("2014-12-29 00:00:00"), int64(2015)}},
 		},
 		{
 			name: "PIVOT",
@@ -7104,7 +7110,7 @@ SELECT date, EXTRACT(ISOYEAR FROM date), EXTRACT(YEAR FROM date), EXTRACT(MONTH 
 			name:  "current_datetime",
 			query: `SELECT CURRENT_DATETIME()`,
 			expectedRows: [][]any{
-				{now.Format("2006-01-02 15:04:05.999999")},
+				{now.Format("2006-01-02T15:04:05.999999")},
 			},
 		},
 		{
@@ -7118,25 +7124,25 @@ SELECT date, EXTRACT(ISOYEAR FROM date), EXTRACT(YEAR FROM date), EXTRACT(MONTH 
 			name:  "datetime_add",
 			query: `SELECT DATETIME "2008-12-25 15:30:00", DATETIME_ADD(DATETIME "2008-12-25 15:30:00", INTERVAL 10 MINUTE)`,
 			expectedRows: [][]any{
-				{"2008-12-25 15:30:00", "2008-12-25 15:40:00"},
+				{createDatetimeWireFormatFromString("2008-12-25 15:30:00"), createDatetimeWireFormatFromString("2008-12-25 15:40:00")},
 			},
 		},
 		{
 			name:         "datetime_add",
 			query:        `SELECT DATETIME_ADD(DATETIME '2023-01-29 00:00:00', INTERVAL 1 MONTH)`,
-			expectedRows: [][]any{{"2023-02-28 00:00:00"}},
+			expectedRows: [][]any{{createDatetimeWireFormatFromString("2023-02-28 00:00:00")}},
 		},
 		{
 			name:  "datetime_sub",
 			query: `SELECT DATETIME "2008-12-25 15:30:00", DATETIME_SUB(DATETIME "2008-12-25 15:30:00", INTERVAL 10 MINUTE)`,
 			expectedRows: [][]any{
-				{"2008-12-25 15:30:00", "2008-12-25 15:20:00"},
+				{createDatetimeWireFormatFromString("2008-12-25 15:30:00"), createDatetimeWireFormatFromString("2008-12-25 15:20:00")},
 			},
 		},
 		{
 			name:         "datetime_sub",
 			query:        `SELECT DATETIME_SUB(DATETIME '2023-03-31 00:00:00', INTERVAL 1 MONTH)`,
-			expectedRows: [][]any{{"2023-02-28 00:00:00"}},
+			expectedRows: [][]any{{createDatetimeWireFormatFromString("2023-02-28 00:00:00")}},
 		},
 		{
 			name:         "datetime_diff with day",
@@ -7161,17 +7167,17 @@ SELECT date, EXTRACT(ISOYEAR FROM date), EXTRACT(YEAR FROM date), EXTRACT(MONTH 
 		{
 			name:         "datetime_trunc with day",
 			query:        `SELECT DATETIME_TRUNC(DATETIME "2008-12-25 15:30:00", DAY)`,
-			expectedRows: [][]any{{"2008-12-25 00:00:00"}},
+			expectedRows: [][]any{{createDatetimeWireFormatFromString("2008-12-25 00:00:00")}},
 		},
 		{
 			name:         "datetime_trunc with weekday(monday)",
 			query:        `SELECT DATETIME_TRUNC(DATETIME "2017-11-05 00:00:00", WEEK(MONDAY))`,
-			expectedRows: [][]any{{"2017-10-30 00:00:00"}},
+			expectedRows: [][]any{{createDatetimeWireFormatFromString("2017-10-30 00:00:00")}},
 		},
 		{
 			name:         "datetime_trunc with isoyear",
 			query:        `SELECT DATETIME_TRUNC('2015-06-15 00:00:00', ISOYEAR)`,
-			expectedRows: [][]any{{"2014-12-29 00:00:00"}},
+			expectedRows: [][]any{{createDatetimeWireFormatFromString("2014-12-29 00:00:00")}},
 		},
 		{
 			name:         "format_datetime with %c",
@@ -7206,12 +7212,12 @@ SELECT date, EXTRACT(ISOYEAR FROM date), EXTRACT(YEAR FROM date), EXTRACT(MONTH 
 		{
 			name:         "parse datetime",
 			query:        `SELECT PARSE_DATETIME("%a %b %e %I:%M:%S %Y", "Thu Dec 25 07:30:00 2008")`,
-			expectedRows: [][]any{{"2008-12-25 07:30:00"}},
+			expectedRows: [][]any{{createDatetimeWireFormatFromString("2008-12-25 07:30:00")}},
 		},
 		{
 			name:         "parse datetime with %c",
 			query:        `SELECT PARSE_DATETIME("%c", "Thu Dec 25 07:30:00 2008")`,
-			expectedRows: [][]any{{"2008-12-25 07:30:00"}},
+			expectedRows: [][]any{{createDatetimeWireFormatFromString("2008-12-25 07:30:00")}},
 		},
 		{
 			name:        "parse datetime ( the year element is in different locations )",
@@ -7224,9 +7230,13 @@ SELECT date, EXTRACT(ISOYEAR FROM date), EXTRACT(YEAR FROM date), EXTRACT(MONTH 
 			expectedErr: `error parsing [Thu Dec 25 07:30:00 2008] with format [%a %b %e %I:%M:%S]: found unparsed text [ 2008]`,
 		},
 		{
-			name:         "parse datetime %F respectfully consuming digits",
-			query:        `SELECT PARSE_DATETIME("%F", "03-1-1"), PARSE_DATETIME("%F", "003-01-1"), PARSE_DATETIME("%F", "0003-1-11")`,
-			expectedRows: [][]any{{"0003-01-01 00:00:00", "0003-01-01 00:00:00", "0003-01-11 00:00:00"}},
+			name:  "parse datetime %F respectfully consuming digits",
+			query: `SELECT PARSE_DATETIME("%F", "03-1-1"), PARSE_DATETIME("%F", "003-01-1"), PARSE_DATETIME("%F", "0003-1-11")`,
+			expectedRows: [][]any{{
+				createDatetimeWireFormatFromString("0003-01-01 00:00:00"),
+				createDatetimeWireFormatFromString("0003-01-01 00:00:00"),
+				createDatetimeWireFormatFromString("0003-01-11 00:00:00"),
+			}},
 		},
 
 		// time functions
@@ -7573,9 +7583,14 @@ FROM Input`,
 
 		// interval functions
 		{
-			name:         "interval operator",
-			query:        `SELECT DATE "2020-09-22" + val FROM UNNEST([INTERVAL 1 DAY,INTERVAL -1 DAY,INTERVAL 2 YEAR,CAST('1-2 3 18:1:55' AS INTERVAL)]) as val`,
-			expectedRows: [][]any{{"2020-09-23 00:00:00"}, {"2020-09-21 00:00:00"}, {"2022-09-22 00:00:00"}, {"2021-11-25 18:01:55"}},
+			name:  "interval operator",
+			query: `SELECT DATE "2020-09-22" + val FROM UNNEST([INTERVAL 1 DAY,INTERVAL -1 DAY,INTERVAL 2 YEAR,CAST('1-2 3 18:1:55' AS INTERVAL)]) as val`,
+			expectedRows: [][]any{
+				{createDatetimeWireFormatFromString("2020-09-23 00:00:00")},
+				{createDatetimeWireFormatFromString("2020-09-21 00:00:00")},
+				{createDatetimeWireFormatFromString("2022-09-22 00:00:00")},
+				{createDatetimeWireFormatFromString("2021-11-25 18:01:55")},
+			},
 		},
 		{
 			name: "interval from sub operator",
@@ -8594,4 +8609,11 @@ func createTimestampFormatFromTime(t time.Time) string {
 // test data reads symmetrically with createTimestampFormatFromTime.
 func createTimestampFormatFromString(v string) string {
 	return v
+}
+
+// createDatetimeWireFormatFromString renders raw DATETIME query values as
+// BigQuery's API/wire representation. CAST(DATETIME AS STRING) tests should
+// keep using the space-separated string literal directly.
+func createDatetimeWireFormatFromString(v string) string {
+	return strings.Replace(v, " ", "T", 1)
 }
