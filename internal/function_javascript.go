@@ -11,6 +11,10 @@ import (
 	"github.com/goccy/googlesqlite/internal/value"
 )
 
+// This fork uses goja for every target because the DuckDB-backed pure-Go stack
+// must also build for GOOS=js. Upstream uses quickjs on native targets to avoid
+// goja's reflect-heavy linker reachability cost; keep this tradeoff explicit so
+// binary-size regressions are not mistaken for an accidental dependency choice.
 func EVAL_JAVASCRIPT(code string, retType *Type, argNames []string, args []value.Value) (value.Value, error) {
 	vm := goja.New()
 	for i := range args {
