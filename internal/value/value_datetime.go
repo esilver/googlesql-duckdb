@@ -102,7 +102,7 @@ func (d DatetimeValue) ToInt64() (int64, error) {
 }
 
 func (d DatetimeValue) ToString() (string, error) {
-	return time.Time(d).Format(datetimeFormat), nil
+	return time.Time(d).Format(datetimePrintableFormat), nil
 }
 
 func (d DatetimeValue) ToBytes() ([]byte, error) {
@@ -142,7 +142,7 @@ func (d DatetimeValue) ToRat() (*big.Rat, error) {
 }
 
 func (d DatetimeValue) Format(verb rune) string {
-	formatted := time.Time(d).Format(datetimeFormat)
+	formatted := time.Time(d).Format(datetimePrintableFormat)
 	switch verb {
 	case 't':
 		return formatted
@@ -153,5 +153,5 @@ func (d DatetimeValue) Format(verb rune) string {
 }
 
 func (d DatetimeValue) Interface() any {
-	return time.Time(d).Format(datetimeFormat)
+	return time.Time(d).Format(datetimePrintableFormat)
 }

@@ -181,5 +181,6 @@ func (d DateValue) Interface() any {
 }
 
 const (
-	datetimeFormat = "2006-01-02T15:04:05.999999"
+	datetimeFormat          = "2006-01-02T15:04:05.999999"
+	datetimePrintableFormat = "2006-01-02 15:04:05.999999"
 )

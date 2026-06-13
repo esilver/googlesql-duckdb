@@ -7104,7 +7104,7 @@ SELECT date, EXTRACT(ISOYEAR FROM date), EXTRACT(YEAR FROM date), EXTRACT(MONTH 
 			name:  "current_datetime",
 			query: `SELECT CURRENT_DATETIME()`,
 			expectedRows: [][]any{
-				{now.Format("2006-01-02T15:04:05.999999")},
+				{now.Format("2006-01-02 15:04:05.999999")},
 			},
 		},
 		{

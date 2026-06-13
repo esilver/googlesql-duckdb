@@ -90,13 +90,13 @@ func TestDatetimeValue(t *testing.T) {
 			t.Fatal(err)
 		}
 		s, _ := base.ToString()
-		if s != "2020-01-01T12:30:45" {
+		if s != "2020-01-01 12:30:45" {
 			t.Fatalf("ToString: %s", s)
 		}
-		if got, _ := base.ToBytes(); string(got) != "2020-01-01T12:30:45" {
+		if got, _ := base.ToBytes(); string(got) != "2020-01-01 12:30:45" {
 			t.Fatalf("ToBytes: %s", got)
 		}
-		if got, _ := base.ToJSON(); got != "2020-01-01T12:30:45" {
+		if got, _ := base.ToJSON(); got != "2020-01-01 12:30:45" {
 			t.Fatalf("ToJSON: %s", got)
 		}
 		if got, _ := base.ToTime(); got.IsZero() {
@@ -120,16 +120,16 @@ func TestDatetimeValue(t *testing.T) {
 	})
 
 	t.Run("Format and Interface", func(t *testing.T) {
-		if base.Format('t') != "2020-01-01T12:30:45" {
+		if base.Format('t') != "2020-01-01 12:30:45" {
 			t.Fatalf("Format t: %s", base.Format('t'))
 		}
-		if base.Format('T') != `DATETIME "2020-01-01T12:30:45"` {
+		if base.Format('T') != `DATETIME "2020-01-01 12:30:45"` {
 			t.Fatalf("Format T: %s", base.Format('T'))
 		}
-		if base.Format('x') != "2020-01-01T12:30:45" {
+		if base.Format('x') != "2020-01-01 12:30:45" {
 			t.Fatalf("Format default: %s", base.Format('x'))
 		}
-		if got, ok := base.Interface().(string); !ok || got != "2020-01-01T12:30:45" {
+		if got, ok := base.Interface().(string); !ok || got != "2020-01-01 12:30:45" {
 			t.Fatalf("Interface: %v", base.Interface())
 		}
 	})
