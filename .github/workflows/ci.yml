@@ -19,14 +19,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # Run every test binary in wazero Compiler mode against a shared
-    # on-disk compilation cache. Without this the embedded GoogleSQL
-    # wasm is re-AOT-compiled (or runs in the slow interpreter) in
-    # every one of the ~40 package test processes, which pushes
-    # `make test` past its 30-minute timeout.
     env:
-      GOOGLESQLITE_WASM_COMPILATION_MODE: compiler
-      GOOGLESQLITE_WASM_CACHE_DIR: ${{ github.workspace }}/.wasm-cache
       GOMAXPROCS: "2"
       GOMEMLIMIT: 4GiB
     steps:
@@ -70,17 +63,6 @@ jobs:
             go-build-test-${{ runner.os }}-${{ hashFiles('go.sum') }}-
             go-build-test-${{ runner.os }}-
 
-      # Persist the wazero compilation cache across runs. The cache is
-      # keyed on go.sum (the embedded wasm only changes when the
-      # go-googlesql dependency changes) plus the OS and Go version.
-      - name: Cache wasm compilation
-        uses: actions/cache@v5
-        with:
-          path: ${{ github.workspace }}/.wasm-cache
-          key: wasm-cache-${{ runner.os }}-go-${{ hashFiles('go.sum') }}
-          restore-keys: |
-            wasm-cache-${{ runner.os }}-go-
-
       - name: Build
         run: make build
 
@@ -91,8 +73,6 @@ jobs:
     name: Spec conformance
     runs-on: ubuntu-latest
     env:
-      GOOGLESQLITE_WASM_COMPILATION_MODE: compiler
-      GOOGLESQLITE_WASM_CACHE_DIR: ${{ github.workspace }}/.wasm-cache
       GOMAXPROCS: "2"
       GOMEMLIMIT: 4GiB
     steps:
@@ -121,14 +101,6 @@ jobs:
           restore-keys: |
             go-build-spec-${{ runner.os }}-${{ hashFiles('go.sum') }}-
             go-build-spec-${{ runner.os }}-
-
-      - name: Cache wasm compilation
-        uses: actions/cache@v5
-        with:
-          path: ${{ github.workspace }}/.wasm-cache
-          key: wasm-cache-${{ runner.os }}-go-${{ hashFiles('go.sum') }}
-          restore-keys: |
-            wasm-cache-${{ runner.os }}-go-
 
       - name: Run spec suite
         run: go test -count=1 -timeout 30m -parallel 4 -run '^TestSpec$' .

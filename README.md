@@ -13,7 +13,7 @@ build flags. Its CI includes a named spec conformance gate that currently
 covers 707 spec files and 1,177 asserted cases, with the corpus categorized as
 697 implemented, 7 partial, and 3 unsupported specs. See
 [REPRODUCE-PURE-GO.md](REPRODUCE-PURE-GO.md) and
-[CLI-PURE-GO.md](CLI-PURE-GO.md).
+[cmd/googlesqlite/README.md](cmd/googlesqlite/README.md).
 
 GoogleSQL parsing and analysis is provided by the forked
 [`esilver/go-googlesql`](https://github.com/esilver/go-googlesql) bridge

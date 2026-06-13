@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -22,13 +21,10 @@ type nopWriteCloser struct{}
 func (nopWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
 func (nopWriteCloser) Close() error                { return nil }
 
-// TestMain selects the wazero Compiler mode with a stable on-disk
-// compilation cache for the black-box suite, so it does not
-// re-AOT-compile the embedded wasm on every run. The driver reads the
-// EnvWasm* environment variables on the first sql.Open; setting them
-// here (when unset) keeps a bare `go test` fast without exposing a
-// programmatic configuration API. CI sets these variables already, in
-// which case the existing values are kept.
+// TestMain sets up process-global state for the black-box suite. The
+// GoogleSQL analyzer is transpiled to native Go (wasm2go AOT), so there
+// is no JIT and no on-disk compilation cache to prime: a bare `go test`
+// is already fast with no per-run wasm warm-up.
 func TestMain(m *testing.M) {
 	// Pin the process timezone to UTC for the whole suite. Timestamp
 	// tests need a deterministic zone; fixing it once here (instead of
@@ -36,13 +32,6 @@ func TestMain(m *testing.M) {
 	// global mutation so they can run with t.Parallel().
 	os.Setenv("TZ", "UTC")
 	time.Local = time.UTC
-
-	if os.Getenv(googlesqlite.EnvWasmCompilationMode) == "" {
-		os.Setenv(googlesqlite.EnvWasmCompilationMode, string(googlesqlite.WasmCompilationModeCompiler))
-		if os.Getenv(googlesqlite.EnvWasmCacheDir) == "" {
-			os.Setenv(googlesqlite.EnvWasmCacheDir, filepath.Join(os.TempDir(), "googlesqlite-wasm-cache"))
-		}
-	}
 
 	// Wire a discard `mem://` writer so the spec-corpus EXPORT DATA case
 	// has a destination to write to. Unit tests that need to inspect the

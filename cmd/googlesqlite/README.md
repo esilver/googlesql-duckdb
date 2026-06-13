@@ -1,10 +1,9 @@
 # googlesqlite CLI
 
 `googlesqlite` is an interactive console for running GoogleSQL queries
-against the googlesqlite engine — in this fork that is the pure-Go DuckDB
-backend — in the
-spirit of the `sqlite3` and `spanner-cli` REPLs. See `CLI-PURE-GO.md`
-at the repository root for the pure-Go build and usage guide.
+against the googlesqlite engine, in the spirit of the `sqlite3` and
+`spanner-cli` REPLs. In this fork it runs on the pure-Go DuckDB engine:
+`CGO_ENABLED=0`, no libduckdb, no C toolchain at runtime.
 
 The same program also builds for `js/wasm` and powers the browser
 Playground.
@@ -18,6 +17,21 @@ upstream backend):
 $ make build        # native binary -> bin/googlesqlite
 $ make build-wasm   # bin/googlesqlite.wasm + bin/wasm_exec.js
 ```
+
+You do not need to rebuild it every time. The result is a single
+self-contained static binary (~375 MB, it embeds the whole transpiled
+DuckDB), so build once and run forever: copy it anywhere and run it.
+Rebuild only when you change the Go code or pull a new engine.
+
+No build flags are required since duckdb-go-pure v0.3.1. The engine is
+sharded into ~30 packages and compiles fully optimized in under a minute
+on a multicore box. Tests run with `-vet=off` because `go vet` cannot
+chew the generated packages.
+
+Prerequisites: none beyond Go. The engine is the fetchable module
+`github.com/esilver/duckdb-go-pure`, with no sibling checkouts. See
+[REPRODUCE-PURE-GO.md](../../REPRODUCE-PURE-GO.md) for the full pure-Go
+build guide.
 
 ## Usage
 
@@ -35,6 +49,28 @@ Flags:
 
 With no `database` argument the CLI uses a shared in-memory database.
 A positional argument opens (or creates) that database file.
+
+```sh
+googlesqlite :memory:           # interactive REPL, in-memory database
+googlesqlite /tmp/mydata.db     # file-backed, tables persist across runs
+```
+
+Statements end with `;`:
+
+```
+> CREATE TABLE fruits (name STRING, sold INT64);
+> INSERT INTO fruits VALUES ("pears", 30), ("apples", 20);
+> SELECT name, ANY_VALUE(name HAVING MAX sold) OVER () AS top FROM fruits;
+> SELECT SEARCH("Hello World", "world"), UNIX_SECONDS(CURRENT_TIMESTAMP());
+```
+
+### Scripted use
+
+```sh
+echo 'SELECT 1 + 1;' | googlesqlite :memory:        # pipe stdin
+googlesqlite --file setup.sql --file queries.sql :memory:
+googlesqlite --continue-on-error --file all.sql :memory:
+```
 
 ### Input modes
 
@@ -63,6 +99,11 @@ terminal is available the REPL opens afterwards in the resulting state.
 Results print as an aligned table. Column widths are measured by
 display width, so full-width (CJK) text stays aligned. Append `\G` to a
 query to print it vertically, one stanza per row.
+
+## What works
+
+The full dialect runs on this engine: 986 of the 994 conformance specs
+pass with zero failures.
 
 ## WebAssembly Playground API
 

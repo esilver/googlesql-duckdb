@@ -52,8 +52,7 @@ Pages artifact, and publishes it through `actions/deploy-pages`.
 
 The engine binary is large — it bundles the whole googlesqlite stack
 into one js/wasm module: the pure-Go DuckDB engine (transpiled to Go)
-plus the GoogleSQL analyzer, which is itself an embedded wasm module
-run through wazero.
+plus the GoogleSQL analyzer, transpiled to native Go via wasm2go.
 The uncompressed binary exceeds GitHub's 100 MB per-file limit, but it
 is never deployed: the worker fetches the gzip-compressed
 `googlesqlite.wasm.gz` (tens of MB) and decompresses it in the browser,
