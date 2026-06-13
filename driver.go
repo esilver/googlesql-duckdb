@@ -19,15 +19,12 @@ import (
 	internal "github.com/goccy/googlesqlite/internal"
 )
 
-// dsnParts splits a googlesqlite DSN into the filename portion the SQLite
-// engine sees and the query string we parse for our own options. SQLite URIs
-// (those that start with "file:") carry their own query parameters such as
-// `mode=memory` and `cache=shared` that SQLite itself interprets — those must
-// pass through to the engine untouched, otherwise `file:foo?mode=memory`
-// silently becomes an on-disk file named `file:foo` and accumulates state
-// across test runs. For non-URI DSNs like `:memory:?dialect=bigquery`, we
-// strip the first `?` since SQLite would otherwise treat the whole DSN as a
-// filename.
+// dsnParts splits a googlesqlite DSN into its path and driver-option query
+// string while preserving historical SQLite-style URI forms. The DuckDB DSN
+// translator consumes the returned pieces and either maps those URI semantics
+// onto DuckDB or strips SQLite-only parameters before opening the raw engine.
+// For non-URI DSNs like `:memory:?dialect=bigquery`, we strip the first `?`
+// so googlesqlite options do not become part of the raw-engine filename.
 func dsnParts(dsn string) (path, query string) {
 	if strings.HasPrefix(dsn, "file:") {
 		return dsn, ""
@@ -76,8 +73,8 @@ const (
 	EnvWasmCacheDir = "GOOGLESQLITE_WASM_CACHE_DIR"
 )
 
-// ensureGoogleSQLInit initialises the embedded GoogleSQL WASM runtime
-// once per process. Subsequent calls are no-ops (Init uses sync.Once).
+// ensureGoogleSQLInit initialises the embedded GoogleSQL analyzer module once
+// per process. Subsequent calls are no-ops (Init uses sync.Once).
 // It is invoked on the first sql.Open of a googlesqlite DB.
 //
 // It also primes the one-time spatial-extension load here, inside the same
@@ -536,9 +533,9 @@ func (c *Conn) SetNamePath(path []string) error {
 func (s *Conn) CheckNamedValue(value *driver.NamedValue) error {
 	// Encode every value into the googlesqlite value layout so the
 	// rest of the pipeline (formatter, reshapeInsertArgs, scanner)
-	// always sees the same shape. Primitives that the underlying
-	// SQLite driver can store natively (int64, float64, bool) are
-	// returned unchanged by EncodeValue.
+	// always sees the same shape. Primitives that the raw engine can
+	// store natively (int64, float64, bool) are returned unchanged by
+	// EncodeValue.
 	return internal.CheckNamedValue(value)
 }
 
