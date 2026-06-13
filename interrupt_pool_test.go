@@ -9,14 +9,12 @@ import (
 
 // TestInterruptedTxDoesNotPoisonPool regresses the post-interrupt pool
 // hygiene behind the bigquery-emulator statement watchdog: a runaway
-// statement inside a transaction begun on a budget context is
-// interrupted mid-flight (duckdb-go-pure >= v0.3.5), the tx watcher
-// discards the outer transaction WITHOUT a driver-level Rollback, and
-// the driver conn used to re-enter the pool with c.tx still set and a
-// doomed inner connection. The next caller — on a dedicated sql.Conn,
-// where database/sql cannot retry — then ate one "driver: bad
-// connection". IsValid/ResetSession must prune that conn so every
-// follow-up probe succeeds.
+// statement inside an explicit transaction is interrupted mid-flight
+// (duckdb-go-pure >= v0.3.5). The driver must still allow the caller's
+// rollback to cleanly end the explicit transaction and must not return
+// a poisoned connection to the pool. The next caller is on a dedicated
+// sql.Conn, where database/sql cannot retry, so every follow-up probe
+// must succeed.
 func TestInterruptedTxDoesNotPoisonPool(t *testing.T) {
 	t.Parallel()
 	db, err := sql.Open("googlesqlite", ":memory:?_test=interrupt_pool")
@@ -50,7 +48,7 @@ func TestInterruptedTxDoesNotPoisonPool(t *testing.T) {
 	if took := time.Since(start); took > 30*time.Second {
 		t.Fatalf("statement returned after %s; the interrupt did not fire mid-flight", took)
 	}
-	_ = tx.Rollback() // the ctx watcher already discarded the tx; best-effort
+	_ = tx.Rollback()
 	cancel()
 	if err := conn.Close(); err != nil {
 		t.Logf("conn.Close: %v", err)

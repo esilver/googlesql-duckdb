@@ -85,7 +85,7 @@ func SetBulkInsertUnsupportedHook(fn func(BulkInsertUnsupportedEvent)) {
 // the unwind permanently — issue #20 has the full mechanism.
 func (c *Conn) BulkInsert(ctx context.Context, tablePath []string, columns []string, rows [][]any) (n int64, err error) {
 	defer c.recoverPanicPoison(&err)
-	conn := internal.NewConnWithOptions(c.conn, c.tx, c.systemVars, c.scriptVars, c.materializeCTE)
+	conn := internal.NewConnWithOptions(c.conn, nil, c.systemVars, c.scriptVars, c.materializeCTE)
 	return internal.BulkInsert(ctx, conn, c.catalog, tablePath, columns, rows)
 }
 
