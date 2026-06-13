@@ -40,7 +40,7 @@ jobs:
       attestations: write  # record the build-provenance attestation
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           # GoReleaser derives the changelog from the commit history.
           fetch-depth: 0
@@ -48,12 +48,12 @@ jobs:
       # GoReleaser cross-compiles the CLI here; tools/go.mod pins the
       # Go toolchain used to resolve and run GoReleaser.
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: tools/go.mod
 
       - name: Download the Playground engine
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: playground-engine
           path: docs/playground/public
@@ -64,7 +64,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             dist/*.tar.gz
@@ -91,17 +91,17 @@ jobs:
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 26
           cache: npm
           cache-dependency-path: docs/playground/package-lock.json
 
       - name: Download the Playground engine
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: playground-engine
           path: docs/playground/public
@@ -114,10 +114,10 @@ jobs:
           make build/page
 
       - name: Upload the Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: docs/playground/dist
 
       - name: Deploy to GitHub Pages
         id: deploy
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
