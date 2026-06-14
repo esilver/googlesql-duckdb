@@ -128,9 +128,9 @@ func (r *Rows) assignValue(src any, dst reflect.Value, typ *Type) error {
 		dst.Set(reflect.New(dst.Type()).Elem())
 		return nil
 	}
-	// DuckDB retarget: native DATE / TIME / TIMESTAMP / TIMESTAMPTZ
-	// columns are scanned by duckdb-go as a Go time.Time, not the
-	// SQLite-era base64 envelope. DecodeValue has no time.Time case, so
+	// Native DATE / TIME / TIMESTAMP / TIMESTAMPTZ
+	// columns are scanned by duckdb-go as a Go time.Time rather than a
+	// base64 envelope. DecodeValue has no time.Time case, so
 	// wrap it in the value type the analyzer resolved for this column
 	// before the normal CastValue -> ToString/ToJSON render path.
 	if tt, ok := src.(time.Time); ok {
@@ -140,7 +140,7 @@ func (r *Rows) assignValue(src any, dst reflect.Value, typ *Type) error {
 	}
 	decodedValue, err := DecodeValue(src)
 	if err != nil {
-		// SQLite TEXT-affinity columns (NUMERIC, BIGNUMERIC, DATE,
+		// Legacy text-stored columns (NUMERIC, BIGNUMERIC, DATE,
 		// TIME, DATETIME, TIMESTAMP, JSON, INTERVAL, GEOGRAPHY) coerce
 		// numeric arguments to their string form at write time, so a
 		// row inserted with `?` bound to a Go int can come back as the

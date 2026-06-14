@@ -145,7 +145,7 @@ func aggMinMax(values []value.Value, wantMin bool) (value.Value, error) {
 	return picked, nil
 }
 
-// BindAGG returns the AGG aggregator constructor. The SQLite
+// BindAGG returns the AGG aggregator constructor. The DuckDB
 // adapter is variadic to accept the three positional args the
 // formatter emits — but it tolerates a single argument too, in
 // which case AGG degrades gracefully to ANY_VALUE semantics

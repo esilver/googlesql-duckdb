@@ -9,7 +9,7 @@ import (
 )
 
 // InfoSchemaView describes one BigQuery `INFORMATION_SCHEMA.<name>`
-// view. There is no SQLite virtual-table layer: each view is
+// view. There is no virtual-table layer: each view is
 // registered catalog-side as a SimpleTable, and at formatter time
 // InfoSchemaInlineRelationSQL synthesises the live rows from the
 // catalog and splices them into the DuckDB query as an inline
@@ -313,7 +313,7 @@ func infoSchemaDuckDBColumnType(declared string) string {
 
 // InfoSchemaInlineRelationSQL renders the INFORMATION_SCHEMA view named
 // by meta as a self-contained DuckDB relation expression that exposes
-// every declared column by name. The DuckDB fork has no SQLite
+// every declared column by name. DuckDB has no
 // virtual-table layer, so the formatter splices this inline relation
 // in place of the (non-existent) eponymous vtab module: the catalog's
 // BuildRows synthesises the live rows, each value is rendered through

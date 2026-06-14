@@ -1,4 +1,4 @@
-// Step / Inverse / Done unit tests for the native SQLite-frame-driven
+// Step / Inverse / Done unit tests for the native DuckDB-frame-driven
 // window aggregators (the ones created via the NewXxxWindowNative
 // constructors and wired through Conn.CreateWindowFunction). These
 // keep their state purely inside the per-instance struct, so they're
@@ -802,7 +802,7 @@ func TestBindStringAggLeadLagNthValue(t *testing.T) {
 	t.Parallel()
 
 	// Build a frame option marker so we can drive the bind wrapper
-	// against a synthetic SQLite-style arg list (the bind wrapper
+	// against a synthetic DuckDB-style arg list (the bind wrapper
 	// strips option markers via parseWindowOptions before forwarding
 	// the value args to the per-spec Step).
 	frameUnit, _ := WINDOW_FRAME_UNIT(int64(WindowFrameUnitRows))

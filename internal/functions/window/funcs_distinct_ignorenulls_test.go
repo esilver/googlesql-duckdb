@@ -1,6 +1,6 @@
 // Direct unit tests for the DISTINCT / IGNORE NULLS branches of the
 // WINDOW_* aggregator Done methods. The SQL-driven layers don't reach
-// these branches because the formatter prefers the SQLite-native /
+// these branches because the formatter prefers the DuckDB-native /
 // customNativeWindow paths even when DISTINCT or IGNORE NULLS is in
 // play, but the binder Step/Done closures are still wired to the
 // WINDOW_* spec methods and the runtime invariants must hold for
@@ -22,7 +22,7 @@ import (
 // driveWithFlags is driveAtRow with manual DistinctOpt /
 // IgnoreNullsOpt flag wiring. Each row's per-step value is passed
 // through, and the aggregator's flags are set BEFORE the first Step
-// (in line with how the SQLite-side aggregator initialises them
+// (in line with how the DuckDB-side aggregator initialises them
 // once on the first Step).
 func driveWithFlags(t *testing.T, step stepFn, done doneFn, vals []value.Value, distinct, ignoreNulls bool) value.Value {
 	t.Helper()

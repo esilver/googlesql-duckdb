@@ -88,8 +88,8 @@ func (t *WildcardTable) FormatSQL(ctx context.Context) (string, error) {
 			}
 			if t.existsColumn(table, column.Name) {
 				// DuckDB identifier quoting (double quotes) — the
-				// backtick form this emitted on the SQLite backend is a
-				// DuckDB Parser Error (same family as issue #11).
+				// backtick form is a DuckDB Parser Error (same family
+				// as issue #11).
 				columns = append(columns, fmt.Sprintf("\"%s\"", column.Name))
 			} else {
 				columns = append(columns, fmt.Sprintf("NULL as \"%s\"", column.Name))

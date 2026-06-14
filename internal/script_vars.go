@@ -123,8 +123,8 @@ func evaluateScriptVariableExpr(ctx context.Context, conn *Conn, expr string) st
 		}
 		return "FALSE"
 	case string:
-		// May be an envelope-encoded value; if so the caller-site
-		// substitution will store the envelope text and SQLite
+		// May be an envelope-encoded value. If so, the caller-site
+		// substitution will store the envelope text and DuckDB
 		// will read it back via the standard collation. Quote with
 		// double quotes (DQS_DML is enabled), matching the form
 		// LiteralFromValue emits for non-primitive values.

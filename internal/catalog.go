@@ -462,7 +462,7 @@ func registerSpannerMysqlAliasFuncs(mysqlCat *googlesql.SimpleCatalog, factory *
 			return
 		}
 		// Storage name is the dotted form so the formatter routes
-		// the call through `mysql_<name>` at SQLite UDF dispatch
+		// the call through `mysql_<name>` at DuckDB UDF dispatch
 		// time (formatter.go flattens "." to "_" on the funcName).
 		fn, err := googlesql.NewFunction([]string{"mysql_" + name}, "", mode, []*googlesql.FunctionSignature{sig}, nil)
 		if err != nil || fn == nil {
@@ -1700,7 +1700,7 @@ func (c *Catalog) PropertyGraph(name string) *propertyGraphSpec {
 	return c.propertyGraphs[name]
 }
 
-// StorageNameForFunction returns the underlying SQLite UDF name for a
+// StorageNameForFunction returns the underlying DuckDB UDF name for a
 // Function handle that the analyzer resolved against this catalog.
 // Each Function handle is constructed once per spec with Name() set
 // to the storage path, then aliased into sub-catalogs via
@@ -1717,7 +1717,7 @@ func (c *Catalog) StorageNameForFunction(fn *googlesql.Function) string {
 	return name
 }
 
-// StorageNameForTable returns the underlying SQLite table name for a
+// StorageNameForTable returns the underlying DuckDB table name for a
 // SimpleTable handle the analyzer resolved against this catalog.
 // Same shape as StorageNameForFunction: the SimpleTable's Name() is
 // pinned to the storage path at construction and the same handle is
@@ -2683,7 +2683,7 @@ func (c *Catalog) createSimpleTable(tableName string, spec *TableSpec) (*googles
 	if tbl != nil && len(spec.PrimaryKey) > 0 {
 		// Propagate PRIMARY KEY column ordinals so the analyzer can
 		// resolve PropertyGraph node-table primary key requirements.
-		// SQLite-side enforcement is unaffected; this is metadata
+		// DuckDB-side enforcement is unaffected. This is metadata
 		// for analysis only.
 		pkIdx := make([]int32, 0, len(spec.PrimaryKey))
 		for _, name := range spec.PrimaryKey {

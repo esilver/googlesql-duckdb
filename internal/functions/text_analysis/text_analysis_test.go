@@ -427,9 +427,9 @@ func TestBindSearchArity(t *testing.T) {
 
 // tfidfNewAgg constructs the minimal WindowFuncAggregatedStatus
 // state the TF_IDF.Done callback expects, mirroring the runtime
-// shape the SQLite-side aggregator produces. We bypass the
-// WindowAggregator wrapper because its Step expects the SQLite
-// ConvertArgs-decoded option markers; the struct surface is the
+// shape the DuckDB-side aggregator produces. We bypass the
+// WindowAggregator wrapper because its Step expects the DuckDB
+// ConvertArgs-decoded option markers. The struct surface is the
 // stable contract that survives refactors.
 func tfidfNewAgg() *window.WindowFuncAggregatedStatus {
 	return &window.WindowFuncAggregatedStatus{

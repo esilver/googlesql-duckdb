@@ -471,8 +471,8 @@ var duckDBNormalUDFNames = append(append(append([]string{}, stringFamilyUDFNames
 	// either operand is NUMERIC or BIGNUMERIC (BigQuery `/` over NUMERIC is
 	// EXACT and errors on a zero divisor, while the native float lowering
 	// computes in DOUBLE and yields Inf), so the default emit produces
-	// googlesqlite_divide / googlesqlite_safe_divide — names the legacy
-	// SQLite backend registered via normalFuncs (mathfn.OP_DIV) but the
+	// googlesqlite_divide / googlesqlite_safe_divide — names that live in
+	// normalFuncs (mathfn.OP_DIV) but the
 	// DuckDB bridge set was missing, failing every NUMERIC division at bind
 	// time with a Catalog Error. The body is the same exact-arithmetic
 	// implementation: operands arrive as exact carriers (a native
@@ -567,12 +567,12 @@ func bindFuncForName(name string) (BindFunction, bool) {
 }
 
 // CallNormalFunc is the DuckDB-facing bridge for a googlesqlite_<name>
-// scalar UDF. It mirrors setupNormalFuncMap's SQLite body exactly: decode
+// scalar UDF. It mirrors setupNormalFuncMap's body exactly: decode
 // every value-layer-encoded argument back into a value.Value, invoke the
 // builtin's pure-Go BindFunc, and re-encode the result into the over-the-wire
 // form (a native int64 / float64 / bool, or a base64 envelope string). When
 // safe is true a body error folds to NULL instead of propagating, matching
-// the googlesqlite_safe_<name> SQLite registration.
+// the googlesqlite_safe_<name> registration.
 func CallNormalFunc(name string, safe bool, args ...any) (any, error) {
 	fn, ok := bindFuncForName(name)
 	if !ok {

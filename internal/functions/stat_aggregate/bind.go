@@ -6,7 +6,7 @@ import (
 )
 
 // Statistical-aggregate function binders. Each constructor returns
-// a fresh *helper.Aggregator that SQLite drives via Step / Done per
+// a fresh *helper.Aggregator that DuckDB drives via Step / Done per
 // group during query execution.
 
 func BindCorr() func() *helper.Aggregator {

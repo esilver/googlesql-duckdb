@@ -16,7 +16,7 @@ import (
 // on mismatch, mirroring the behaviour of LAX_INT64 / LAX_FLOAT64
 // already shipped.
 //
-// Naming convention: BindXxx for the SQLite-side adapter, the
+// Naming convention: BindXxx for the DuckDB-side adapter, the
 // Go-level helper lives next to it.
 
 // ---------------- strict scalar ----------------

@@ -56,9 +56,9 @@ type Result struct {
 	Rows [][]any
 	// RowsAffected is the affected-row count (non-queries only).
 	RowsAffected int64
-	// SQLiteQuery is the translated backend SQL the engine executed.
-	// It is always captured; the CLI shows it only in debug mode.
-	SQLiteQuery string
+	// DuckDBQuery is the translated backend SQL the engine executed.
+	// It is always captured. The CLI shows it only in debug mode.
+	DuckDBQuery string
 	// Elapsed is the wall-clock execution time.
 	Elapsed time.Duration
 	// Err is the execution error, if any.
@@ -106,7 +106,7 @@ func (r *Runner) Close() error {
 
 // Exec runs a single statement and returns its structured Result. A
 // trailing \G selects group display mode. The translated backend SQL is
-// captured into Result.SQLiteQuery via the internal SQL collector.
+// captured into Result.DuckDBQuery via the internal SQL collector.
 func (r *Runner) Exec(ctx context.Context, statement string) Result {
 	res := Result{Statement: statement}
 	stmt := strings.TrimSpace(statement)
@@ -129,7 +129,7 @@ func (r *Runner) Exec(ctx context.Context, statement string) Result {
 	}
 	res.Elapsed = time.Since(start)
 	if queries := collector.Queries(); len(queries) > 0 {
-		res.SQLiteQuery = strings.Join(queries, ";\n")
+		res.DuckDBQuery = strings.Join(queries, ";\n")
 	}
 	return res
 }

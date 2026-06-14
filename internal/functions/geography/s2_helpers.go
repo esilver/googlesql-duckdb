@@ -198,7 +198,7 @@ func numSubGeometries(g *value.GeographyValue) int {
 	return 0
 }
 
-// geographyArg is a defensive accessor that converts the SQLite
+// geographyArg is a defensive accessor that converts the DuckDB
 // boundary value into a *GeographyValue. Returns nil when the
 // argument is NULL or not a geography.
 func geographyArg(v value.Value) *value.GeographyValue {

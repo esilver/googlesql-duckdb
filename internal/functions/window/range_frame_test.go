@@ -3,7 +3,7 @@
 // partition-aware index/range helpers in option.go. These paths only
 // run when the analyzer materialises a `RANGE BETWEEN N PRECEDING AND
 // N FOLLOWING` window via the predecessor-emulation path, which is
-// only routed for DISTINCT / IGNORE NULLS aggregates that the SQLite
+// only routed for DISTINCT / IGNORE NULLS aggregates that the DuckDB
 // native engine can't drive natively. The unit tests below bypass that
 // gating by constructing the status directly — the same shape the
 // formatter would emit for a `LOGICAL_OR(DISTINCT b) OVER (ORDER BY t

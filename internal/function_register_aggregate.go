@@ -33,7 +33,7 @@ var aggregateFuncs = []*aggregateFuncInfo{
 	// to
 	//   googlesqlite_having_any_value(value, having_expr, 'MAX'|'MIN')
 	// because go-googlesql's resolved tree exposes the modifier but
-	// SQLite has no native equivalent. The setupAggregateFuncMap
+	// DuckDB has no native equivalent. The setupAggregateFuncMap
 	// prefix turns the Name below into googlesqlite_having_any_value
 	// at registration time.
 	{Name: "having_any_value", BindFunc: aggregate.BindHavingAnyValue},

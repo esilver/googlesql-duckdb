@@ -39,8 +39,8 @@ func TestRunnerSelect(t *testing.T) {
 	if got := res.Columns; len(got) != 2 || got[0] != "x" || got[1] != "y" {
 		t.Fatalf("columns = %v", got)
 	}
-	if res.SQLiteQuery == "" {
-		t.Errorf("SQLiteQuery is empty; the debug collector did not capture the translated query")
+	if res.DuckDBQuery == "" {
+		t.Errorf("DuckDBQuery is empty, the debug collector did not capture the translated query")
 	}
 }
 
@@ -50,10 +50,10 @@ func TestRunnerDebugCollector(t *testing.T) {
 	if res.Err != nil {
 		t.Fatalf("Exec: %v", res.Err)
 	}
-	// The translated backend SQL must mention the addition; it is the
+	// The translated backend SQL must mention the addition. It is the
 	// internal SQL collector hook that feeds CLI debug mode.
-	if !strings.Contains(res.SQLiteQuery, "1") {
-		t.Errorf("SQLiteQuery = %q, expected the translated query text", res.SQLiteQuery)
+	if !strings.Contains(res.DuckDBQuery, "1") {
+		t.Errorf("DuckDBQuery = %q, expected the translated query text", res.DuckDBQuery)
 	}
 }
 

@@ -30,7 +30,7 @@ type HistoryEntry struct {
 func NewHistoryEntry(res Result) HistoryEntry {
 	e := HistoryEntry{
 		Statement:    res.Statement,
-		DuckDBQuery:  res.SQLiteQuery,
+		DuckDBQuery:  res.DuckDBQuery,
 		IsQuery:      res.IsQuery,
 		Columns:      res.Columns,
 		RowsAffected: res.RowsAffected,

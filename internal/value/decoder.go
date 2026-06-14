@@ -122,8 +122,8 @@ func DecodeValue(v any) (Value, error) {
 	case int64:
 		return IntValue(vv), nil
 	// DuckDB returns narrower integer widths natively (e.g. INT -> int32,
-	// SELECT 1 -> int32, SMALLINT -> int16), whereas SQLite always handed
-	// back int64. Widen them so scalar columns and integer literals decode.
+	// SELECT 1 -> int32, SMALLINT -> int16). Widen them so scalar columns
+	// and integer literals decode.
 	case int32:
 		return IntValue(int64(vv)), nil
 	case int16:
@@ -169,8 +169,8 @@ func DecodeValue(v any) (Value, error) {
 		}
 		return BytesValue(vv), nil
 	case *big.Int:
-		// DuckDB returns HUGEINT (128-bit) results as *big.Int, which the
-		// SQLite backend never produced. COUNT / COUNTIF / SUM(INTEGER)
+		// DuckDB returns HUGEINT (128-bit) results as *big.Int.
+		// COUNT / COUNTIF / SUM(INTEGER)
 		// promote to HUGEINT in DuckDB even when the true result fits in
 		// 64 bits, so map a representable value to INT64 and fall back to
 		// FLOAT64 only when it genuinely overflows int64.

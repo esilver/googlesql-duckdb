@@ -9,7 +9,7 @@ import (
 
 // STRUCT_WITH_FIELD_SET returns a copy of the input struct with the
 // field at the given (0-based) index replaced by newValue. Used by
-// UPDATE rewrites of `col.field = value` — SQL/SQLite cannot assign
+// UPDATE rewrites of `col.field = value` — SQL cannot assign
 // to a function call, so the formatter rewrites those updates into
 // a whole-column replacement that calls this function.
 //

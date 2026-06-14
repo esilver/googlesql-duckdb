@@ -246,7 +246,7 @@ Append \G to a query to print it in vertical (row-per-stanza) form.
 
 // catalogNames reads entry names of the given kinds from the
 // googlesqlite_catalog bookkeeping table. It opens a short-lived
-// connection to the raw SQLite engine because that table is internal
+// connection to the raw DuckDB engine because that table is internal
 // to the engine and not visible to the GoogleSQL analyzer. A missing
 // catalog table (nothing created yet) is reported as an empty list.
 func (r *Runner) catalogNames(ctx context.Context, kinds ...string) ([]string, error) {
@@ -278,8 +278,8 @@ func (r *Runner) catalogNames(ctx context.Context, kinds ...string) ([]string, e
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		// No catalog table yet: the session has not created anything.
-		// SQLite reports "no such table"; the DuckDB backend reports
-		// a Catalog Error saying the table does not exist.
+		// DuckDB reports a Catalog Error saying the table does not
+		// exist. The "no such table" form is tolerated as a fallback.
 		msg := err.Error()
 		if strings.Contains(msg, "no such table") ||
 			(strings.Contains(msg, "googlesqlite_catalog") && strings.Contains(msg, "does not exist")) {

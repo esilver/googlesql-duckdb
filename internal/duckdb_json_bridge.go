@@ -18,9 +18,8 @@ import (
 // shared pure-Go implementation, and re-encodes the result.
 //
 // Keeping this table local (rather than reusing the full normalFuncs
-// list) scopes the DuckDB JSON retarget to its own family without
-// disturbing the other function categories that still route through the
-// predecessor's SQLite adapter.
+// list) scopes the JSON family to its own bridge without
+// disturbing the other function categories.
 var jsonFamilyFuncs = []*funcInfo{
 	{Name: "json_extract", BindFunc: jsonfn.BindJsonExtract},
 	{Name: "json_extract_scalar", BindFunc: jsonfn.BindJsonExtractScalar},
@@ -239,9 +238,9 @@ var jsonFamilyMapOnce sync.Once
 // ensureJSONFamilyInFormatterMap inserts every JSON-family name into
 // normalFuncMap so getFuncNameAndArgs emits the googlesqlite_-prefixed
 // UDF name. The formatter only consults the map for membership (it never
-// invokes the stored body on the DuckDB path), so a nil body is fine; we
+// invokes the stored body on the DuckDB path), so a nil body is fine. We
 // still attach the canonical encode/decode wrapper for parity with the
-// SQLite registration shape.
+// normal UDF registration shape.
 func ensureJSONFamilyInFormatterMap() {
 	jsonFamilyMapOnce.Do(func() {
 		funcMapMu.Lock()

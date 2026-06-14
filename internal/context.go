@@ -38,7 +38,7 @@ type (
 // function calls through their `googlesqlite_safe_<name>` variants
 // (NULL-on-error) instead of the raising form, and the formatter
 // short-circuits inner ERROR(msg) calls to a SQL NULL literal so
-// SQLite never has to abort the statement on the would-be error.
+// DuckDB never has to abort the statement on the would-be error.
 func withSafeEvalMode(ctx context.Context) context.Context {
 	return context.WithValue(ctx, safeEvalModeKey{}, true)
 }
@@ -142,7 +142,7 @@ func connFromContext(ctx context.Context) *Conn {
 // withCteRefCounts carries a CTE-name → reference-count map through
 // the formatter, populated by WithScanNode just before it formats
 // the WITH entries. WithEntryNode reads it to decide whether to
-// emit the SQLite `MATERIALIZED` hint for entries that are
+// emit the DuckDB `MATERIALIZED` hint for entries that are
 // referenced more than once.
 func withCteRefCounts(ctx context.Context, m map[string]int) context.Context {
 	return context.WithValue(ctx, cteRefCountsKey{}, m)
@@ -170,7 +170,7 @@ func cteSetOperationOrdinals(ctx context.Context) map[string]bool {
 
 // nullOrderMode represents the OVER (ORDER BY ... NULLS FIRST/LAST)
 // clause as captured from the resolved AST. The default zero value
-// "unspecified" leaves null placement to the SQLite default for the
+// "unspecified" leaves null placement to the DuckDB default for the
 // emitted ORDER BY expression.
 type nullOrderMode int
 
@@ -385,11 +385,11 @@ func paramCollectorFromContext(ctx context.Context) *paramCollector {
 	return v.(*paramCollector)
 }
 
-// SQLCollector accumulates the SQLite queries that the formatter emits
+// SQLCollector accumulates the DuckDB queries that the formatter emits
 // while analyzing GoogleSQL statements. It is the introspection hook
 // behind the CLI's debug mode: the caller installs one on the context
 // via NewSQLCollectorContext, runs a statement through the driver, and
-// reads back the translated SQLite text with Queries.
+// reads back the translated DuckDB text with Queries.
 //
 // It lives in the internal package so cmd/googlesqlite (and the wasm
 // Playground) can surface the translated SQL without the public
@@ -399,7 +399,7 @@ type SQLCollector struct {
 	queries []string
 }
 
-// Add records one translated SQLite query. Called by the formatter
+// Add records one translated DuckDB query. Called by the formatter
 // chokepoint (collectFormatParams) once per analyzed statement.
 func (c *SQLCollector) Add(query string) {
 	c.mu.Lock()
@@ -407,7 +407,7 @@ func (c *SQLCollector) Add(query string) {
 	c.mu.Unlock()
 }
 
-// Queries returns a copy of every translated SQLite query collected so
+// Queries returns a copy of every translated DuckDB query collected so
 // far, in analysis order.
 func (c *SQLCollector) Queries() []string {
 	c.mu.Lock()
@@ -420,7 +420,7 @@ func (c *SQLCollector) Queries() []string {
 // NewSQLCollectorContext derives a context carrying a fresh
 // SQLCollector. Pass the returned context to database/sql's
 // QueryContext / ExecContext and the analyzer will populate the
-// collector with the SQLite text it generates.
+// collector with the DuckDB text it generates.
 func NewSQLCollectorContext(ctx context.Context) (context.Context, *SQLCollector) {
 	c := &SQLCollector{}
 	return context.WithValue(ctx, sqlCollectorKey{}, c), c

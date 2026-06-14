@@ -11,10 +11,10 @@ import (
 )
 
 // EncodeValue serializes a Value into the over-the-wire form the
-// SQLite layer accepts. INT64 / FLOAT64 / BOOL pass through to their
+// DuckDB layer accepts. INT64 / FLOAT64 / BOOL pass through to their
 // Go primitives; richer types (BYTES, NUMERIC, ARRAY, STRUCT, ...)
 // are JSON-encoded under a small (header, body) envelope and then
-// base64-encoded so SQLite stores them as a flat string.
+// base64-encoded so DuckDB stores them as a flat string.
 func EncodeValue(v Value) (any, error) {
 	if v == nil {
 		return nil, nil

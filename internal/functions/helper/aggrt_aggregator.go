@@ -7,9 +7,9 @@ import (
 	"github.com/goccy/googlesqlite/internal/value"
 )
 
-// Aggregator is the SQLite-side wrapper that drives a per-spec
-// aggregate (Step / Done shape) over a single GROUP. SQLite hands
-// each row's args to Step; we strip the encoded option markers
+// Aggregator is the DuckDB-side wrapper that drives a per-spec
+// aggregate (Step / Done shape) over a single GROUP. DuckDB hands
+// each row's args to Step, then we strip the encoded option markers
 // (DISTINCT / IGNORE_NULLS / LIMIT / ORDER_BY), thread the resulting
 // Option through to the per-spec step function, and finally encode
 // the Done result back into the over-the-wire form.
@@ -76,7 +76,7 @@ func (a *Aggregator) Done() (any, error) {
 }
 
 // NewAggregator wires up a fresh Aggregator with the given per-spec
-// step / done callbacks. Returns the wrapper SQLite drives.
+// step / done callbacks. Returns the wrapper DuckDB drives.
 func NewAggregator(
 	step func([]value.Value, *Option) error,
 	done func() (value.Value, error),

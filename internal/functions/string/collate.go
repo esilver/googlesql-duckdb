@@ -32,8 +32,7 @@ func COLLATE(v, spec string) (value.Value, error) {
 	// Project the value to a normalised form whose lexicographic
 	// ordering matches the requested collation, so a subsequent
 	// `<` / `>` / `=` comparison between two COLLATE results
-	// (or routing through the `googlesqlite_collate` SQLite
-	// collation) observes the collation-aware order. For `und:ci`
+	// observes the collation-aware order. For `und:ci`
 	// we fold to lower case via Unicode case mapping; other
 	// language tags reuse the same fold which is acceptable for
 	// the upstream Examples that exercise plain ASCII / Latin.

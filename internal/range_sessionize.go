@@ -220,7 +220,7 @@ func rewriteRangeSessionize(rawArgs string) (string, error) {
 
 	// Level 3: derive session_range. Cannot wrap the RANGE() result
 	// directly around two window aggregates because RANGE expects
-	// scalar args; let SQLite evaluate the window aggregates first.
+	// scalar args, so let DuckDB evaluate the window aggregates first.
 	final := fmt.Sprintf(
 		"SELECT * EXCEPT(__rs_start, __rs_end, __rs_prev_max_end, __rs_new_session, __rs_session_id), RANGE(MIN(__rs_start) OVER (PARTITION BY %s__rs_session_id), MAX(__rs_end) OVER (PARTITION BY %s__rs_session_id)) AS session_range FROM (%s)",
 		partitionForSession, partitionForSession, grouped,

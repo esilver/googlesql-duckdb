@@ -37,7 +37,7 @@ import (
 )
 
 // normalFuncs lists every scalar / non-aggregate function the
-// driver registers as a SQLite UDF. Organized roughly by category
+// driver registers as a DuckDB UDF. Organized roughly by category
 // (arithmetic / comparison / bit; struct + array accessors; type
 // system; string; numeric; date / datetime / time / timestamp;
 // json; hash; net; geography; helpers).

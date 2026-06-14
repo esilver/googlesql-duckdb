@@ -43,7 +43,7 @@ func getTableName(ctx context.Context, n googlesql.ResolvedNode) (string, error)
 	// is equivalent.
 	if scan, ok := n.(*googlesql.ResolvedTableScan); ok {
 		if table, err := scan.Table(); err == nil && table != nil {
-			// Preferred: look the table's storage name (the SQLite
+			// Preferred: look the table's storage name (the DuckDB
 			// table identifier built from the spec's full namespace
 			// path) up against our local catalog index. This works
 			// regardless of which sub-catalog level the analyzer
@@ -190,19 +190,16 @@ func getFuncNameAndArgs(ctx context.Context, node *ResolvedBaseFunctionCallNode,
 	funcName := m1(m1(node.Function()).FullName(false))
 	funcName = strings.Replace(funcName, ".", "_", -1)
 
-	// DuckDB retarget: COUNT(*) is analyzed as the $-builtin
-	// `$count_star` and would otherwise lower to the SQLite UDF
-	// googlesqlite_count_star(). DuckDB has no such UDF but supports
-	// native COUNT(*) with identical semantics, so emit that directly
-	// as a hand-translated single-function lowering.
+	// COUNT(*) is analyzed as the $-builtin `$count_star`. DuckDB
+	// supports native COUNT(*) with identical semantics, so emit that
+	// directly as a hand-translated single-function lowering.
 	if funcName == "$count_star" {
 		return "count", []string{"*"}, nil
 	}
 
-	// DuckDB retarget: the GoogleSQL geography builtins (ST_* / S2_*)
-	// resolve as analyzer builtins, so they reach here with their bare
-	// lowercase name and are absent from normalFuncMap (which only the
-	// SQLite registration path populates). Route them to the
+	// The GoogleSQL geography builtins (ST_* / S2_*) resolve as
+	// analyzer builtins, so they reach here with their bare
+	// lowercase name and are absent from normalFuncMap. Route them to the
 	// googlesqlite_st_* / googlesqlite_s2_* scalar UDFs registered on
 	// the DuckDB handle (see duckdb_geo_udf.go). Those UDFs reuse the
 	// pure-Go geography bodies and the value-layer envelope, so the
@@ -500,11 +497,11 @@ func (n *FunctionCallNode) FormatSQL(ctx context.Context) (string, error) {
 	// googlesqlite_<op> scalar UDFs. Those UDFs are not registered on
 	// DuckDB (and need not be: DuckDB has native infix/prefix operators
 	// with matching semantics). Emit the native operator form directly.
-	// DuckDB retarget (math family): the BigQuery math builtins
+	// Math family: the BigQuery math builtins
 	// (IS_NAN, IEEE_DIVIDE, DIV, SAFE_*, RAND, LOG, RANGE_BUCKET,
 	// the reciprocal trig forms, vector-distance funcs) reach the
 	// formatter as their bare resolved names because normalFuncMap is
-	// only populated for the SQLite UDF path. Lower each to its DuckDB
+	// empty. Lower each to its DuckDB
 	// native equivalent (or an inline expression with matching
 	// semantics) instead of emitting an unknown scalar function. This
 	// runs before tryNativeOperator so the bare SAFE_DIVIDE name keeps
@@ -532,9 +529,9 @@ func (n *FunctionCallNode) FormatSQL(ctx context.Context) (string, error) {
 	if sql, ok, err := n.tryFormatDateConstructor(funcName, args, kinds); ok || err != nil {
 		return sql, err
 	}
-	// DuckDB retarget: the array-family value-layer functions resolve to
-	// bare builtin names (array_concat, array_length, ...) because the
-	// normalFuncMap prefixing only runs on the SQLite registration path.
+	// The array-family value-layer functions resolve to
+	// bare builtin names (array_concat, array_length, ...) because
+	// normalFuncMap is empty.
 	// DuckDB's own array_* natives operate on native LIST values, not the
 	// base64 envelope strings our value layer carries, so route these to
 	// the registered googlesqlite_<name> scalar UDFs that decode the
@@ -628,8 +625,8 @@ func (n *FunctionCallNode) FormatSQL(ctx context.Context) (string, error) {
 		// for already-native operands); non-NUMERIC arguments emit unchanged,
 		// so the output matches the default native lowering this case
 		// otherwise mirrors (both names reach the generic funcName(args) emit
-		// on the DuckDB path — the googlesqlite_ifnull CASE form above only
-		// fires when the SQLite normalFuncMap shells the name).
+		// on DuckDB, while the googlesqlite_ifnull CASE form above only fires
+		// for the legacy googlesqlite_-prefixed spelling of the name).
 		//
 		// IF / NULLIF / GREATEST / LEAST (issue #22) are the rest of the
 		// multi-branch family that binds branch / operand types together:
@@ -666,9 +663,9 @@ func (n *FunctionCallNode) FormatSQL(ctx context.Context) (string, error) {
 	if funcName == "googlesqlite_format" || funcName == "googlesqlite_safe_format" {
 		args = wrapFormatTimestampArgs(args, argKinds(m1(n.node.ArgumentList())))
 	}
-	// DuckDB retarget: a handful of scalar built-ins resolve to their bare
-	// catalog name here (the SQLite normalFuncMap is never populated on
-	// this target) but DuckDB spells the equivalent function differently.
+	// A handful of scalar built-ins resolve to their bare
+	// catalog name here (normalFuncMap is empty) but DuckDB spells the
+	// equivalent function differently.
 	if duckName, ok := nativeScalarRenames[funcName]; ok {
 		funcName = duckName
 	}
@@ -780,8 +777,8 @@ var nativelySafeValueLayerBuiltins = map[string]struct{}{
 }
 
 // nativeNumericAggregates maps a GoogleSQL aggregate (its catalog storage
-// name, which is what getFuncNameAndArgs resolves to on the DuckDB target
-// because the SQLite aggregateFuncMap is never populated here) to its
+// name, which is what getFuncNameAndArgs resolves to because
+// aggregateFuncMap is empty) to its
 // DuckDB-native aggregate name plus the numeric type its single argument
 // must be cast to. The UNNEST source feeds rows as JSON-typed
 // value-layer-encoded scalars (json_each.value), so DuckDB's native
@@ -1072,8 +1069,8 @@ func usesDuckDBAggregateOptionMarkers(funcName string) bool {
 }
 
 // nativeScalarRenames maps a GoogleSQL scalar built-in (its bare catalog
-// storage name, which is what getFuncNameAndArgs resolves to when the
-// SQLite normalFuncMap is empty - the DuckDB target) to the equivalent
+// storage name, which is what getFuncNameAndArgs resolves to because
+// normalFuncMap is empty) to the equivalent
 // DuckDB scalar function spelled differently. Only same-semantics renames
 // belong here; the value-layer round-trip and NULL behaviour must match.
 // IS_NAN / IS_INF guard the statistical aggregate specs (IS_NAN(COVAR_*)),
@@ -1368,9 +1365,8 @@ func tryNativeOperator(funcName string, args []string, kinds []googlesql.TypeKin
 
 // nativeScalarFuncMap maps a bare GoogleSQL scalar function name to a DuckDB
 // native scalar function that has identical argument order and NULL / value
-// semantics. The formatter lowers BQ funcs to googlesqlite_<name> UDFs that
-// the SQLite adapter registered; on the DuckDB path those maps are empty, so
-// the resolver emits the bare GoogleSQL name. Many of those have a native
+// semantics. The googlesqlite_<name> UDF maps are empty, so the resolver
+// emits the bare GoogleSQL name. Many of those have a native
 // DuckDB builtin under a slightly different spelling, so we emit the native
 // call directly instead of bouncing through an unregistered function.
 var nativeScalarFuncMap = map[string]string{
@@ -2415,17 +2411,15 @@ func tryNativeDatetimeFunc(funcName string, args []string, kinds []googlesql.Typ
 
 // canonicalBuiltinFuncNames lists the special-form builtins whose
 // FunctionCallNode dispatch (the switch on funcName below) handles them with
-// a hand-written lowering rather than a registered UDF. On the SQLite path the
-// resolver prefixes these to googlesqlite_<name>; on the DuckDB path the
+// a hand-written lowering rather than a registered UDF. The
 // normalFuncMap is empty so they arrive bare. We canonicalize the bare name
-// back to the prefixed form so a single dispatch covers both paths.
+// to the prefixed googlesqlite_<name> form so the dispatch below covers them.
 var canonicalBuiltinFuncNames = map[string]string{
 	"iferror":     "googlesqlite_iferror",
 	"iserror":     "googlesqlite_iserror",
 	"nulliferror": "googlesqlite_nulliferror",
-	// On the DuckDB target the analyzer resolves these proto builtins to
-	// their bare GoogleSQL names (the SQLite normalFuncMap that would
-	// otherwise shell them into googlesqlite_<name> is never populated).
+	// The analyzer resolves these proto builtins to their bare GoogleSQL
+	// names because normalFuncMap is empty.
 	// Canonicalize so the switch below reaches their format* lowerings,
 	// which rewrite the call to the googlesqlite_<name> scalar UDFs
 	// registered by registerProtoUDFs. FILTER_FIELDS / REPLACE_FIELDS are
@@ -2732,8 +2726,8 @@ func (n *FunctionCallNode) formatEnumValueDescriptorProto(_ context.Context, arg
 }
 
 // formatErrorHandling lowers the IFERROR / ISERROR / NULLIFERROR family.
-// SQLite has no UDF-level try / catch (the VDBE aborts the statement as
-// soon as any function returns non-nil error), so we lower the
+// DuckDB has no UDF-level try / catch (a UDF returning a non-nil error
+// aborts the whole statement), so we lower the
 // error-handling family by reformatting the inner argument under a
 // safe-eval sub-context. Every reachable function call switches to its
 // `googlesqlite_safe_<name>` variant (NULL on failure), and a nested
@@ -2841,12 +2835,13 @@ func (n *FunctionCallNode) formatErrorBuiltin(ctx context.Context, funcName stri
 	if inSafeEvalMode(ctx) {
 		return "NULL", nil
 	}
-	// SQLite path: route through the registered googlesqlite_error UDF.
+	// If a registered UDF for this name exists in the context func map,
+	// route through it.
 	funcMap := funcMapFromContext(ctx)
 	if spec, exists := funcMap[funcName]; exists {
 		return spec.CallSQL(ctx, n.node.ResolvedFunctionCallBase, args)
 	}
-	// DuckDB path: emit the native error() function. Unlike a registered
+	// Emit the native DuckDB error() function. Unlike a registered
 	// UDF (which must declare a concrete VARCHAR result type and would
 	// then fail to unify with a non-VARCHAR sibling branch in an
 	// enclosing CASE / if - e.g. the IS_FIRST / IS_LAST numbering
@@ -2949,7 +2944,7 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 	}
 	// HAVING { MAX | MIN } modifier rewrite. The resolved tree
 	// carries the modifier on ResolvedAggregateFunctionCall, but
-	// SQLite has no equivalent. For ANY_VALUE we rewrite to a
+	// DuckDB has no equivalent. For ANY_VALUE we rewrite to a
 	// custom googlesqlite_having_any_value(value, having_expr,
 	// 'MAX'|'MIN') that filters rows down to those matching the
 	// extremum of having_expr at Done() time.
@@ -3010,9 +3005,9 @@ func (n *AggregateFunctionCallNode) FormatSQL(ctx context.Context) (string, erro
 	if sql, ok, err := tryNativeArrayAggStructTopN(ctx, funcName, n.node, args); ok || err != nil {
 		return sql, err
 	}
-	// DuckDB retarget: numeric / statistical / bitwise / logical
-	// aggregates resolve to their bare catalog name here (the SQLite
-	// aggregateFuncMap is never populated on this target), but DuckDB's
+	// Numeric / statistical / bitwise / logical
+	// aggregates resolve to their bare catalog name here (the
+	// aggregateFuncMap is empty), but DuckDB's
 	// native reducers cannot consume the JSON value-layer encoding the
 	// UNNEST source feeds. Rewrite to the native name with the argument(s)
 	// cast to the right numeric type; the DISTINCT / ORDER BY handling
@@ -3244,14 +3239,14 @@ func tryNativeArrayAggStructTopN(ctx context.Context, funcName string, node *goo
 }
 
 // nativeWindowFuncMap maps GoogleSQL window function names that have a
-// direct SQLite built-in equivalent. When a function is in this map,
-// AnalyticFunctionCallNode emits native `<sqlite_name>(args) OVER
+// direct DuckDB built-in equivalent. When a function is in this map,
+// AnalyticFunctionCallNode emits native `<native_name>(args) OVER
 // (PARTITION BY ... ORDER BY ... FRAME)` syntax — avoiding the
 // per-row full-scan emulation that the predecessor used because the
 // underlying SQLite binding (mattn) could not register custom window
 // functions.
 var nativeWindowFuncMap = map[string]string{
-	// Numbering functions — SQLite built-ins return identical results.
+	// Numbering functions — DuckDB built-ins return identical results.
 	"row_number":   "row_number",
 	"rank":         "rank",
 	"dense_rank":   "dense_rank",
@@ -3268,7 +3263,7 @@ var nativeWindowFuncMap = map[string]string{
 	// IS_LAST rewrite attaches is a no-op for COUNT(*) (it counts rows),
 	// so the bare native form is exact. formatNative injects the * arg.
 	"count_star": "count",
-	// Navigation functions — SQLite returns the underlying value
+	// Navigation functions — DuckDB returns the underlying value
 	// unchanged, so encoded values flow through correctly.
 	"lag":         "lag",
 	"lead":        "lead",
@@ -3290,10 +3285,10 @@ var nativeWindowFuncMap = map[string]string{
 	"bit_and":     "bit_and",
 	"bit_or":      "bit_or",
 	"bit_xor":     "bit_xor",
-	// Cumulative aggregates against native SQLite types. Encoded
+	// Cumulative aggregates against native DuckDB types. Encoded
 	// values would not survive these (SUM of base64 strings would
 	// fail), but parity tests exercise them on INT64/FLOAT64 where
-	// SQLite arithmetic suffices.
+	// DuckDB arithmetic suffices.
 	"sum":   "sum",
 	"avg":   "avg",
 	"count": "count",
@@ -3335,8 +3330,8 @@ var customNativeWindowFuncMap = map[string]string{
 	"var_samp":    "googlesqlite_window_var_samp",
 }
 
-// nativeWindowFuncForName returns the SQLite native name for a
-// predecessor window function, or "" when no native equivalent
+// nativeWindowFuncForName returns the DuckDB native name for a
+// GoogleSQL window function, or "" when no native equivalent
 // applies.
 func nativeWindowFuncForName(name string) string {
 	if v, ok := nativeWindowFuncMap[name]; ok {
@@ -3356,16 +3351,16 @@ func (n *AnalyticFunctionCallNode) FormatSQL(ctx context.Context) (string, error
 	// native OVER syntax or the predecessor's correlated-subquery
 	// emulation. Some BigQuery-specific modifiers (DISTINCT,
 	// IGNORE NULLS) and one tied-row case in CUME_DIST diverge from
-	// SQLite's native semantics, so those still take the emulation
+	// DuckDB's native semantics, so those still take the emulation
 	// path.
 	rawName := strings.ReplaceAll(m1(m1(n.node.Function()).FullName(false)), ".", "_")
 	// googlesql analyzer prefixes some operator-like functions with
 	// `$` (e.g. `$count_star` for COUNT(*)). Strip it for lookup.
 	rawName = strings.TrimPrefix(rawName, "$")
 
-	// ST_CLUSTERDBSCAN has no native analytic form and the SQLite
-	// emulation hack does not survive DuckDB's unordered parallel
-	// scan, so lower it to a native list_extract(... OVER (), ...)
+	// ST_CLUSTERDBSCAN has no native analytic form and the per-row
+	// correlated-subquery emulation does not survive DuckDB's unordered
+	// parallel scan, so lower it to a native list_extract(... OVER (), ...)
 	// window expression backed by the st_clusterdbscan window
 	// aggregate. See formatStClusterDBSCAN.
 	if rawName == "st_clusterdbscan" {
@@ -3474,7 +3469,7 @@ func (n *AnalyticFunctionCallNode) FormatSQL(ctx context.Context) (string, error
 // distinctAwareNativeWindowFuncs maps `<name>` to the custom function
 // registered through Conn.CreateWindowFunction that handles
 // `<name>(DISTINCT x) OVER (...)`. Used when the formatter sees the
-// DISTINCT modifier on functions whose plain native form is a SQLite
+// DISTINCT modifier on functions whose plain native form is a DuckDB
 // built-in (which doesn't accept DISTINCT in OVER).
 var distinctAwareNativeWindowFuncs = map[string]string{
 	"sum":         "googlesqlite_window_sum_distinct",
@@ -3493,7 +3488,7 @@ func (n *AnalyticFunctionCallNode) requiresPredecessorEmulation() bool {
 	if m1(n.node.Distinct()) {
 		// MIN(DISTINCT x) and MAX(DISTINCT x) are equivalent to
 		// MIN(x) / MAX(x) — the DISTINCT marker is a no-op, so
-		// SQLite native is fine.
+		// DuckDB native is fine.
 		switch rawName {
 		case "min", "max":
 			return false
@@ -3515,7 +3510,7 @@ func (n *AnalyticFunctionCallNode) requiresPredecessorEmulation() bool {
 	}
 	switch m1(n.node.NullHandlingModifier()) {
 	case googlesql.ResolvedNonScalarFunctionCallBaseEnums_NullHandlingModifierIgnoreNulls:
-		// SQLite's SUM/AVG/COUNT/MIN/MAX/COUNT_STAR already skip
+		// DuckDB's SUM/AVG/COUNT/MIN/MAX/COUNT_STAR already skip
 		// NULLs unconditionally, which matches the IGNORE NULLS
 		// modifier exactly. Navigation functions (LAG/LEAD/
 		// FIRST_VALUE/LAST_VALUE/NTH_VALUE) honour the modifier
@@ -3542,20 +3537,20 @@ func (n *AnalyticFunctionCallNode) requiresPredecessorEmulation() bool {
 	return false
 }
 
-// formatNative emits a SQLite-native window function call:
+// formatNative emits a DuckDB-native window function call:
 //
-//	<sqliteName>(<value-args>) OVER (PARTITION BY ... ORDER BY ... <frame>)
+//	<nativeName>(<value-args>) OVER (PARTITION BY ... ORDER BY ... <frame>)
 //
 // The OVER clause is built from the same partition / order / frame
-// information the predecessor tucked into function arguments. SQLite
+// information the predecessor tucked into function arguments. DuckDB
 // drives Step/Value over rows in the frame, which is dramatically
 // cheaper than the predecessor's per-output-row full-scan subquery.
 //
 // includeOpts forwards the DISTINCT / IGNORE NULLS markers as
-// trailing arguments. SQLite built-ins reject those, so we only
+// trailing arguments. DuckDB built-ins reject those, so we only
 // include them when calling our custom googlesqlite_window_<name>
 // implementations that know how to parse them.
-func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName string, orderColumns []*analyticOrderBy, includeOpts bool) (string, error) {
+func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, nativeName string, orderColumns []*analyticOrderBy, includeOpts bool) (string, error) {
 	// Collect the user-supplied value arguments (without our window
 	// option markers).
 	var valueArgs []string
@@ -3572,10 +3567,10 @@ func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName 
 	// always yields a continuous (double) result, so cast the value arg
 	// to DOUBLE. quantile_disc returns the element type unchanged and
 	// DuckDB auto-casts JSON integers for it, so it is left as-is.
-	if sqliteName == "quantile_cont" && len(valueArgs) >= 1 {
+	if nativeName == "quantile_cont" && len(valueArgs) >= 1 {
 		valueArgs[0] = fmt.Sprintf("CAST(%s AS DOUBLE)", valueArgs[0])
 	}
-	if sqliteName == "string_agg" && len(valueArgs) >= 1 {
+	if nativeName == "string_agg" && len(valueArgs) >= 1 {
 		valueArgs[0] = fmt.Sprintf("googlesqlite_plain_string(%s)", valueArgs[0])
 		if len(valueArgs) >= 2 {
 			valueArgs[1] = fmt.Sprintf("googlesqlite_plain_string(%s)", valueArgs[1])
@@ -3591,10 +3586,10 @@ func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName 
 	// valueLayerScalarCastType resolves for the integer kinds — DuckDB's
 	// sum(BIGINT) accumulates in HUGEINT without float rounding. MIN /
 	// MAX / COUNT bind against JSON directly, so they are left alone.
-	if (sqliteName == "sum" || sqliteName == "avg") && len(valueArgs) >= 1 {
+	if (nativeName == "sum" || nativeName == "avg") && len(valueArgs) >= 1 {
 		kinds := argKinds(m1(n.node.ResolvedFunctionCallBase.ArgumentList()))
 		if castType, ok := valueLayerScalarCastType(kindAt(kinds, 0)); ok {
-			if sqliteName == "avg" {
+			if nativeName == "avg" {
 				castType = "DOUBLE"
 			}
 			valueArgs[0] = fmt.Sprintf("CAST(%s AS %s)", valueArgs[0], castType)
@@ -3617,7 +3612,7 @@ func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName 
 	// BYTES operand by payload bytes — the same treatment the
 	// non-window aggregate path applies (issue #9's "window not" gap,
 	// closed by the native-storage migration).
-	if (sqliteName == "min" || sqliteName == "max") && len(valueArgs) >= 1 {
+	if (nativeName == "min" || nativeName == "max") && len(valueArgs) >= 1 {
 		kinds := argKinds(m1(n.node.ResolvedFunctionCallBase.ArgumentList()))
 		switch kindAt(kinds, 0) {
 		case googlesql.TypeKindTypeNumeric:
@@ -3628,7 +3623,7 @@ func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName 
 	}
 	// $count_star resolves with no value arguments; DuckDB's native
 	// COUNT requires the * argument in OVER context.
-	if sqliteName == "count" && len(valueArgs) == 0 {
+	if nativeName == "count" && len(valueArgs) == 0 {
 		valueArgs = []string{"*"}
 	}
 	if includeOpts {
@@ -3650,7 +3645,7 @@ func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName 
 	// googlesqlite_distinct() marker via includeOpts instead.
 	distinctKeyword := ""
 	if m1(n.node.Distinct()) && !includeOpts {
-		switch sqliteName {
+		switch nativeName {
 		case "sum", "avg", "count", "min", "max", "bool_or", "bool_and",
 			// ARRAY_AGG(DISTINCT x) / STRING_AGG(DISTINCT s) in OVER
 			// context: the engine implements DISTINCT for windowed
@@ -3667,12 +3662,12 @@ func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName 
 			distinctKeyword = "DISTINCT "
 		}
 	}
-	call := fmt.Sprintf("%s(%s%s)", sqliteName, distinctKeyword, strings.Join(valueArgs, ","))
+	call := fmt.Sprintf("%s(%s%s)", nativeName, distinctKeyword, strings.Join(valueArgs, ","))
 	// COUNTIF(cond) — same rewrite as the non-window aggregate path:
 	// DuckDB's count_if returns NULL over an empty frame where GoogleSQL
 	// returns 0, while COUNT(CASE WHEN cond THEN 1 END) matches both the
 	// truthy-count and the zero-on-empty semantics.
-	if sqliteName == "countif" && len(valueArgs) >= 1 {
+	if nativeName == "countif" && len(valueArgs) >= 1 {
 		call = fmt.Sprintf("count(CASE WHEN %s THEN 1 END)", valueArgs[0])
 	}
 
@@ -3686,11 +3681,11 @@ func (n *AnalyticFunctionCallNode) formatNative(ctx context.Context, sqliteName 
 	// exact INT64 (and a genuinely out-of-range running sum raises DuckDB's
 	// conversion error — BigQuery's overflow semantics) instead of falling
 	// back to a rounded FLOAT64 on the decode path (issue #5).
-	if sqliteName == "sum" || sqliteName == "avg" {
+	if nativeName == "sum" || nativeName == "avg" {
 		if t, _ := n.node.Type(); t != nil {
 			if k, kerr := t.Kind(); kerr == nil {
 				switch {
-				case sqliteName == "sum" && k == googlesql.TypeKindTypeInt64:
+				case nativeName == "sum" && k == googlesql.TypeKindTypeInt64:
 					expr = fmt.Sprintf("CAST(%s AS BIGINT)", expr)
 				case k == googlesql.TypeKindTypeNumeric:
 					// BigQuery SUM/AVG(NUMERIC) return NUMERIC (issue #9):
@@ -3790,10 +3785,9 @@ func (n *AnalyticFunctionCallNode) wantsRowIDTiebreak() bool {
 // formatStClusterDBSCAN lowers the analytic ST_CLUSTERDBSCAN to a
 // native-DuckDB window expression. DBSCAN assigns each row a cluster id
 // computed from the whole partition, which has no native DuckDB
-// analytic; the SQLite backend faked it with a correlated-subquery +
-// rowid-marker hack that depended on the engine preserving scan order
-// (DuckDB's parallel scan does not, so that path mis-aligns). Instead
-// emit:
+// analytic. A per-row correlated-subquery + rowid-marker emulation would
+// depend on the engine preserving scan order, and DuckDB's parallel scan
+// does not, so that path mis-aligns. Instead emit:
 //
 //	list_extract(st_clusterdbscan(geo, eps, min_pts) OVER (w),
 //	             row_number() OVER (w))
@@ -3870,9 +3864,9 @@ func forceFullPartitionFrame(over string) string {
 	return over
 }
 
-// formatNativeFrame turns the resolved-tree frame into a SQLite frame
+// formatNativeFrame turns the resolved-tree frame into a DuckDB frame
 // clause: `ROWS|RANGE BETWEEN <start> AND <end>`. Returns ""
-// when no frame is specified (SQLite picks the appropriate default
+// when no frame is specified (DuckDB picks the appropriate default
 // for the function — RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT
 // ROW for ordered aggregates).
 func (n *AnalyticFunctionCallNode) formatNativeFrame(ctx context.Context) (string, error) {
@@ -4796,7 +4790,7 @@ func (n *SubqueryExprNode) FormatSQL(ctx context.Context) (string, error) {
 			// more than one row. In IFERROR / ISERROR / NULLIFERROR
 			// contexts that error must fold to NULL, so guard the value
 			// with an inline COUNT(*) probe and return NULL unless the
-			// subquery produced exactly one row. DuckDB (unlike SQLite)
+			// subquery produced exactly one row. DuckDB
 			// raises on a multi-row scalar subquery even in the dead CASE
 			// arm, so extract the value through `SELECT * FROM (sub) LIMIT
 			// 1` rather than a bare scalar `(sub)`: the LIMIT 1 keeps the
@@ -4823,9 +4817,8 @@ func (n *SubqueryExprNode) FormatSQL(ctx context.Context) (string, error) {
 			return "", fmt.Errorf("failed to find computed column names for array subquery")
 		}
 		colName := uniqueColumnName(ctx, subCols[0])
-		// DuckDB retarget: the predecessor collected the array-subquery rows
-		// with the googlesqlite_array SQLite aggregate UDF. duckdb-go exposes
-		// no aggregate-UDF registration, so collect the rows with DuckDB's
+		// duckdb-go exposes no aggregate-UDF registration, so collect the
+		// array-subquery rows with DuckDB's
 		// native array_agg (yielding a LIST whose elements are the per-row
 		// value-layer wire form) and fold that LIST back into the array-layer
 		// envelope with googlesqlite_array_from_native. Re-enveloping keeps
@@ -4918,9 +4911,8 @@ func (n *TableScanNode) FormatSQL(ctx context.Context) (string, error) {
 		return fmt.Sprintf("(SELECT %s FROM (%s))", strings.Join(columns, ","), query), nil
 	}
 	// INFORMATION_SCHEMA scans materialise the catalog's live rows as
-	// an inline DuckDB relation. The SQLite fork served these through
-	// an eponymous virtual-table module, but the DuckDB engine has no
-	// vtab layer, so we splice a self-contained subquery exposing the
+	// an inline DuckDB relation. The DuckDB engine has no
+	// virtual-table layer, so we splice a self-contained subquery exposing the
 	// view's columns instead. The dataset filter is applied while the
 	// rows are built (BuildRows takes meta.dataset), so the outer
 	// projection only needs the column names.
@@ -5182,7 +5174,7 @@ func wrapZipOperand(operand string) string {
 //   - DATE / TIME / DATETIME / TIMESTAMP elements ride the envelope inside
 //     the JSON; googlesqlite_unnest_temporal unwraps the envelope to a
 //     canonical native-castable text form and the CAST retypes it to the
-//     native temporal column type (matching ColumnSpec.SQLiteSchema, which
+//     native temporal column type (matching ColumnSpec.SchemaDDL, which
 //     stores temporals natively).
 //
 // Every other element kind (ARRAY, STRUCT, BYTES, NUMERIC, GEOGRAPHY, JSON,
@@ -5294,8 +5286,8 @@ func (n *ArrayScanNode) FormatSQL(ctx context.Context) (string, error) {
 		// and the engine's dependent-join flattening delivers each input
 		// row's elements in REVERSE array order (probed: `SELECT x, range
 		// FROM (SELECT 4 AS x), range(x)` yields 3,2,1,0). BigQuery's
-		// UNNEST surfaces elements in array order and the upstream SQLite
-		// lowering preserved it, so impose it deterministically: stamp
+		// UNNEST surfaces elements in array order, so impose it
+		// deterministically: stamp
 		// each input row with an ordinal (row_number over the input's
 		// natural order), then order the cross product by (input ordinal,
 		// element offset). The helper ordinal is EXCLUDEd from the star
@@ -5612,10 +5604,8 @@ func (n *AggregateScanNode) FormatSQL(ctx context.Context) (string, error) {
 	}
 	var groupBy string
 	if len(groupByColumns) > 0 {
-		// DuckDB retarget (PATH B): the predecessor wrapped each GROUP BY
-		// key in the googlesqlite_group_by() SQLite UDF (a collation /
-		// value-decode shim). DuckDB has no such UDF and groups on the
-		// raw value-layer encoding directly - rows that are equal under
+		// PATH B: DuckDB groups on the raw value-layer encoding
+		// directly - rows that are equal under
 		// GoogleSQL semantics share a byte-identical encoded string, so
 		// native GROUP BY on the bare column is correct.
 		groupBy = fmt.Sprintf("GROUP BY %s", strings.Join(groupByColumns, ","))
@@ -6535,8 +6525,7 @@ func (n *OrderByScanNode) FormatSQL(ctx context.Context) (string, error) {
 		case googlesql.ResolvedOrderByItemEnums_NullOrderModeNullsLast:
 			nullOrder = " NULLS LAST"
 		}
-		// DuckDB retarget: drop the googlesqlite_collate SQLite collation
-		// (no DuckDB callback-collation API). STRING/UUID keys sort by
+		// DuckDB has no callback-collation API, so STRING/UUID keys sort by
 		// decoded payload text; other scalar storage orders natively.
 		orderExpr := orderExprForColumn(col, formattedCol)
 		direction := ""
@@ -6959,7 +6948,7 @@ func (n *DropStmtNode) FormatSQL(ctx context.Context) (string, error) {
 }
 
 // RecursiveRefScanNode renders as the enclosing CTE's queryName so
-// SQLite's native `WITH RECURSIVE name AS (... UNION ALL SELECT ...
+// DuckDB's native `WITH RECURSIVE name AS (... UNION ALL SELECT ...
 // FROM name)` emits a self-reference correctly.
 func (n *RecursiveRefScanNode) FormatSQL(ctx context.Context) (string, error) {
 	name := recursiveCteName(ctx)
@@ -6971,7 +6960,7 @@ func (n *RecursiveRefScanNode) FormatSQL(ctx context.Context) (string, error) {
 
 // findRecursiveRefScanCols walks a scan tree looking for the column
 // list exposed by the (one and only) ResolvedRecursiveRefScan in a
-// recursive UNION term. SQLite-side `WITH RECURSIVE t(...)` must use
+// recursive UNION term. DuckDB-side `WITH RECURSIVE t(...)` must use
 // these IDs as the explicit column list so the recursive term's
 // `FROM t` references resolve to the right columns.
 //
@@ -6997,11 +6986,11 @@ func findRecursiveRefScanCols(node googlesql.ResolvedNode) []*googlesql.Resolved
 
 // RecursiveScanNode renders as `<non_recursive_branch> UNION [ALL]
 // <recursive_branch>`. The recursive-cte reference must stay at the
-// top-level FROM of the recursive branch (SQLite restriction). The
+// top-level FROM of the recursive branch (DuckDB restriction). The
 // enclosing WithEntryNode emits an explicit column list using the
 // RecursiveScan canonical ColumnList so the outer query's references
-// resolve. The recursive term internally uses RecursiveRefScan IDs;
-// those are substituted with canonical IDs here so SQLite sees one
+// resolve. The recursive term internally uses RecursiveRefScan IDs,
+// which are substituted with canonical IDs here so DuckDB sees one
 // consistent name set.
 func (n *RecursiveScanNode) FormatSQL(ctx context.Context) (string, error) {
 	if n.node == nil {
@@ -7046,7 +7035,7 @@ func (n *RecursiveScanNode) FormatSQL(ctx context.Context) (string, error) {
 		return "", err
 	}
 	// Substitute RecursiveRefScan column IDs in the recursive branch
-	// with the canonical RecursiveScan ColumnList IDs so SQLite's
+	// with the canonical RecursiveScan ColumnList IDs so DuckDB's
 	// single-column-name view of the CTE matches the outer query's
 	// references. Same number of columns — pair by position.
 	if rt := m1(n.node.RecursiveTerm()); rt != nil {
@@ -7185,7 +7174,7 @@ func (n *WithEntryNode) FormatSQL(ctx context.Context) (string, error) {
 	tableToColumnList[queryName] = m1(sub.MutableColumnList())
 	hint := cteMaterializeHint(ctx, queryName, subKind)
 	if subKind == googlesql.ResolvedNodeKindResolvedRecursiveScan {
-		// SQLite needs an explicit column list on the recursive CTE
+		// DuckDB needs an explicit column list on the recursive CTE
 		// so both UNION branches map their projected columns by
 		// position. Use the RecursiveScan canonical ColumnList — the
 		// outer query references those IDs. RecursiveScanNode.FormatSQL
@@ -7310,9 +7299,9 @@ func setOperationOrdinalRowNumber(ctx context.Context, scan googlesql.ResolvedNo
 }
 
 // cteMaterializeHint returns either " MATERIALIZED" (with a leading
-// space) or "" depending on whether SQLite should be told to push
+// space) or "" depending on whether DuckDB should be told to push
 // this CTE into a transient temp table instead of inlining its body
-// once per reference. Recursive CTEs are skipped — SQLite always
+// once per reference. Recursive CTEs are skipped because DuckDB always
 // materialises the recursion accumulator anyway, and the hint
 // interacts oddly with the `WITH RECURSIVE` keyword.
 func cteMaterializeHint(ctx context.Context, queryName string, subKind googlesql.ResolvedNodeKind) string {
@@ -7523,7 +7512,7 @@ func (n *InsertStmtNode) FormatSQL(ctx context.Context) (string, error) {
 // missingColumnDefaults returns one entry per table column that has
 // a DEFAULT expression and is not present in inserted. Callers append
 // the names to the INSERT column list and the exprs to each row's
-// VALUES tuple, which lets the standard SQLite path supply the
+// VALUES tuple, which lets DuckDB supply the
 // default at execution time.
 func missingColumnDefaults(ctx context.Context, storageTable string, inserted map[string]struct{}) []struct{ name, expr string } {
 	a := analyzerFromContext(ctx)

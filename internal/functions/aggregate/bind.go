@@ -6,7 +6,7 @@ import (
 )
 
 // Aggregate-function binders. Each constructor returns a fresh
-// *helper.Aggregator state object that SQLite drives via Step / Done
+// *helper.Aggregator state object that DuckDB drives via Step / Done
 // per group during query execution.
 
 func BindArray() func() *helper.Aggregator {

@@ -324,7 +324,7 @@ func BindStIsRing(args ...value.Value) (value.Value, error) {
 	}
 	// A simple O(n^2) self-intersection check: for each pair of
 	// non-adjacent edges, see whether they cross. Adequate for the
-	// vertex counts that fit a SQLite UDF row.
+	// vertex counts that fit a DuckDB UDF row.
 	pl := newPolyline(pts)
 	n := pl.NumEdges()
 	for i := 0; i < n; i++ {

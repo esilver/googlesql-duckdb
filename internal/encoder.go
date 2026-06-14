@@ -799,11 +799,11 @@ func ValueFromGoValue(v any) (value.Value, error) {
 
 // EncodeGoValueForDriver converts complex Go values (maps, nested slices,
 // user structs) into the googlesqlite value-layout base64 string so the
-// underlying sqlite3 driver accepts them as a plain string. Primitive
+// underlying DuckDB driver accepts them as a plain string. Primitive
 // values (int64, float64, bool, string, []byte, time.Time) and nil pass
-// through untouched because the sqlite3 driver already understands them.
+// through untouched because the DuckDB driver already understands them.
 // Returning the original value unchanged for unsupported shapes would
-// let sqlite3 report the "unsupported type" error itself, which is
+// let the DuckDB driver report the "unsupported type" error itself, which is
 // better than us guessing.
 func encodeGoValueForDriver(v any) (any, error) {
 	if v == nil {
@@ -816,7 +816,7 @@ func encodeGoValueForDriver(v any) (any, error) {
 	rv := reflect.ValueOf(v)
 	k := rv.Kind()
 	// Primitive kinds pass through; only encode maps / non-byte slices /
-	// user structs which sqlite3 would otherwise reject.
+	// user structs which the DuckDB driver would otherwise reject.
 	switch k {
 	case reflect.Invalid, reflect.Bool,
 		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,

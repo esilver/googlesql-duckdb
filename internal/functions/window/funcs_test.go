@@ -1,5 +1,5 @@
 // Direct Step/Done unit tests for the WINDOW_* aggregators in
-// funcs.go. We drive them without a real sqlite conn by constructing
+// funcs.go. We drive them without a real DuckDB conn by constructing
 // a WindowFuncStatus / WindowFuncAggregatedStatus pair per row.
 //
 // The aggregator's Done() reads SortedValues to compute ranks and
@@ -24,7 +24,7 @@ import (
 // what RANK / DENSE_RANK expect: one *WindowOrderBy per row, with the
 // row's "order by value" filled in.
 //
-// Note: SQLite-driven window aggregators own one *WindowFuncAggregated
+// Note: DuckDB-driven window aggregators own one *WindowFuncAggregated
 // Status per output row, so every Step call for a given output row
 // carries the same RowID. That matches the once-set guard inside
 // WindowFuncAggregatedStatus.Step.
@@ -62,7 +62,7 @@ type stepFn func(v value.Value, opt *WindowFuncStatus, agg *WindowFuncAggregated
 type doneFn func(agg *WindowFuncAggregatedStatus) (value.Value, error)
 
 // driveAtRow replays Step for every (i, vals[i]) row carrying the
-// fixed targetRowID, then invokes Done. That matches how the SQLite
+// fixed targetRowID, then invokes Done. That matches how the DuckDB
 // engine drives a window function: one aggregator per output row,
 // fed every partition row before Done.
 func driveAtRow(t *testing.T, step stepFn, done doneFn, vals []value.Value, targetRowID int64) value.Value {
@@ -358,7 +358,7 @@ func TestWindowLeadLag(t *testing.T) {
 	}
 }
 
-// Each window aggregator is owned per output row by SQLite, so we
+// Each window aggregator is owned per output row by DuckDB, so we
 // build a fresh *WindowFuncAggregatedStatus for every Done() we want
 // to evaluate. The helper below replays the same partition rows into
 // such an aggregator with the desired current RowID.
@@ -402,11 +402,11 @@ func TestWindowNtile(t *testing.T) {
 	t.Parallel()
 
 	// NTILE(2) over 4 rows splits into halves under the
-	// SQLite-driven path. When called via the direct
+	// DuckDB-driven path. When called via the direct
 	// WindowFuncAggregatedStatus API the SortedValues / start index
 	// are derived differently, so we only assert that the result is
 	// in the [1, num] range — the value of the property we can
-	// safely check without the full SQLite frame walker driving the
+	// safely check without the full DuckDB frame walker driving the
 	// aggregator. (Per the BigQuery NTILE spec, the result is
 	// always between 1 and the constant integer expression.)
 	rows := []value.Value{value.IntValue(10), value.IntValue(20), value.IntValue(30), value.IntValue(40)}

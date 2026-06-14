@@ -12,10 +12,10 @@ import (
 // ARRAY indexed by row position, so the DuckDB aggregate bridge can
 // register it and DuckDB can run it as a window function under OVER ().
 //
-// DuckDB has no native per-row analytic DBSCAN, and the SQLite backend
-// emulated it with a correlated-subquery + rowid-marker hack that relied
-// on the engine preserving scan order (DuckDB's parallel scan does not).
-// Instead the formatter lowers
+// DuckDB has no native per-row analytic DBSCAN. A per-row
+// correlated-subquery + rowid-marker emulation would rely
+// on the engine preserving scan order, which DuckDB's parallel scan does
+// not. Instead the formatter lowers
 //
 //	ST_CLUSTERDBSCAN(geo, eps, min_pts) OVER (w)
 //

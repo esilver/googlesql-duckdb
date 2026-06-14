@@ -7,9 +7,9 @@ import (
 	"github.com/goccy/googlesqlite/internal/value"
 )
 
-// WindowAggregator is the SQLite-side wrapper that drives a per-spec
-// WINDOW_X implementation across the active frame. SQLite calls
-// Step / Done; the aggregator parses option markers out of the
+// WindowAggregator is the DuckDB-side wrapper that drives a per-spec
+// WINDOW_X implementation across the active frame. DuckDB calls
+// Step / Done, and the aggregator parses option markers out of the
 // argument list, threads the resulting *WindowFuncStatus through to
 // the per-spec step function, and finally encodes the Done result
 // back into the over-the-wire form.

@@ -11,7 +11,7 @@ package internal
 // path, and a catalog generation counter.
 //
 // What is cached is deliberately the *downstream* artifact, not the
-// resolved AST: the formatted DuckDB/SQLite SQL, the output column
+// resolved AST: the formatted DuckDB SQL, the output column
 // specs, and the resolved parameter list. The ResolvedParameter and
 // type-node wrappers are wasm handles; holding them in the cache
 // keeps their backing wasm objects alive (go-googlesql wrappers pin

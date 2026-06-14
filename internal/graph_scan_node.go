@@ -788,7 +788,7 @@ func tryFormatMeasureAGG(ctx context.Context, n *googlesql.ResolvedAggregateFunc
 		return "", false, err
 	}
 	// Inner expression: column references inside `innerExpr` are
-	// against the underlying SQLite table, so prefix bare
+	// against the underlying DuckDB table, so prefix bare
 	// identifiers with the alias. The simple parser only supports
 	// a single column / "*", so wrap it directly.
 	innerSQL := innerExpr
@@ -953,7 +953,7 @@ func tryFormatGraphElementFunc(ctx context.Context, n *googlesql.ResolvedFunctio
 
 // graphStringArrayLiteral encodes the given STRING slice as the
 // driver's ARRAY<STRING> literal form (base64-wrapped layout) so
-// SQLite passes it through unchanged and the row decoder reads
+// DuckDB passes it through unchanged and the row decoder reads
 // it back as an ARRAY value.
 func graphStringArrayLiteral(items []string) string {
 	values := make([]value.Value, 0, len(items))

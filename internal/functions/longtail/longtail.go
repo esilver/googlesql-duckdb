@@ -87,7 +87,7 @@ func BindNullIfError(args ...value.Value) (value.Value, error) {
 // ----- string -----
 
 // BindCollate is a no-op runtime: the analyzer enforces collation
-// at type-checking time but our SQLite backing uses BINARY
+// at type-checking time but our DuckDB backing uses BINARY
 // comparisons by default. Returns the input unchanged.
 func BindCollate(args ...value.Value) (value.Value, error) {
 	if len(args) < 1 || len(args) > 2 {

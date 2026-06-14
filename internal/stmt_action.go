@@ -39,7 +39,7 @@ func (a *CreateTableStmtAction) Prepare(ctx context.Context, conn *Conn) (driver
 			return nil, err
 		}
 	}
-	stmt, err := conn.PrepareContext(ctx, a.spec.SQLiteSchema())
+	stmt, err := conn.PrepareContext(ctx, a.spec.SchemaDDL())
 	if err != nil {
 		return nil, fmt.Errorf("failed to prepare %s: %w", a.query, err)
 	}
@@ -79,7 +79,7 @@ func (a *CreateTableStmtAction) exec(ctx context.Context, conn *Conn) error {
 			return err
 		}
 	}
-	if _, err := conn.ExecContext(ctx, a.spec.SQLiteSchema(), a.args...); err != nil {
+	if _, err := conn.ExecContext(ctx, a.spec.SchemaDDL(), a.args...); err != nil {
 		return fmt.Errorf("failed to exec %s: %w", a.query, err)
 	}
 	if a.isAutoIndexMode {
@@ -146,7 +146,7 @@ func (a *CreateViewStmtAction) Prepare(ctx context.Context, conn *Conn) (driver.
 			return nil, err
 		}
 	}
-	stmt, err := conn.PrepareContext(ctx, a.spec.SQLiteSchema())
+	stmt, err := conn.PrepareContext(ctx, a.spec.SchemaDDL())
 	if err != nil {
 		return nil, fmt.Errorf("failed to prepare %s: %w", a.query, err)
 	}
@@ -162,7 +162,7 @@ func (a *CreateViewStmtAction) exec(ctx context.Context, conn *Conn) error {
 			return err
 		}
 	}
-	if _, err := conn.ExecContext(ctx, a.spec.SQLiteSchema()); err != nil {
+	if _, err := conn.ExecContext(ctx, a.spec.SchemaDDL()); err != nil {
 		return fmt.Errorf("failed to exec %s: %w", a.query, err)
 	}
 
@@ -324,7 +324,7 @@ func (a *DropStmtAction) exec(ctx context.Context, conn *Conn) error {
 		spec, exists := a.catalog.tableMap[a.name]
 		if !exists {
 			// DROP TABLE/VIEW IF EXISTS on an object the catalog never
-			// registered: the SQLite-level statement above already ran as a
+			// registered: the DuckDB-level statement above already ran as a
 			// no-op (it carries IF EXISTS), and there is no spec to remove.
 			// Honour IF EXISTS by returning success instead of failing in
 			// DeleteTableSpec with "failed to find table spec from map".
@@ -455,7 +455,7 @@ func (a *QueryStmtAction) ExecContext(ctx context.Context, conn *Conn) (driver.R
 }
 
 func (a *QueryStmtAction) ExplainQueryPlan(ctx context.Context, conn *Conn) error {
-	// DuckDB has no `EXPLAIN QUERY PLAN` (that was SQLite syntax); its
+	// DuckDB has no `EXPLAIN QUERY PLAN`. Its
 	// `EXPLAIN <query>` returns (explain_key, explain_value) VARCHAR
 	// rows carrying the rendered physical plan.
 	rows, err := conn.QueryContext(ctx, fmt.Sprintf("EXPLAIN %s", a.formattedQuery), a.args...)
@@ -754,8 +754,8 @@ func (a *BeginStmtAction) Cleanup(ctx context.Context, conn *Conn) error {
 
 // AssignmentStmtAction implements `SET @@var = expr` for
 // session-scope system variables. The expression has already been
-// formatted to a SQL string by the analyzer; we evaluate it through
-// the underlying SQLite connection so simple literals, casts, and
+// formatted to a SQL string by the analyzer. We evaluate it through
+// the underlying DuckDB connection so simple literals, casts, and
 // string concatenations all work without re-implementing the
 // expression evaluator here. The result is stored on Conn.systemVars
 // keyed by the dotted variable name (e.g. "time_zone").

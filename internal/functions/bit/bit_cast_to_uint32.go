@@ -7,7 +7,7 @@ import (
 )
 
 // BIT_CAST_TO_UINT32 reinterprets the low 32 bits of v as an unsigned
-// UINT32 (carried as INT64 on the SQLite side).
+// UINT32 (carried as INT64 on the DuckDB side).
 func BIT_CAST_TO_UINT32(v value.Value) (value.Value, error) {
 	x, err := v.ToInt64()
 	if err != nil {

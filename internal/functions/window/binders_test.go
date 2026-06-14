@@ -1,8 +1,8 @@
 // Direct exercise of each BindWindow* constructor. The predecessor-
 // emulation path of the formatter routes through these binders for
-// any window call the SQLite-native engine can't drive directly. The
+// any window call the DuckDB-native engine can't drive directly. The
 // existing parity / spectest layers don't reach them because the
-// formatter prefers customNativeWindowFuncMap / SQLite-native
+// formatter prefers customNativeWindowFuncMap / DuckDB-native
 // versions for nearly every aggregator. These tests bypass the
 // formatter and drive Step / Done on the raw *WindowAggregator
 // returned by each binder.

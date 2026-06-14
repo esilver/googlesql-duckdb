@@ -509,7 +509,7 @@ func (a *Analyzer) AddNamePath(path string) error {
 // Two-pass rewrite:
 //
 //  1. Strip `PARTITION BY <expr>` from CREATE TABLE statements.
-//     googlesqlite does not physically partition (SQLite is the
+//     googlesqlite does not physically partition (DuckDB is the
 //     storage layer); the clause is metadata-only and the upstream
 //     analyzer rejects `PARTITION BY DATE(CURRENT_TIMESTAMP())` as
 //     "PARTITION BY expression must not be constant" if we tried to
@@ -2665,7 +2665,7 @@ func (a *Analyzer) newAssignmentStmtAction(ctx context.Context, _ string, _ []dr
 func (a *Analyzer) newTruncateStmtAction(ctx context.Context, _ string, _ []driver.NamedValue, node *googlesql.ResolvedTruncateStmt) (*TruncateStmtAction, error) {
 	// Resolve the storage name through the catalog index so every path
 	// form (bare table, dataset.table, project.dataset.table, and
-	// backquoted compound) collapses to the same flattened SQLite
+	// backquoted compound) collapses to the same flattened DuckDB
 	// identifier the DELETE/UPDATE/INSERT formatters use. Quote with
 	// double-quotes - DuckDB rejects backquoted identifiers.
 	table, err := getTableName(ctx, m1(node.TableScan()))
@@ -2677,7 +2677,7 @@ func (a *Analyzer) newTruncateStmtAction(ctx context.Context, _ string, _ []driv
 
 // newMergeStmtAction translates `MERGE target USING source ON <P>
 // WHEN ... THEN ...` into a deterministic sequence of straight SQL
-// statements that emulate the BigQuery semantics on SQLite.
+// statements that emulate the BigQuery semantics on DuckDB.
 //
 // The implementation is predicate-agnostic: any boolean expression that
 // the analyzer accepts in the ON clause flows through unchanged. Two
@@ -2711,7 +2711,7 @@ func (a *Analyzer) newTruncateStmtAction(ctx context.Context, _ string, _ []driv
 // Known gaps (pre-existing): WHEN clauses are emitted independently,
 // so first-match-wins is not enforced across overlapping conditions;
 // and a matched (target, source) pair that has multiple source rows
-// for one target row is silently accepted (SQLite UPDATE FROM
+// for one target row is silently accepted (DuckDB UPDATE FROM
 // behaves last-match-wins). Neither restriction is new in this
 // rewrite.
 func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, _ []driver.NamedValue, node *googlesql.ResolvedMergeStmt) (*MergeStmtAction, error) {
@@ -2975,8 +2975,8 @@ func getArgsFromParams(values []driver.NamedValue, params []*googlesql.ResolvedP
 		out := make([]any, 0, len(values))
 		for _, v := range values {
 			// Conn.CheckNamedValue has already encoded each value
-			// into the canonical googlesqlite layout; we just need
-			// to wrap named args so SQLite can match them against
+			// into the canonical googlesqlite layout. We just need
+			// to wrap named args so DuckDB can match them against
 			// the analyzer's lower-cased placeholder names.
 			if v.Name != "" {
 				out = append(out, sql.Named(strings.ToLower(v.Name), v.Value))

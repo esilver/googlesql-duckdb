@@ -23,8 +23,8 @@ import (
 // raw JSON scalars; richer element types become base64 strings), and
 // json.Marshal the resulting slice. DuckDB's json_each table function then
 // iterates that JSON array, exposing json_each.value (the element) and
-// json_each.key (its 0-based offset) - identical to the SQLite path the
-// body was written for in function_register.go.
+// json_each.key (its 0-based offset) - the layout the shared body in
+// function_register.go expects.
 func GoogleSQLDecodeArray(arr any) (string, error) {
 	// DuckDB-native LIST input: native aggregates (array_agg, list, the
 	// ARRAY(SELECT ...) subquery lowering) hand back a Go []any whose

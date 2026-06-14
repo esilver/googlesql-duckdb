@@ -13,9 +13,9 @@ import (
 // storage names the formatter emits (NET.MAKE_NET -> make_net, etc.),
 // matching the UDF names registered in the root package against DuckDB.
 //
-// Reusing the same bodies that the SQLite-coupled function_register_*
-// path uses keeps semantics (arg order, range checks, NULL handling)
-// identical across both backends; only the value-layer plumbing differs.
+// Reusing the same bodies that the function_register_*
+// tables define keeps semantics (arg order, range checks, NULL handling)
+// identical, with only the value-layer plumbing wrapping them for DuckDB.
 var netBindFuncs = map[string]func(...value.Value) (value.Value, error){
 	"host":                netfn.BindNetHost,
 	"ip_from_string":      netfn.BindNetIpFromString,

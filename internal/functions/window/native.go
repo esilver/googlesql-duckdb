@@ -9,8 +9,8 @@ import (
 )
 
 // Native (frame-driven) window aggregators below all conform to the
-// shape SQLite expects from CreateWindowFunction: Step / Inverse /
-// Done. SQLite owns partition / order / frame; per-aggregator
+// shape DuckDB expects from CreateWindowFunction: Step / Inverse /
+// Done. DuckDB owns partition / order / frame, and per-aggregator
 // implementations only maintain incremental state. They receive the
 // user value as the first arg and any encoded option markers
 // (googlesqlite_distinct(), googlesqlite_ignore_nulls()) as trailing
@@ -55,10 +55,10 @@ func (a *arrayAggWindowNative) Step(stepArgs ...any) error {
 	return nil
 }
 
-// Inverse is invoked when SQLite slides the frame forward; we pop the
+// Inverse is invoked when DuckDB slides the frame forward, popping the
 // oldest captured value so the next Done() reflects the current
 // frame. Without this method, RegisterWindow falls back to a
-// buffer-and-rebuild adapter, but matching the SQLite-driven
+// buffer-and-rebuild adapter, but matching the DuckDB-driven
 // invariant directly is cleaner.
 func (a *arrayAggWindowNative) Inverse(stepArgs ...any) error {
 	if len(a.values) > 0 {
@@ -311,7 +311,7 @@ func (a *anyValueWindowNative) Done() (any, error) {
 // in the frame is NULL — matching the documented BigQuery semantics.
 //
 // Step appends the per-row truthiness; Inverse pops the oldest entry
-// when SQLite slides the frame forward. Done re-evaluates the
+// when DuckDB slides the frame forward. Done re-evaluates the
 // current buffer, which is O(frame_size) — same shape as ARRAY_AGG
 // but cheaper because we only carry tristate flags.
 type logicalOrWindowNative struct {
@@ -438,7 +438,7 @@ func (a *logicalAndWindowNative) Done() (any, error) {
 // They keep the window's set of NULL-skipped values and recompute on
 // Done. Buffer-and-recompute is O(frame_size) per output row, no
 // worse than the predecessor's correlated-subquery approach but
-// driven natively by SQLite's frame walker.
+// driven natively by DuckDB's frame walker.
 type bitAndAggWindowNative struct {
 	values []int64
 }

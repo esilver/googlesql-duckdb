@@ -197,16 +197,16 @@ func (s *TableSpec) TableName() string {
 	return formatPath(s.NamePath)
 }
 
-func (s *TableSpec) SQLiteSchema() string {
+func (s *TableSpec) SchemaDDL() string {
 	if s.IsView {
-		return viewSQLiteSchema(s)
+		return viewSchemaDDL(s)
 	}
 	if s.Query != "" {
 		return fmt.Sprintf("CREATE TABLE \"%s\" AS %s", s.TableName(), s.Query)
 	}
 	columns := []string{}
 	for _, c := range s.Columns {
-		columns = append(columns, c.sqliteSchemaVersioned(s.legacyStorage()))
+		columns = append(columns, c.schemaDDLVersioned(s.legacyStorage()))
 	}
 	if len(s.PrimaryKey) != 0 {
 		columns = append(
@@ -226,7 +226,7 @@ func (s *TableSpec) SQLiteSchema() string {
 	return fmt.Sprintf("%s \"%s\" (%s)", stmt, s.TableName(), strings.Join(columns, ","))
 }
 
-func viewSQLiteSchema(s *TableSpec) string {
+func viewSchemaDDL(s *TableSpec) string {
 	var stmt string
 	switch s.CreateMode {
 	case googlesql.ResolvedCreateStatementEnums_CreateModeCreateDefault:
@@ -519,11 +519,11 @@ func (s *TableSpec) legacyStorage() bool {
 	return s.StorageVersion < currentStorageVersion
 }
 
-func (s *ColumnSpec) SQLiteSchema() string {
-	return s.sqliteSchemaVersioned(false)
+func (s *ColumnSpec) SchemaDDL() string {
+	return s.schemaDDLVersioned(false)
 }
 
-func (s *ColumnSpec) sqliteSchemaVersioned(legacy bool) string {
+func (s *ColumnSpec) schemaDDLVersioned(legacy bool) string {
 	typ := storageTypeForKindVersioned(googlesql.TypeKind(s.Type.Kind), legacy)
 	schema := fmt.Sprintf("\"%s\" %s", s.Name, typ)
 	if s.IsNotNull {
@@ -534,7 +534,7 @@ func (s *ColumnSpec) sqliteSchemaVersioned(legacy bool) string {
 
 // storageTypeForKind maps a GoogleSQL column kind to the DuckDB column type
 // its cells are stored in — the single source of truth shared by the CREATE
-// TABLE schema rendering (SQLiteSchema) and the bulk-insert seam (which must
+// TABLE schema rendering (SchemaDDL) and the bulk-insert seam (which must
 // produce/cast into exactly these storage types; see internal/bulkinsert.go).
 func storageTypeForKind(kind googlesql.TypeKind) string {
 	return storageTypeForKindVersioned(kind, false)

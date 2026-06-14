@@ -7,7 +7,7 @@ import (
 )
 
 // Window-function (analytic) binders. Each constructor returns
-// a fresh *WindowAggregator state object that SQLite drives
+// a fresh *WindowAggregator state object that DuckDB drives
 // through Step / Inverse / value.Value / Done as the active frame
 // scans the partition.
 

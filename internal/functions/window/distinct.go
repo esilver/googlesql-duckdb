@@ -6,11 +6,11 @@ import (
 )
 
 // Native, frame-driven DISTINCT variants of the standard aggregate
-// window functions. SQLite's built-in SUM/COUNT/AVG don't accept
+// window functions. DuckDB's built-in SUM/COUNT/AVG don't accept
 // `DISTINCT` inside `OVER (...)`, so the predecessor handled
 // `SUM(DISTINCT x) OVER (...)` through its per-output-row
 // correlated-subquery emulation. Wiring these custom variants
-// through `Conn.CreateWindowFunction` lets the SQLite frame engine
+// through `Conn.CreateWindowFunction` lets the DuckDB frame engine
 // drive Step / Inverse / Done while we apply DISTINCT semantics in
 // Done over the active frame.
 

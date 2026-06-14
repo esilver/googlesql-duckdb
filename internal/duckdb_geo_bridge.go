@@ -150,9 +150,9 @@ func encodeGeoResult(ret value.Value, rt GeoUDFResultType) (any, error) {
 // GeographyScalarFuncs returns the geography + S2 scalar functions from
 // the normalFuncs table (every entry whose name starts with st_ or s2_),
 // each wrapped so the DuckDB UDF shell in the root package can register
-// it. The wrapper reuses the exact decode -> body -> encode path the
-// SQLite registration used (value.ConvertArgs + BindFunc + EncodeValue),
-// so the value-layer envelope semantics are identical on both engines.
+// it. The wrapper reuses the exact decode -> body -> encode path
+// (value.ConvertArgs + BindFunc + EncodeValue) that the shared builtin
+// bodies expect, so the value-layer envelope semantics stay identical.
 func GeographyScalarFuncs() []GeoScalarFunc {
 	out := make([]GeoScalarFunc, 0, 80)
 	for _, info := range normalFuncs {

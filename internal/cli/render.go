@@ -30,8 +30,8 @@ type RenderOptions struct {
 // line for non-queries, or a bordered table / \G group view for
 // queries, followed by a row-count summary.
 func RenderResult(w io.Writer, res Result, opt RenderOptions) {
-	if opt.Debug && res.SQLiteQuery != "" {
-		for _, line := range strings.Split(res.SQLiteQuery, "\n") {
+	if opt.Debug && res.DuckDBQuery != "" {
+		for _, line := range strings.Split(res.DuckDBQuery, "\n") {
 			fmt.Fprintf(w, "-- duckdb: %s\n", line)
 		}
 	}

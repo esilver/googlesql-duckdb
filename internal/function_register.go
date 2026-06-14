@@ -44,7 +44,7 @@ func populateFuncMaps() {
 	// Replace the predecessor's per-row full-scan emulation for
 	// the window forms of these aggregators with native
 	// incremental implementations. The formatter emits these
-	// through OVER syntax in customNativeWindowFuncMap, so SQLite
+	// through OVER syntax in customNativeWindowFuncMap, so DuckDB
 	// drives Step/Done over the active frame instead of the
 	// O(N²) correlated subquery the predecessor required.
 	windowFuncMap["array_agg"] = []*nameAndFunc{
