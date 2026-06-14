@@ -1513,17 +1513,17 @@ func NewCatalog(db *sql.DB) *Catalog {
 	// Auto-register protobuf well-known types (google.protobuf.* and
 	// google.type.*). BigQuery and Spanner treat these as built-in,
 	// so user SQL referencing them resolves without manual descriptor
-	// wiring. Acquire wasmAnalyzeMu around the proto FFI block so
+	// wiring. Acquire analyzeMu around the proto FFI block so
 	// other goroutines that are mid-Analyze do not see a partially-
 	// populated DescriptorPool / SimpleCatalog while AddType is in
 	// flight. The unlock is deferred inside a closure: the body
 	// crosses the analyzer FFI boundary, and an abort there surfaces
 	// as a Go panic — a bare Lock/Unlock pair would orphan
-	// wasmAnalyzeMu for every Analyze in the process even when the
+	// analyzeMu for every Analyze in the process even when the
 	// caller recovers the panic (issue #18).
 	func() {
-		wasmAnalyzeMu.Lock()
-		defer wasmAnalyzeMu.Unlock()
+		analyzeMu.Lock()
+		defer analyzeMu.Unlock()
 		if h := newCatalogProtoBlockHookForTest; h != nil {
 			h()
 		}
@@ -1533,7 +1533,7 @@ func NewCatalog(db *sql.DB) *Catalog {
 }
 
 // newCatalogProtoBlockHookForTest, when non-nil, runs inside
-// NewCatalog's wasmAnalyzeMu-guarded proto block, before
+// NewCatalog's analyzeMu-guarded proto block, before
 // registerWellKnownProtos. Test-only seam for the issue #18
 // lock-leak-on-panic regression test; never set in production.
 var newCatalogProtoBlockHookForTest func()

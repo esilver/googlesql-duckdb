@@ -2,9 +2,9 @@ package internal
 
 // Regression test for issue #18 (lock sections without defer-unlock
 // leak the lock when a panic crosses them): NewCatalog's
-// wasmAnalyzeMu-guarded proto FFI block used a bare Lock/Unlock pair,
+// analyzeMu-guarded proto FFI block used a bare Lock/Unlock pair,
 // so an analyzer abort inside registerWellKnownProtos orphaned
-// wasmAnalyzeMu — every later Analyze in the process then blocked
+// analyzeMu — every later Analyze in the process then blocked
 // forever even when the caller recovered the panic.
 
 import (
@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-func TestNewCatalogProtoBlockPanicDoesNotLeakWasmAnalyzeMu(t *testing.T) {
+func TestNewCatalogProtoBlockPanicDoesNotLeakAnalyzeMu(t *testing.T) {
 	newCatalogProtoBlockHookForTest = func() {
 		panic("synthetic analyzer abort inside the proto FFI block")
 	}
@@ -32,12 +32,12 @@ func TestNewCatalogProtoBlockPanicDoesNotLeakWasmAnalyzeMu(t *testing.T) {
 	// of deadlocking the suite.
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		if wasmAnalyzeMu.TryLock() {
-			wasmAnalyzeMu.Unlock()
+		if analyzeMu.TryLock() {
+			analyzeMu.Unlock()
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("issue #18 regression: wasmAnalyzeMu is still held after a panic crossed NewCatalog's proto block; the deferred unlock is gone")
+			t.Fatal("issue #18 regression: analyzeMu is still held after a panic crossed NewCatalog's proto block; the deferred unlock is gone")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
