@@ -1,3 +1,17 @@
+// Package value is googlesqlite's GoogleSQL value layer. It models each
+// GoogleSQL value as a typed Value (see value.go) and defines the
+// on-the-wire envelope used to carry the types DuckDB cannot store
+// natively with BigQuery semantics.
+//
+// The envelope is a base64-encoded JSON object {type, value} (the
+// ValueType header plus a string body in codec.go), stored in DuckDB as
+// a flat string and decoded back on the way out. It exists because
+// DuckDB has no native carrier that preserves GoogleSQL semantics for
+// NUMERIC / BIGNUMERIC, ARRAY, STRUCT, the temporal types (DATE,
+// DATETIME, TIME, TIMESTAMP, INTERVAL), RANGE, GEOGRAPHY, and JSON, so
+// those types ride the envelope. INT64, FLOAT64, BOOL, STRING, and BYTES
+// round-trip through DuckDB's own column types instead. encoder.go and
+// decoder.go are the two ends of that conversion.
 package value
 
 import (

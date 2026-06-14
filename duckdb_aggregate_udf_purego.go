@@ -142,8 +142,8 @@ func duckdbAggSpecs() []aggSpec {
 		// precision (the analyzer may inject a default trailing arg), so a 1..2
 		// arity band covers both call shapes; the body reads args[0] and the
 		// optional args[1] precision. HLL_COUNT.MERGE resolves to `merge` and
-		// folds the per-group sketch BYTES into one cardinality. The bodies are
-		// the same pure-Go aggregators the SQLite path uses (hll.BindHllCount*).
+		// folds the per-group sketch BYTES into one cardinality. The bodies reuse
+		// the GoogleSQL pure-Go aggregators (hll.BindHllCount*).
 		// HLL_COUNT.EXTRACT is a scalar: it rides the googlesqlite_hll_count_extract
 		// UDF registered by registerNormalFuncUDFs (the formatter remaps the bare
 		// `extract` leaf to it).
@@ -153,7 +153,7 @@ func duckdbAggSpecs() []aggSpec {
 
 		// BigQuery approximate aggregates. Keep these on the existing Go
 		// bodies instead of DuckDB's native approximations so result shape
-		// and the small conformance examples match the SQLite baseline.
+		// and the small conformance examples match the BigQuery reference.
 		{name: "approx_quantiles", minParams: 2, maxParams: 5, newAgg: approx.BindApproxQuantiles()},
 		{name: "approx_top_count", minParams: 2, maxParams: 5, newAgg: approx.BindApproxTopCount()},
 		{name: "approx_top_sum", minParams: 3, maxParams: 6, newAgg: approx.BindApproxTopSum()},

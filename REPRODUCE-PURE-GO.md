@@ -85,10 +85,10 @@ surface the emulator already uses.
 - ✅ Aggregates: all 32 aggregate specs are registered and exercised by the spec
   test suite. The engine ships built with the json + icu extensions (the UNNEST
   lowering rides `json_each`, and timezone-aware temporals need icu).
-- ✅ **Conformance:** the named spec gate covers 707 spec files and 1,177
-  asserted cases, with the corpus categorized as 697 implemented, 7 partial,
-  and 3 unsupported specs. See the status section in
-  [README.md](README.md) for the authoritative figures. The
+- ✅ **Conformance:** the named spec gate runs the full normalized spec
+  corpus. The current per-dialect counts and the
+  implemented/partial/unsupported breakdown live in the generated
+  [docs/specs/INDEX.md](docs/specs/INDEX.md). The
   `bigquery/functions/{search, objectref}` family runs on pure-Go bodies
   (textfn.BindSearch, extras.BindObj*) routed through the formatter retarget
   (trySearchObjectRefFunc) plus the DuckDB UDF allow-list entries

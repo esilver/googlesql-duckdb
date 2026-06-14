@@ -1,19 +1,19 @@
 package helper
 
-// Package sqlfn collects the scalar-function binder helpers that let
-// call sites declare arity-typed wrappers around their semantic
-// functions instead of repeating the same `existsNull(args)` /
-// argument-fanout boilerplate in every `bindXxx` helper.
+// The scalar-function binder helpers below let call sites declare
+// arity-typed wrappers around their semantic functions instead of
+// repeating the same `existsNull(args)` / argument-fanout boilerplate
+// in every `bindXxx` helper.
 //
-// The helpers are intentionally type-light: googlesqlite's runtime
+// The helpers are intentionally type-light. googlesqlite's runtime
 // value type is the (non-parameterized) `value.Value` interface, so
 // the wrappers trade Go-side type parameters for a small set of
 // arity-typed shapes. Each helper:
 //
-//   - asserts the expected arg count (so an analyzer-bridge mismatch
-//     surfaces as a clear runtime error rather than a silent panic);
+//   - asserts the expected arg count, so an analyzer-bridge mismatch
+//     surfaces as a clear runtime error rather than a silent panic,
 //   - propagates NULL by returning (nil, nil) the moment any arg is
-//     nil (the GoogleSQL default for scalar functions);
+//     nil (the GoogleSQL default for scalar functions),
 //   - forwards the typed args to the caller's pure semantic function.
 //
 // Variants ending in `KeepNull` skip the NULL-propagation step for

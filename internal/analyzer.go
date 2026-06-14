@@ -28,18 +28,18 @@ type Analyzer struct {
 }
 
 // sharedAnalyzerOpt is the process-wide singleton AnalyzerOptions
-// every Analyzer reuses. The wasm runtime keeps each AnalyzerOptions
-// alive in its scratch memory and the FFI calls that build it (~50
-// LanguageFeature toggles, ProductMode, system-variable declarations,
-// rewrite flags) are expensive. Allocating a fresh one per Conn used
-// to push the wasm pool past its capacity under heavy parallel test
-// load, surfacing as `NewLanguageOptions returned nil` or
-// `<Invalid simple type's value>` from downstream FFI calls.
+// every Analyzer reuses. Building one is expensive (~50 LanguageFeature
+// toggles, ProductMode, system-variable declarations, rewrite flags),
+// and the analyzer module that consumes it is single-threaded: it is
+// not safe to run two analyses or two options mutations against it
+// concurrently. Allocating a fresh options object per Conn and driving
+// the analyzer in parallel used to surface as `NewLanguageOptions
+// returned nil` or `<Invalid simple type's value>` from downstream calls.
 //
-// All mutations to this options object — ParameterMode,
+// All mutations to this options object (ParameterMode,
 // ClearQueryParameters, AddQueryParameter, and AnalyzeStatement-
-// FromParserAST itself — happen under wasmAnalyzeMu, so a single
-// goroutine owns the wasm runtime for one Analyze call at a time.
+// FromParserAST itself) happen under wasmAnalyzeMu, so one goroutine at
+// a time drives the analyzer for a single Analyze call.
 var (
 	sharedAnalyzerOptOnce sync.Once
 	sharedAnalyzerOpt     *googlesql.AnalyzerOptions
@@ -1479,19 +1479,20 @@ func (a *Analyzer) sliceArgsPerStatement(parsed *parsedScript, args []driver.Nam
 	return stmtArgsList, nil
 }
 
-// analyzeStatementLocked runs the wasm analyzer for one statement
-// under wasmAnalyzeMu. SetParameterMode and declareParameterTypes
-// mutate the process-wide shared AnalyzerOptions, and
-// AnalyzeStatementFromParserAST reads it; the three steps must form a
-// single atomic critical section, otherwise a parallel caller's
-// SetParameterMode races in between — observed under load as spurious
-// "Positional parameters are not supported" failures.
+// analyzeStatementLocked runs the analyzer for one statement under
+// wasmAnalyzeMu. SetParameterMode and declareParameterTypes mutate the
+// process-wide shared AnalyzerOptions, and AnalyzeStatementFromParserAST
+// reads it, so the three steps must form a single atomic critical
+// section. Otherwise a parallel caller's SetParameterMode races in
+// between, observed under load as spurious "Positional parameters are
+// not supported" failures.
 //
-// The lock is deliberately narrow. The action closures returned by
-// Analyze are invoked lazily by the caller, and the surrounding work
-// they do — wildcard-table pre-registration, StmtAction construction
-// — can itself re-enter Analyze; keeping that outside this critical
-// section is what prevents a self-deadlock.
+// The lock is deliberately narrow because the analyzer is not
+// reentrant. The action closures returned by Analyze are invoked lazily
+// by the caller, and the surrounding work they do (wildcard-table
+// pre-registration, StmtAction construction) can itself call back into
+// Analyze. Keeping that outside this critical section is what prevents a
+// self-deadlock.
 func (a *Analyzer) analyzeStatementLocked(stmt googlesql.ASTStatementNode, mode googlesql.ParameterMode, args []driver.NamedValue, query string) (googlesql.ResolvedStatementNode, error) {
 	wasmAnalyzeMu.Lock()
 	defer wasmAnalyzeMu.Unlock()
@@ -1508,16 +1509,16 @@ func (a *Analyzer) analyzeStatementLocked(stmt googlesql.ASTStatementNode, mode 
 }
 
 func (a *Analyzer) Analyze(ctx context.Context, conn *Conn, query string, args []driver.NamedValue) ([]stmtActionFunc, error) {
-	// One goroutine at a time owns the wasm runtime / shared
-	// AnalyzerOptions. See the doc on sharedAnalyzerOpt above.
+	// One goroutine at a time drives the single-threaded analyzer and its
+	// shared AnalyzerOptions. See the doc on sharedAnalyzerOpt above.
 	wasmAnalyzeMu.Lock()
 	defer wasmAnalyzeMu.Unlock()
 	// Analyzer fairness (#18 follow-up): a caller whose context died while
-	// queued for this mutex must not run catalog sync + parse + analysis —
-	// those wasm spans are un-interruptible, and under a cancellation storm
-	// (a client in a tight timeout-retry loop, every query's text unique so
-	// the analysis cache never hits) the doomed analyses monopolize the
-	// analyzer and starve live callers.
+	// queued for this mutex must not run catalog sync + parse + analysis.
+	// Those analyzer calls cannot be interrupted, and under a cancellation
+	// storm (a client in a tight timeout-retry loop, every query's text
+	// unique so the analysis cache never hits) the doomed analyses
+	// monopolize the analyzer and starve live callers.
 	if cerr := ctx.Err(); cerr != nil {
 		return nil, cerr
 	}

@@ -80,8 +80,8 @@ func doLoadSpatialExtension() error {
 // tryGeographyFunc in internal/formatter.go); these UDFs are the
 // runtime that backs them. Each reuses the pure-Go body under
 // internal/functions/geography through internal.GeographyScalarFuncs,
-// so the value-layer envelope semantics are identical to the SQLite
-// path that originally satisfied geography conformance.
+// so the value-layer envelope semantics carry through unchanged to the
+// DuckDB scalar UDF path.
 func registerGeographyUDFs(db *sql.DB) error {
 	conn, err := db.Conn(context.Background())
 	if err != nil {

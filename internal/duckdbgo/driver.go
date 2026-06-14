@@ -7,7 +7,7 @@ import (
 )
 
 // Driver is the compat mirror of duckdb-go's duckdb.Driver. It is the only direct
-// data-path API the emulator calls (driver.go:177:
+// data-path API the emulator calls (internalDuckDBDriver.Open forwards through
 // `duckdb.Driver{}.Open(duckdbDSN(name))`). Open delegates straight to our pure-Go
 // engine driver, so the DSN, connection-sharing, and database/sql plumbing are all
 // the engine's (which already shares one in-memory database across every
@@ -28,10 +28,10 @@ var (
 // Open implements driver.Driver by forwarding to the engine driver's Open. An
 // empty dsn is handled by the engine (it maps "" to an in-memory database).
 //
-// NOTE: the engine's raw Open mints a brand-new wasm engine per call. Pooled
-// use must go through OpenConnector instead, which shares one engine across
-// the pool — database/sql prefers OpenConnector automatically because Driver
-// implements driver.DriverContext.
+// NOTE: the engine's raw Open mints a brand-new transpiled DuckDB engine
+// instance per call. Pooled use must go through OpenConnector instead, which
+// shares one engine across the pool. database/sql prefers OpenConnector
+// automatically because Driver implements driver.DriverContext.
 func (Driver) Open(dsn string) (driver.Conn, error) {
 	return (&convergeduckdb.Driver{}).Open(dsn)
 }

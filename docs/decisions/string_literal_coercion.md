@@ -15,8 +15,8 @@ SELECT '2022-09-09' > TIMESTAMP '2022-09-09 00:00:00+00';
 SELECT CAST('2022-09-09' AS DATE) - INTERVAL 1 DAY;
 ```
 
-Both `googlesqlite` (via `go-googlesql` v0.2.1) and the predecessor
-the upstream wasm bridge accept all three:
+Both `googlesqlite` (via `go-googlesql` v0.2.1) and its predecessor,
+the upstream wasm bridge, accept all three:
 
 | Query                                                            | Result                  |
 |------------------------------------------------------------------|-------------------------|

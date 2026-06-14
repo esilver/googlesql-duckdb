@@ -11,7 +11,7 @@
 //   - ResolvedBaseFunctionCallNode: a short alias for the long
 //     canonical ResolvedFunctionCallBase type so per-spec call sites
 //     read more cleanly.
-//   - ASTWalk: depth-first visitor over a googlesql AST subtree.
+//   - astWalk: depth-first visitor over a googlesql AST subtree.
 package internal
 
 import (
@@ -59,7 +59,7 @@ func resolvedCreateScope(h any) googlesql.ResolvedCreateStatementEnums_CreateSco
 	return googlesql.ResolvedCreateStatementEnums_CreateScopeCreateDefaultScope
 }
 
-// ASTWalk traverses an ASTNode subtree depth-first via Child(i) /
+// astWalk traverses an ASTNode subtree depth-first via Child(i) /
 // NumChildren(), invoking visit on each node. Returns the first error
 // the visitor produces.
 func astWalk(root googlesql.ASTNode, visit func(googlesql.ASTNode) error) error {

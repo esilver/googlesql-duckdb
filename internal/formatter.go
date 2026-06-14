@@ -20,6 +20,10 @@ type Formatter interface {
 	FormatSQL(context.Context) (string, error)
 }
 
+// The __gsx_ prefix marks a googlesqlite-internal synthetic name (a
+// helper column or staging object the formatter injects). It never
+// appears in user SQL or in a result schema, so the prefix keeps these
+// names from colliding with anything the query author wrote.
 const setOperationOrdinalColumn = "__gsx_setop_ordinal"
 
 // setOperationOrdinalStride separates UNION ALL branches in the
@@ -3241,10 +3245,11 @@ func tryNativeArrayAggStructTopN(ctx context.Context, funcName string, node *goo
 // nativeWindowFuncMap maps GoogleSQL window function names that have a
 // direct DuckDB built-in equivalent. When a function is in this map,
 // AnalyticFunctionCallNode emits native `<native_name>(args) OVER
-// (PARTITION BY ... ORDER BY ... FRAME)` syntax — avoiding the
-// per-row full-scan emulation that the predecessor used because the
-// underlying SQLite binding (mattn) could not register custom window
-// functions.
+// (PARTITION BY ... ORDER BY ... FRAME)` syntax. This avoids the
+// per-row full-scan emulation the predecessor fell back to, which it
+// needed only because its engine could not register custom window
+// functions. DuckDB registers them as native window UDFs, so the
+// emulation is unnecessary here.
 var nativeWindowFuncMap = map[string]string{
 	// Numbering functions — DuckDB built-ins return identical results.
 	"row_number":   "row_number",
@@ -3294,7 +3299,7 @@ var nativeWindowFuncMap = map[string]string{
 	"count": "count",
 	"min":   "min",
 	"max":   "max",
-	// TF_IDF is registered as a DuckDB aggregate (see duckdb_aggregate_udf.go),
+	// TF_IDF is registered as a DuckDB aggregate (see duckdb_aggregate_udf_purego.go),
 	// and DuckDB runs any aggregate as a window function under OVER (). Routing
 	// it through the native window path emits a clean `tf_idf(tokens) OVER (...)`
 	// call without the option markers (ignore_nulls / window_rowid) the
@@ -6709,9 +6714,8 @@ func (n *AnalyticScanNode) FormatSQL(ctx context.Context) (string, error) {
 			)
 		}
 	}
-	// Trailing output ORDER BY: the legacy SQLite engine evaluated window
-	// functions by sorting rows on (partition keys, order keys) and emitted
-	// them in that order, and the legacy test corpus asserts
+	// Trailing output ORDER BY: BigQuery emits window-function rows in
+	// (partition keys, order keys) order, and the spec corpus asserts
 	// that order. DuckDB's window operator gives no output-order guarantee,
 	// so reproduce it explicitly: sort by the last function group's
 	// partition + order keys (value-layer aware via sortSQL, BigQuery null
@@ -6743,10 +6747,10 @@ func (n *AnalyticScanNode) FormatSQL(ctx context.Context) (string, error) {
 }
 
 // analyticOrderDirectionSQL renders the direction + null-placement suffix
-// for one analytic sort key. BigQuery (like the legacy SQLite engine)
-// places NULLs first on ASC and last on DESC by default; DuckDB defaults
-// to NULLS LAST regardless of direction, so the placement is always
-// emitted explicitly.
+// for one analytic sort key. BigQuery places NULLs first on ASC and
+// last on DESC by default, while DuckDB defaults to NULLS LAST
+// regardless of direction, so the placement is always emitted
+// explicitly.
 func analyticOrderDirectionSQL(col *analyticOrderBy) string {
 	dir := ""
 	nulls := " NULLS FIRST"

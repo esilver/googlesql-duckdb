@@ -54,9 +54,9 @@ func normalizeLastInsertID(id int64, err error) (int64, error) {
 		return id, nil
 	}
 	// The DuckDB driver does not support LastInsertId (there is no rowid
-	// concept). BigQuery has no last-insert-id either, and the legacy SQLite
-	// backend returned an implementation-defined value. Degrade only that
-	// unsupported surface to 0; other driver errors should remain visible.
+	// concept), and BigQuery has no last-insert-id either, so degrade only
+	// that unsupported surface to 0. Other driver errors should remain
+	// visible.
 	if isUnsupportedLastInsertIDError(err) {
 		return 0, nil
 	}

@@ -1,8 +1,8 @@
-// Package aggrt holds the aggregator-runtime types and helpers shared
-// between the internal Aggregator wrapper, the window sub-package, and
-// per-aggregate function implementations. It is a leaf package: it
-// depends on internal/value but is depended upon by internal/ and by
-// internal/function/window/.
+// Package helper holds the aggregator-runtime types and scalar-function
+// binder helpers shared between the internal Aggregator wrapper, the
+// window sub-package, and per-aggregate function implementations. It is
+// a leaf package: it depends on internal/value but is depended upon by
+// internal/ and by internal/function/window/.
 package helper
 
 import (

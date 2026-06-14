@@ -34,7 +34,7 @@ import (
 // doubled per the SQL standard. The graph lowering emits identifiers
 // (table names, per-scan aliases, column names) through this helper so
 // they match the double-quote convention the rest of the formatter
-// uses; DuckDB rejects the backtick quoting BigQuery/SQLite accept.
+// uses. DuckDB rejects the backtick quoting that BigQuery accepts.
 func dq(ident string) string {
 	return "\"" + strings.ReplaceAll(ident, "\"", "\"\"") + "\""
 }

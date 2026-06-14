@@ -103,9 +103,9 @@ query to print it vertically, one stanza per row.
 ## What works
 
 The full dialect runs on this engine. The spec conformance gate covers
-707 spec files and 1,177 asserted cases, with the corpus categorized as
-697 implemented, 7 partial, and 3 unsupported specs. See the Status
-section of the [top-level README](../../README.md) for the current matrix.
+the full normalized spec corpus; the current per-dialect counts and the
+implemented/partial/unsupported breakdown live in the generated
+[docs/specs/INDEX.md](../../docs/specs/INDEX.md).
 
 ## WebAssembly Playground API
 

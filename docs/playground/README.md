@@ -5,13 +5,18 @@ A browser-based playground for running GoogleSQL queries against the
 DuckDB backend). The same UI runs against either of two interchangeable
 engine modes, selected at UI start time with `VITE_ENGINE`:
 
-- **Wasm (default)**, where the whole engine is compiled to WebAssembly
-  and runs entirely client-side in the browser tab. Nothing is sent
-  anywhere.
+- **Browser (default)**, the `js/wasm` build, where the whole engine is
+  compiled to WebAssembly and runs entirely client-side in the browser
+  tab. Nothing is sent anywhere.
 - **Server**, where the UI talks HTTP to a small local native server
   (`cmd/playground`) that runs the engine natively with
   `CGO_ENABLED=0`. This is the fast path for big data, since there is no
-  wasm download and queries run at native speed.
+  browser download and queries run at native speed.
+
+The two modes differ only in this delivery target. In both, the SQL
+engine itself is the same wasm2go-transpiled native Go (the DuckDB
+engine plus the GoogleSQL analyzer); the browser mode then compiles that
+to WebAssembly, while the server mode runs it as a native binary.
 
 The UI is the same in both modes:
 
