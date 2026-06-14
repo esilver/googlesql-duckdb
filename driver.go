@@ -411,13 +411,13 @@ func RawEngineDB(name string) (*sql.DB, bool) {
 var _ driver.DriverContext = (*Driver)(nil)
 
 type Conn struct {
-	conn           *sql.Conn
-	txActive       bool
-	txReset        string
-	analyzer       *internal.Analyzer
-	catalog        *internal.Catalog
-	systemVars     map[string]string
-	scriptVars     map[string]string
+	conn       *sql.Conn
+	txActive   bool
+	txReset    string
+	analyzer   *internal.Analyzer
+	catalog    *internal.Catalog
+	systemVars map[string]string
+	scriptVars map[string]string
 	// materializeCTE is intentionally always-on: every construction
 	// site sets it true and no caller flips it false today. The field
 	// is retained because it feeds the analysis-cache key, so a future
