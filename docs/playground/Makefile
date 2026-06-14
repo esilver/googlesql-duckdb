@@ -57,8 +57,8 @@ deps:
 #
 # With VITE_ENGINE=server the in-browser wasm engine is not built or
 # loaded: the UI talks to the native engine server instead (run
-# `go run ./cmd/playground` from the repository root first; see
-# cmd/playground/README.md).
+# `go run ./cmd/playground` from the repository root first; see the
+# server mode section in docs/playground/README.md).
 ifeq ($(VITE_ENGINE),server)
 dev:
 	npm run dev

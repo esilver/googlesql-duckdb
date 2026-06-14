@@ -3,10 +3,10 @@
 This fork can execute GoogleSQL/BigQuery queries with **`CGO_ENABLED=0`** by
 swapping the native-`libduckdb` backend (`github.com/duckdb/duckdb-go/v2`) for a
 **pure-Go DuckDB v1.5.3** transpiled by [`ncruces/wasm2go`](https://github.com/ncruces/wasm2go).
-The BigQuery dialect (GoogleSQL analysis + the `googlesqlite_*` UDFs) is unchanged —
-only the DuckDB *execution backend* changes. The current maintained path is the
-pure-Go backend; the older native cgo backend is historical and is not exercised
-by CI on this branch.
+The BigQuery dialect (GoogleSQL analysis + the `googlesqlite_*` UDFs) is the same as
+upstream, only the DuckDB *execution backend* changes. The pure-Go backend is the
+maintained path that CI exercises on this branch. The earlier native cgo backend
+remains in the history for reference.
 
 ## Setup — ONE clone, zero replaces
 
@@ -25,11 +25,10 @@ cd googlesqlite
 CGO_ENABLED=0 go run ./cmd/googlesqlite :memory:
 ```
 
-(Engine developers hacking on the transpiler output can still point the engine
-at a local checkout the old way — add
-`replace github.com/esilver/duckdb-go-pure => ../duckdb-go-pure` (or the PoC
-repo's `converge` tree via its previous `duckdbconverge` wiring) — but nothing
-in this repo requires it anymore.)
+(Engine developers working on the transpiler output can point the build at a
+local checkout by adding
+`replace github.com/esilver/duckdb-go-pure => ../duckdb-go-pure` to `go.mod`.
+This repo's default build needs no replace directive.)
 
 Expected: GoogleSQL queries run pure-Go, e.g.
 
@@ -40,13 +39,13 @@ SELECT STARTS_WITH('duckdb','duck') -> true
 SELECT SAFE_CAST('42' AS INT64) -> 42
 ```
 
-(No build flags required — since duckdb-go-pure v0.3.1 a plain `go build`
+(No build flags required. Since duckdb-go-pure v0.3.1 a plain `go build`
 works: the engine is sharded into ~30 packages under
 `internal/duckdbcore/{core,shardNN,all}` with its oversized functions split,
 so the whole engine compiles **fully optimized with inlining**. Run tests
-with `-vet=off` — `go vet` can't chew the generated packages. The first
-build compiles the engine in well under a minute on a multicore box; cached
-afterwards.)
+with `-vet=off`, because `go vet` cannot analyze the generated packages. The
+first build compiles the engine in well under a minute on a typical multi-core
+development machine, and is cached afterwards.)
 
 ## How the swap works
 
@@ -66,27 +65,26 @@ afterwards.)
   suite (`CGO_ENABLED=0 go run ./cmd/googlesqlite :memory:` reproduces
   individual cases), including HLL INIT+MERGE over struct UNNEST and the
   noiseless `WITH ANONYMIZATION ANON_COUNT(*)` rewrite.
-- `doLoadSpatialExtension` is a no-op (geography lowers to pure-Go
-  `googlesqlite_st_*`/`s2_*` UDFs, so the native `INSTALL spatial` was a dead probe).
+- `doLoadSpatialExtension` is a no-op: geography is handled entirely by the pure-Go
+  `googlesqlite_st_*`/`s2_*` UDFs, so the backend serves spatial queries without
+  DuckDB's native `INSTALL spatial`.
 
 ## How the UDFs run with no cgo
 
 The cgo build hands DuckDB a C function pointer for each `googlesqlite_*` UDF. In
 the wasm2go engine the indirect-call table is a Go `[]any` of closures, so the
 backend appends the Go UDF closure to that table and passes its index as the
-"function pointer" to `duckdb_create_scalar_function`; DuckDB then `call_indirect`s
-back into Go — registered through the same `database/sql` + `RegisterScalarUDF`
-surface the emulator already uses. (See `SWAP-BLUEPRINT.md` in the PoC repo.)
+"function pointer" to `duckdb_create_scalar_function`. DuckDB then `call_indirect`s
+back into Go, registered through the same `database/sql` + `RegisterScalarUDF`
+surface the emulator already uses.
 
 ## Status
 
-- ✅ Compiles `CGO_ENABLED=0`; T0 (data path, DDL/DML, cross-conn) + scalar UDFs
-  (GoogleSQL string/math/`SAFE_*` builtins) run pure-Go.
-- ✅ T2 aggregates: all 32 specs registered and exercised by the spec
-  test suite.
-  Needs an engine built WITH the json + icu extensions (the UNNEST lowering
-  rides `json_each`; timezone-aware temporals need icu) — the PoC repo's
-  `rebuild_fs_all.sh` produces it.
+- ✅ Compiles with `CGO_ENABLED=0`. The core data path (DDL/DML, cross-connection
+  queries) and scalar UDFs (GoogleSQL string/math/`SAFE_*` builtins) run pure-Go.
+- ✅ Aggregates: all 32 aggregate specs are registered and exercised by the spec
+  test suite. The engine ships built with the json + icu extensions (the UNNEST
+  lowering rides `json_each`, and timezone-aware temporals need icu).
 - ✅ **Conformance:** the named spec gate covers 707 spec files and 1,177
   asserted cases, with the corpus categorized as 697 implemented, 7 partial,
   and 3 unsupported specs. See the status section in
@@ -97,8 +95,8 @@ surface the emulator already uses. (See `SWAP-BLUEPRINT.md` in the PoC repo.)
   (SEARCH declared BOOL). Run the gate pure-Go with:
   `CGO_ENABLED=0 go test -vet=off
   -run 'TestSpec/(googlesql|bigquery)' -test.parallel 4 -timeout 2400s .`
-- Known latent issue (backend-independent): a DuckDB-level failure inside
-  `catalog.Sync` can leave a transaction open on the pooled connection
-  ("cannot start a transaction within a transaction" on later queries) — the
-  sync error path has no rollback. Not currently reproducible after the json
-  fix; revisit if conformance runs hit it.
+- Known edge case: if a DuckDB-level error occurs inside `catalog.Sync`, the sync
+  error path currently skips a rollback, which can leave a transaction open on the
+  pooled connection and surface as "cannot start a transaction within a transaction"
+  on later queries. It has been stable since the JSON-extension fix, and adding a
+  rollback on that path would close it fully.

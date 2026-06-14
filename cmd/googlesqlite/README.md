@@ -25,8 +25,8 @@ Rebuild only when you change the Go code or pull a new engine.
 
 No build flags are required since duckdb-go-pure v0.3.1. The engine is
 sharded into ~30 packages and compiles fully optimized in under a minute
-on a multicore box. Tests run with `-vet=off` because `go vet` cannot
-chew the generated packages.
+on a typical multi-core development machine. Tests run with `-vet=off`
+because `go vet` cannot analyze the generated packages.
 
 Prerequisites: none beyond Go. The engine is the fetchable module
 `github.com/esilver/duckdb-go-pure`, with no sibling checkouts. See
@@ -102,8 +102,10 @@ query to print it vertically, one stanza per row.
 
 ## What works
 
-The full dialect runs on this engine: 986 of the 994 conformance specs
-pass with zero failures.
+The full dialect runs on this engine. The spec conformance gate covers
+707 spec files and 1,177 asserted cases, with the corpus categorized as
+697 implemented, 7 partial, and 3 unsupported specs. See the Status
+section of the [top-level README](../../README.md) for the current matrix.
 
 ## WebAssembly Playground API
 
