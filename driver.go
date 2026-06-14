@@ -418,6 +418,10 @@ type Conn struct {
 	catalog        *internal.Catalog
 	systemVars     map[string]string
 	scriptVars     map[string]string
+	// materializeCTE is intentionally always-on: every construction
+	// site sets it true and no caller flips it false today. The field
+	// is retained because it feeds the analysis-cache key, so a future
+	// per-Conn setter can vary it without invalidating cached plans.
 	materializeCTE bool
 
 	// dead is set when an operation on this Conn observes that the

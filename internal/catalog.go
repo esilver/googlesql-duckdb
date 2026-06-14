@@ -1535,7 +1535,7 @@ func NewCatalog(db *sql.DB) *Catalog {
 	// populated DescriptorPool / SimpleCatalog while AddType is in
 	// flight. The unlock is deferred inside a closure: the body
 	// crosses the analyzer FFI boundary, and an abort there surfaces
-	// as a Go panic — a bare Lock/Unlock pair would orphan
+	// as a Go panic, and a bare Lock/Unlock pair would orphan
 	// analyzeMu for every Analyze in the process even when the
 	// caller recovers the panic (issue #18).
 	func() {
@@ -1790,7 +1790,7 @@ func (c *Catalog) FindTable(path []string) (googlesql.TableNode, error) {
 	if c.isWildcardTable(path) {
 		return c.createWildcardTable(path)
 	}
-	return nil, fmt.Errorf("catalog: FindTable not yet supported via wasm bridge")
+	return nil, fmt.Errorf("catalog: FindTable not yet supported by the analyzer")
 }
 
 // registerWildcardTableByPath pre-creates a wildcard table for `path`
@@ -1849,35 +1849,35 @@ func (c *Catalog) normalizeTablePath(path []string) []string {
 }
 
 func (c *Catalog) FindModel(path []string) (googlesql.ModelNode, error) {
-	return nil, fmt.Errorf("catalog: FindModel not yet supported via wasm bridge")
+	return nil, fmt.Errorf("catalog: FindModel not yet supported by the analyzer")
 }
 
 func (c *Catalog) FindConnection(path []string) (googlesql.ConnectionNode, error) {
-	return nil, fmt.Errorf("catalog: FindConnection not yet supported via wasm bridge")
+	return nil, fmt.Errorf("catalog: FindConnection not yet supported by the analyzer")
 }
 
 func (c *Catalog) FindFunction(path []string) (*googlesql.Function, error) {
-	return nil, fmt.Errorf("catalog: FindFunction not yet supported via wasm bridge")
+	return nil, fmt.Errorf("catalog: FindFunction not yet supported by the analyzer")
 }
 
 func (c *Catalog) FindTableValuedFunction(path []string) (*googlesql.TableValuedFunction, error) {
-	return nil, fmt.Errorf("catalog: FindTableValuedFunction not yet supported via wasm bridge")
+	return nil, fmt.Errorf("catalog: FindTableValuedFunction not yet supported by the analyzer")
 }
 
 func (c *Catalog) FindProcedure(path []string) (*googlesql.Procedure, error) {
-	return nil, fmt.Errorf("catalog: FindProcedure not yet supported via wasm bridge")
+	return nil, fmt.Errorf("catalog: FindProcedure not yet supported by the analyzer")
 }
 
 func (c *Catalog) FindType(path []string) (googlesql.Googlesql_TypeNode, error) {
-	return nil, fmt.Errorf("catalog: FindType not yet supported via wasm bridge")
+	return nil, fmt.Errorf("catalog: FindType not yet supported by the analyzer")
 }
 
 func (c *Catalog) FindConstant(path []string) (googlesql.ConstantNode, int, error) {
-	return nil, 0, fmt.Errorf("catalog: FindConstant not yet supported via wasm bridge")
+	return nil, 0, fmt.Errorf("catalog: FindConstant not yet supported by the analyzer")
 }
 
 func (c *Catalog) FindConversion(from, to googlesql.Googlesql_TypeNode) (*googlesql.Conversion, error) {
-	return nil, fmt.Errorf("catalog: FindConversion not yet supported via wasm bridge")
+	return nil, fmt.Errorf("catalog: FindConversion not yet supported by the analyzer")
 }
 
 // ExtendedTypeSuperTypes used to return *TypeListView but that alias was
@@ -1886,7 +1886,7 @@ func (c *Catalog) FindConversion(from, to googlesql.Googlesql_TypeNode) (*google
 // Callers of this method only ever checked the error, so returning an
 // empty slice keeps the contract without depending on the removed alias.
 func (c *Catalog) ExtendedTypeSuperTypes(typ googlesql.Googlesql_TypeNode) ([]googlesql.Googlesql_TypeNode, error) {
-	return nil, fmt.Errorf("catalog: ExtendedTypeSuperTypes not yet supported via wasm bridge")
+	return nil, fmt.Errorf("catalog: ExtendedTypeSuperTypes not yet supported by the analyzer")
 }
 
 func (c *Catalog) SuggestTable(mistypedPath []string) string {
