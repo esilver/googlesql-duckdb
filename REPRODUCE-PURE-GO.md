@@ -33,12 +33,20 @@ SELECT STARTS_WITH('duckdb','duck') -> true
 SELECT SAFE_CAST('42' AS INT64)     -> 42
 ```
 
-No build flags are required. Since duckdb-go-pure v0.3.1 a plain `go build`
-works: the engine is sharded into ~30 packages under
+No build flags are required. Since duckdb-go-pure v0.3.1 (now pinned at v0.3.13)
+a plain `go build` works: the engine is sharded into ~30 packages under
 `internal/duckdbcore/{core,shardNN,all}` with its oversized functions split, so
 it compiles **fully optimized with inlining** in well under a minute on a
 typical multi-core machine, cached thereafter. Run tests with `-vet=off`,
 because `go vet` cannot analyze the generated packages.
+
+To verify the build against the full conformance corpus, run the pure-Go spec
+gate (see [Status](#status)):
+
+```sh
+CGO_ENABLED=0 go test -vet=off \
+  -run 'TestSpec/(googlesql|bigquery)' -test.parallel 4 -timeout 2400s .
+```
 
 > [!NOTE]
 > Engine developers can point the build at a local checkout with
@@ -55,24 +63,18 @@ because `go vet` cannot analyze the generated packages.
   pure-Go engine. Call sites are unchanged apart from the import path.
 - The historical cgo `duckdb_aggregate_udf.go` is removed (history-only).
   `duckdb_aggregate_udf_purego.go` is the supported bridge: all 32 aggregate
-  specs (KLL, HLL, ANY_VALUE HAVING, googlesqlite_agg, ST_*_AGG,
-  st_clusterdbscan, tf_idf, and both differential-privacy families) register as
-  arity bands of ANY-parameter overloads through the engine's
-  `RegisterAggregateBandConn`, with the same collect/concat/replay state model.
-  The aggregate spec suite verifies it, including HLL INIT+MERGE over struct
-  UNNEST and the noiseless `WITH ANONYMIZATION ANON_COUNT(*)` rewrite.
+  specs register through the engine's `RegisterAggregateBandConn` and are
+  verified by the aggregate spec suite.
 - `doLoadSpatialExtension` is a no-op: geography runs entirely on the pure-Go
   `googlesqlite_st_*`/`s2_*` UDFs, so spatial queries work without DuckDB's
   native `INSTALL spatial`.
 
 ## How the UDFs run with no cgo
 
-The cgo build hands DuckDB a C function pointer per `googlesqlite_*` UDF. In the
-wasm2go engine the indirect-call table is a Go `[]any` of closures, so the
-backend appends the Go UDF closure to that table and passes its index as the
-"function pointer" to `duckdb_create_scalar_function`. DuckDB then
-`call_indirect`s back into Go, through the same `database/sql` +
-`RegisterScalarUDF` surface the emulator already uses.
+Where the cgo build hands DuckDB a C function pointer per `googlesqlite_*` UDF,
+the wasm2go engine instead registers each Go UDF closure as an index into its
+indirect-call table and `call_indirect`s back into Go, through the same
+`database/sql` + `RegisterScalarUDF` surface the emulator already uses.
 
 ## Status
 
@@ -82,18 +84,14 @@ backend appends the Go UDF closure to that table and passes its index as the
 - ✅ Aggregates: all 32 specs register and pass the spec suite. The engine ships
   with the json and icu extensions (UNNEST lowering rides `json_each`,
   timezone-aware temporals need icu).
-- ✅ Conformance: the named spec gate runs the full normalized corpus. Counts
-  and the implemented/partial/unsupported breakdown live in
+- ✅ Conformance: the named spec gate runs the full normalized corpus (the
+  pure-Go run command is in [Setup](#setup)). Counts and the
+  implemented/partial/unsupported breakdown live in
   [docs/specs/INDEX.md](docs/specs/INDEX.md). The
   `bigquery/functions/{search,objectref}` family runs on pure-Go bodies
   (`textfn.BindSearch`, `extras.BindObj*`) routed through the formatter retarget
   (`trySearchObjectRefFunc`) plus the DuckDB UDF allow-list (SEARCH declared
-  BOOL). Run the gate pure-Go with:
-
-  ```sh
-  CGO_ENABLED=0 go test -vet=off \
-    -run 'TestSpec/(googlesql|bigquery)' -test.parallel 4 -timeout 2400s .
-  ```
+  BOOL).
 
 > [!CAUTION]
 > Known edge case: a DuckDB-level error inside `catalog.Sync` currently skips a

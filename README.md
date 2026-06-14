@@ -2,9 +2,9 @@
 
 [![CI](https://github.com/esilver/googlesqlite/actions/workflows/ci.yml/badge.svg)](https://github.com/esilver/googlesqlite/actions/workflows/ci.yml)
 
-A pure-Go GoogleSQL engine, exposed as a `database/sql` driver. No cgo, no
-external services, no C toolchain. GoogleSQL is the dialect behind BigQuery and
-Cloud Spanner, so this is a local execution engine for those workloads.
+A pure-Go GoogleSQL engine, exposed as a `database/sql` driver with no cgo, no
+external services, and no C toolchain, giving you a local execution engine for
+the dialect behind BigQuery and Cloud Spanner.
 
 It runs the GoogleSQL dialect on a pure-Go DuckDB backend:
 
