@@ -67,7 +67,7 @@ func encodeOrPassArgs(values []any, params []*googlesql.ResolvedParameter) ([]an
 	return EncodeGoValues(values, params)
 }
 
-// typeKindCache pins the wasm-resolved Kind of a googlesql type node so
+// typeKindCache pins the analyzer-resolved Kind of a googlesql type node so
 // prepared statements pay the analyzer round-trip once at prepare time
 // instead of on every Exec/Query. hasKind is false when the type was nil
 // or its Kind() call failed; consumers then fall back to the un-typed
@@ -98,7 +98,7 @@ func cacheTypeKinds(types []googlesql.Googlesql_TypeNode) []typeKindCache {
 }
 
 // paramTypeCache pins a resolved parameter's type node and kind, both of
-// which are wasm round-trips (ResolvedParameter.Type() and Type.Kind())
+// which are analyzer round-trips (ResolvedParameter.Type() and Type.Kind())
 // that EncodeGoValues would otherwise re-issue per exec.
 type paramTypeCache struct {
 	typ googlesql.Googlesql_TypeNode
@@ -133,7 +133,7 @@ func cacheParamTypes(params []*googlesql.ResolvedParameter) []paramTypeCache {
 
 // encodeOrPassArgsCached is encodeOrPassArgs for statements that cached
 // their parameter types at prepare time. Behavior matches
-// EncodeGoValues(values, params) exactly, minus the per-exec wasm
+// EncodeGoValues(values, params) exactly, minus the per-exec analyzer
 // round-trips.
 func encodeOrPassArgsCached(values []any, params []*googlesql.ResolvedParameter, cache []paramTypeCache) ([]any, error) {
 	if len(params) == 0 && len(values) > 0 {

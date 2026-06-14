@@ -1286,7 +1286,7 @@ func parseLocationLineCol(node googlesql.ASTNode, query string) (int, int) {
 // preRegisterWildcardTables walks the AST looking for table references
 // whose last path segment ends with `*` (e.g. `project.dataset.table_*`).
 // For each such reference, build the corresponding wildcard table and
-// add it to the wasm-side catalog so the analyzer resolves the
+// add it to the analyzer's catalog so the analyzer resolves the
 // reference. The googlesql SimpleCatalog has no native wildcard
 // support, so we pre-register an equivalent SimpleTable here.
 func (a *Analyzer) preRegisterWildcardTables(stmt googlesql.ASTStatementNode) {
@@ -2224,8 +2224,8 @@ func reshapeArgToType(v any, t googlesql.Googlesql_TypeNode) any {
 }
 
 // reshapeArgToTypeWithKind is reshapeArgToType with the column type's
-// Kind pre-resolved. Type.Kind() is a wasm round-trip into the GoogleSQL
-// analyzer module; DMLStmt caches the per-column kinds at prepare time
+// Kind pre-resolved. Type.Kind() is a call into the GoogleSQL
+// analyzer module. DMLStmt caches the per-column kinds at prepare time
 // so the per-exec reshape pass costs no analyzer calls for the common
 // scalar columns (which are not reshape candidates at all).
 func reshapeArgToTypeWithKind(v any, t googlesql.Googlesql_TypeNode, kind googlesql.TypeKind) any {
@@ -2918,7 +2918,7 @@ func mergeFormatUpdateItems(ctx context.Context, items []*googlesql.ResolvedUpda
 
 // getParamsFromNode returns the deduplicated `*ResolvedParameter`
 // list collected as a side-effect of formatting the resolved tree.
-// The wasm bridge in v0.1.0 does not expose a descendants walker on
+// The analyzer module in v0.1.0 does not expose a descendants walker on
 // ResolvedNode, so the collector populated by ParameterNode.FormatSQL
 // is the only source. Callers must install a paramCollector on ctx
 // before invoking FormatSQL — newQueryStmtAction / newDMLStmtAction

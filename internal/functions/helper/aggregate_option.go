@@ -2,7 +2,7 @@
 // binder helpers shared between the internal Aggregator wrapper, the
 // window sub-package, and per-aggregate function implementations. It is
 // a leaf package: it depends on internal/value but is depended upon by
-// internal/ and by internal/function/window/.
+// internal/ and by internal/functions/window/.
 package helper
 
 import (

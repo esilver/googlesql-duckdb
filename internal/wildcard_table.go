@@ -29,9 +29,10 @@ func (c *Catalog) isWildcardTable(path []string) bool {
 // WildcardTable captures the set of real tables that a wildcard pattern
 // expanded to, plus the merged column list the analyzer sees. The
 // analyzer-visible handle is the embedded *SimpleTable (already a real
-// wasm-side googlesql.TableNode) — WildcardTable itself never crosses the
-// bridge. At SQL-emission time the formatter looks up the metadata by the
-// SimpleTable's handle ptr and rewrites the scan into a UNION ALL.
+// analyzer-side googlesql.TableNode) — WildcardTable itself never crosses
+// into the analyzer. At SQL-emission time the formatter looks up the
+// metadata by the SimpleTable's handle ptr and rewrites the scan into a
+// UNION ALL.
 type WildcardTable struct {
 	spec   *TableSpec
 	tables []*TableSpec
@@ -135,7 +136,7 @@ func (c *Catalog) createWildcardTable(path []string) (googlesql.TableNode, error
 }
 
 // createWildcardTableImpl builds the WildcardTable metadata (matched
-// tables, merged column list, prefix) without touching the wasm-side
+// tables, merged column list, prefix) without touching the analyzer's
 // catalog.
 func (c *Catalog) createWildcardTableImpl(path []string) (*WildcardTable, error) {
 	name := strings.Join(path, "_")

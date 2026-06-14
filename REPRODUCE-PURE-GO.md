@@ -8,14 +8,16 @@ upstream, only the DuckDB *execution backend* changes. The pure-Go backend is th
 maintained path that CI exercises on this branch. The earlier native cgo backend
 remains in the history for reference.
 
-## Setup — ONE clone, zero replaces
+## Setup - ONE clone, zero replaces for the engine
 
 The engine is a normal fetchable Go module:
 [`github.com/esilver/duckdb-go-pure`](https://github.com/esilver/duckdb-go-pure)
 (root package `duckdb`, a `database/sql` driver registered as `"duckdb"`, with
 the transpiled engine committed under `internal/duckdbcore`). This repo
-`require`s it like any other dependency — **no `replace` directives, no sibling
-checkouts, no generated files**.
+`require`s it like any other dependency: zero replaces for the DuckDB engine,
+no sibling checkouts, no generated files. The GoogleSQL analyzer is consumed
+via a documented replace to the `go-googlesql` fork until the fixes land
+upstream (see the `replace` directive in `go.mod`).
 
 ```sh
 git clone https://github.com/esilver/googlesqlite
@@ -55,8 +57,8 @@ development machine, and is cached afterwards.)
   `duckdb-go/v2` API subset the emulator consumes (`Driver`, `Decimal`,
   `Type`/`TypeInfo`, `RegisterScalarUDF`, `RegisterTableUDF`, …) backed by the
   pure-Go engine. Call sites are unchanged apart from the import path.
-- The historical cgo translation unit `duckdb_aggregate_udf.go` is archived
-  behind `//go:build ignore`; `duckdb_aggregate_udf_purego.go` is the
+- The historical cgo translation unit `duckdb_aggregate_udf.go` was removed
+  (history-only in git). `duckdb_aggregate_udf_purego.go` is the
   supported pure-Go bridge: all 32 aggregate specs (KLL, HLL, ANY_VALUE
   HAVING, googlesqlite_agg, ST_*_AGG, st_clusterdbscan, tf_idf, and both
   differential-privacy families) register as arity bands of ANY-parameter

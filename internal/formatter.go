@@ -42,7 +42,7 @@ func getTableName(ctx context.Context, n googlesql.ResolvedNode) (string, error)
 	// ask it for its name. The go-googlesql version used a side-car
 	// nodeMap that mapped ResolvedTableScan → ASTPathExpression to
 	// recover the original user-supplied identifier, but that side
-	// channel is not exposed through the wasm bridge. For the common
+	// channel is not exposed through the analyzer module. For the common
 	// case (single-segment table names) the catalog-bound Table.Name()
 	// is equivalent.
 	if scan, ok := n.(*googlesql.ResolvedTableScan); ok {
@@ -4904,7 +4904,7 @@ func (n *TableScanNode) FormatSQL(ctx context.Context) (string, error) {
 	}
 
 	// If the underlying TableNode is actually a wildcard — recorded in
-	// wildcardTableRegistry under the SimpleTable's wasm handle ptr —
+	// wildcardTableRegistry under the SimpleTable's analyzer handle ptr —
 	// rewrite the scan into the UNION-ALL pattern. Otherwise fall through
 	// to a regular table reference.
 	table := m1(n.node.Table())

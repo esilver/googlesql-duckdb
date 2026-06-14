@@ -973,7 +973,7 @@ func graphStringArrayLiteral(items []string) string {
 // populate it at SimplePropertyGraph construction time because
 // the Go binding exposes a slice-write-back API on
 // GraphElementTableNode that can't actually return data through
-// wasmify.
+// the analyzer module.
 type graphElementMetadata struct {
 	Name          string
 	Labels        []string

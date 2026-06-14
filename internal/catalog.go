@@ -1,5 +1,22 @@
 package internal
 
+// catalog.go wires the GoogleSQL analyzer's schema view to this driver.
+// It is organized into three regions so a reader can navigate by purpose:
+//
+//   - The SimpleCatalog mirror: the Go-side spec maps (tableMap, funcMap,
+//     tvfMap, sub-catalogs, …) and the routines that mirror those specs
+//     into the analyzer's SimpleCatalog tree so the analyzer can resolve
+//     tables, functions, and types.
+//   - The Find* stubs: the Catalog interface methods (FindTable, FindModel,
+//     FindFunction, …) that the analyzer calls back into. Most are stubs
+//     today because the analyzer resolves directly off the mirrored
+//     SimpleCatalog, so only FindTable does real work (wildcard expansion).
+//   - The GC / memory management: resetCatalog and the addTableSpec
+//     equivalence gates exist because a full rebuild per DDL statement
+//     pinned retired catalog trees and exhausted the analyzer heap under
+//     sustained dbt-style churn (issues #16, #19). The gates skip the
+//     rebuild when a spec change is analyzer-irrelevant.
+
 import (
 	"bytes"
 	"context"
@@ -94,7 +111,7 @@ type Catalog struct {
 	infoSchemaTables map[string]*infoSchemaTableMeta
 	// subCatalogs maps a parent SimpleCatalog (Go pointer) to its
 	// name→sub-catalog table, so every AddCatalog call happens at
-	// most once per (parent, name) — the wasm side traps if you try
+	// most once per (parent, name): the analyzer traps if you try
 	// to add the same name twice. The Go pointer is the right key
 	// here: each call to getOrCreateSubCatalog hands back a stable
 	// cached *SimpleCatalog so re-encountering the same parent
@@ -131,7 +148,7 @@ type propertyGraphSpec struct {
 // builtin registration at catalog construction. resetCatalog rebuilds
 // the SimpleCatalog on every DDL mutation — a dbt build does this per
 // node — and each rebuild previously created and abandoned a fresh
-// wasm-side LanguageOptions, arming one GC finalizer per node
+// analyzer-side LanguageOptions, arming one GC finalizer per node
 // (googlesqlite#16: the production crash trace is exactly
 // LanguageOptions.free on the runtime-finalizer goroutine). The
 // options are pure configuration read by AddGoogleSQLFunctions2, so
@@ -194,7 +211,7 @@ func newSimpleCatalog(name string) *googlesql.SimpleCatalog {
 		// IncludeFunctionIds into a single AddGoogleSQLFunctions2
 		// call. Calling AddGoogleSQLFunctions3 first and then
 		// AddGoogleSQLFunctions2 results in a duplicate-registration
-		// crash inside the wasm catalog.
+		// crash inside the analyzer catalog.
 		bf := newDPBuiltinFunctionOptions(opts)
 		if bf == nil {
 			bf = &googlesql.BuiltinFunctionOptions{LanguageOptions: opts}
@@ -988,7 +1005,7 @@ func registerSpannerStandaloneScalarFuncs(catalog *googlesql.SimpleCatalog, mysq
 		[]*googlesql.FunctionArgumentType{mkArg(googlesql.TypeKindTypeString)})
 	// NOTE: Spanner JSON FLOAT32 / FLOAT32_ARRAY / FLOAT64_ARRAY
 	// helpers are not registered here. FLOAT32 collides with the
-	// reserved type-name keyword and triggers a wasm-side crash; the
+	// reserved type-name keyword and triggers an analyzer crash. The
 	// runtime UDFs remain available for callers that route through
 	// an alternative dispatch path.
 
@@ -1575,8 +1592,8 @@ func (c *Catalog) RegisterProto(fileDescriptorProtoBytes []byte) error {
 	if !ok {
 		return fmt.Errorf("RegisterProto: invalid FileDescriptorProto wire format")
 	}
-	// Deferred unlock inside a closure: BuildFile crosses the wasm
-	// FFI boundary, and an analyzer abort there surfaces as a Go
+	// Deferred unlock inside a closure: BuildFile crosses into the
+	// analyzer module, and an analyzer abort there surfaces as a Go
 	// panic — manual Unlock calls on each return path would leak
 	// c.mu on that panic (issue #18).
 	if err := func() error {
@@ -1589,15 +1606,15 @@ func (c *Catalog) RegisterProto(fileDescriptorProtoBytes []byte) error {
 	}
 	// Mirror the registration on the Go-side proto registry so the
 	// runtime (CAST(STRING AS Proto) text-format parsing, value
-	// formatters, etc.) can resolve the descriptor without crossing
-	// the wasm bridge. Failure here is non-fatal — the wasm pool
-	// already has the FileDescriptor for analyzer use.
+	// formatters, etc.) can resolve the descriptor without calling
+	// into the analyzer. Failure here is non-fatal — the analyzer's
+	// descriptor pool already has the FileDescriptor for analyzer use.
 	_ = registerGoProtoFileFromBytes(fileDescriptorProtoBytes)
 	// Auto-register every message declared in the file as a
 	// SQL-visible proto type so callers don't have to follow each
 	// RegisterProto with explicit RegisterProtoMessage calls. We
 	// derive the names from the Go-side FileDescriptor (already built
-	// above) which is cheaper than re-walking the wasm bridge.
+	// above) which is cheaper than re-walking the analyzer descriptors.
 	for _, fullName := range messageFullNamesFromGoFile(fileDescriptorProtoBytes) {
 		if _, err := c.RegisterProtoMessage(fullName); err != nil {
 			return fmt.Errorf("RegisterProto: auto-promote %q: %w", fullName, err)
@@ -1736,7 +1753,7 @@ func (c *Catalog) StorageNameForTable(table googlesql.TableNode) string {
 
 // getOrCreateSubCatalog returns the sub-catalog registered under
 // parent+name, creating and attaching it on first use. AddCatalog is
-// called exactly once per (parent, sub-name) so wasm-side
+// called exactly once per (parent, sub-name) so analyzer-side
 // deduplication traps are impossible.
 func (c *Catalog) getOrCreateSubCatalog(parent *googlesql.SimpleCatalog, name string) *googlesql.SimpleCatalog {
 	if parent == nil {
@@ -1764,9 +1781,9 @@ func (c *Catalog) FullName() string {
 	return s
 }
 
-// Find* methods are currently unsupported through the wasm bridge: the
-// underlying googlesql::Catalog templated Find<T>(...) variants use
-// output-pointer parameters the bridge cannot marshal today. Returning
+// Find* methods are currently unsupported through the analyzer module:
+// the underlying googlesql::Catalog templated Find<T>(...) variants use
+// output-pointer parameters the module cannot marshal today. Returning
 // the stored SimpleCatalog handle via FindOptions would require a
 // Go-side callback catalog wrapper, which is tracked separately.
 func (c *Catalog) FindTable(path []string) (googlesql.TableNode, error) {
@@ -1796,7 +1813,7 @@ func (c *Catalog) registerWildcardTableByPath(path []string) {
 		return
 	}
 	registerWildcardTable(simpleTable, wt)
-	// Install into the wasm-side catalog tree. Walk the leading path
+	// Install into the analyzer's catalog tree. Walk the leading path
 	// segments as sub-catalogs so the analyzer resolves the reference
 	// in either form (fully-qualified or dataset-qualified).
 	c.installWildcardIntoCatalog(c.catalog, path, simpleTable)
@@ -1878,7 +1895,7 @@ func (c *Catalog) SuggestTable(mistypedPath []string) string {
 }
 
 func (c *Catalog) SuggestModel(mistypedPath []string) string {
-	// SuggestModel isn't exposed on SimpleCatalog via the wasm bridge.
+	// SuggestModel isn't exposed on SimpleCatalog via the analyzer module.
 	return ""
 }
 
@@ -2191,11 +2208,11 @@ func (c *Catalog) resetCatalog(tables []*TableSpec, functions []*FunctionSpec, t
 	// Map keys keep their referents alive, so without this reset the
 	// retired SimpleCatalog (plus every sub-catalog it spawned) would
 	// stay reachable until the process ends. Under sustained DDL
-	// pressure that pins thousands of catalogs in the wasm heap until
+	// pressure that pins thousands of catalogs in the analyzer heap until
 	// it exhausts and `wasm_alloc` starts returning OOB.
 	c.subCatalogs = map[*googlesql.SimpleCatalog]map[string]*googlesql.SimpleCatalog{}
 	// Issue #19: push the retired catalog tree toward reclamation NOW
-	// instead of waiting for an organic GC cycle. The wasm-side
+	// instead of waiting for an organic GC cycle. The analyzer-side
 	// objects are released by Go finalizers (free is enqueued, then
 	// drained on the next top-level module entry — i.e. during the
 	// re-registration below), so a forced collection here turns
@@ -2401,7 +2418,7 @@ func (c *Catalog) addTableSpec(spec *TableSpec) error {
 		// the next Sync) rebuilt the WHOLE analyzer catalog — full
 		// builtin + extension function surface per sub-catalog — once
 		// per statement over a growing spec set. Per-statement cost
-		// climbed with catalog size and the analyzer wasm heap filled
+		// climbed with catalog size and the analyzer heap filled
 		// until bad_alloc. Gate the rebuild on what actually changed:
 		//
 		//  1. byte-identical spec (modulo bookkeeping timestamps):
@@ -2414,9 +2431,9 @@ func (c *Catalog) addTableSpec(spec *TableSpec) error {
 		//     registries and invalidate the analysis cache (Query /
 		//     DefaultExpr / options may differ — those are read from
 		//     tableMap at lowering time, so the pointer swap is
-		//     enough) but skip the wasm rebuild entirely.
+		//     enough) but skip the analyzer rebuild entirely.
 		//  3. schema change (issue #10): rebuild via resetCatalog.
-		//     The wasm-side SimpleCatalog has no table-removal API
+		//     The analyzer's SimpleCatalog has no table-removal API
 		//     and addTableSpecRecursive skips already-registered
 		//     names, so a fresh catalog is the only way to shed the
 		//     stale SimpleTable handle under every lookup alias.
@@ -2566,7 +2583,7 @@ func (c *Catalog) addTableSpecRecursiveImpl(cat *googlesql.SimpleCatalog, spec *
 		// Reuse the previously-added sub-catalog when the same name
 		// reappears (e.g. "project" on the path of every table). Adding
 		// a new SimpleCatalog handle under an already-registered name
-		// traps the wasm runtime because SimpleCatalog::AddCatalog
+		// traps the analyzer because SimpleCatalog::AddCatalog
 		// rejects duplicates via a CHECK.
 		subCatalog := c.getOrCreateSubCatalog(cat, subCatalogName)
 		if subCatalog == nil {
@@ -2699,8 +2716,8 @@ func (c *Catalog) createSimpleTable(tableName string, spec *TableSpec) (*googles
 }
 
 // newSimpleTableWithColumns constructs a googlesql.SimpleTable with
-// `name` and the supplied owned columns. Returns nil if the wasm
-// bridge fails so a single trap can't tear down the whole binary.
+// `name` and the supplied owned columns. Returns nil if the analyzer
+// module fails so a single trap can't tear down the whole binary.
 //
 // Each column is added with isOwned=true; v0.2.1 of go-googlesql
 // neutralises the column's Go-side finalizer inside AddColumn2 itself,
@@ -2903,10 +2920,10 @@ func (c *Catalog) existsTVF(cat *googlesql.SimpleCatalog, name string) bool {
 }
 
 func (c *Catalog) existsTable(cat *googlesql.SimpleCatalog, name string) bool {
-	// Checks presence on the *wasm-side* SimpleCatalog via TableNames().
+	// Checks presence on the analyzer's SimpleCatalog via TableNames().
 	// The earlier implementation short-circuited against c.tableMap,
 	// which caused AddTable to be skipped for tables that were already
-	// recorded on the Go side but never propagated into the wasm
+	// recorded on the Go side but never propagated into the analyzer
 	// catalog — the analyzer then couldn't find them.
 	names, err := cat.TableNames()
 	if err != nil {

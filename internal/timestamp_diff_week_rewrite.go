@@ -3,7 +3,7 @@ package internal
 import "strings"
 
 // applyTimestampDiffWeekRewrite works around a GoogleSQL analyzer gap in the
-// wasm binding used by the DuckDB branch: TIMESTAMP_DIFF rejects WEEK-family
+// analyzer module used by the DuckDB branch: TIMESTAMP_DIFF rejects WEEK-family
 // parts for TIMESTAMP arguments before the formatter can lower the call. The
 // repository's BigQuery spec expects the DATE_DIFF week-boundary behavior, so
 // rewrite only the timestamp-looking unsupported shape before analysis.

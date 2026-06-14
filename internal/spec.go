@@ -76,7 +76,7 @@ func (s *FunctionSpec) SQL() string {
 	return fmt.Sprintf(
 		// Backtick-quote the name: GoogleSQL treats a double-quoted
 		// token as a string literal, so "name" fails to parse
-		// ("Unexpected string literal") on the wasm analyzer.
+		// ("Unexpected string literal") in the analyzer.
 		"CREATE FUNCTION `%s`(%s) RETURNS %v AS (%s)",
 		s.FuncName(),
 		strings.Join(args, ", "),
@@ -885,9 +885,9 @@ func normaliseStringLiteralQuotes(s string) string {
 //
 // Each call uses `Value.GetSQLLiteral()` for the value text and
 // `Value.TypeKind()` for the declared type. We deliberately avoid
-// touching `Value.Type()` (the wasm-side Type handle) here: pulling
-// it out keeps a wasm sub-handle alive that another goroutine's
-// finalizer can deadlock against if a process-global wasm Module
+// touching `Value.Type()` (the analyzer-side Type handle) here: pulling
+// it out keeps an analyzer sub-handle alive that another goroutine's
+// finalizer can deadlock against if a process-global analyzer module
 // mutex is contended.
 func newTableOptionsFromResolved(opts []*googlesql.ResolvedOption) []*tableOptionSpec {
 	if len(opts) == 0 {

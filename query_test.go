@@ -1209,7 +1209,7 @@ func TestTableSample(t *testing.T) {
 
 // TestQualifyClause drives FilterScanNode with QUALIFY (analyzer
 // lowers QUALIFY into a FilterScan over an AnalyticScan). The
-// formatter currently emits a wrapped WHERE so the SQLite engine can
+// formatter currently emits a wrapped WHERE so the DuckDB engine can
 // filter.
 //
 // Reference: docs/third_party/googlesql-docs/query-syntax.md "QUALIFY
