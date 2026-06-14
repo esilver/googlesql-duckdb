@@ -91,16 +91,14 @@ var normalFuncs = []*funcInfo{
 
 	// uuid functions
 	{
-		Name:             "generate_uuid",
-		BindFunc:         func(args ...value.Value) (value.Value, error) { return uuid.GENERATE_UUID() },
-		NonDeterministic: true,
+		Name:     "generate_uuid",
+		BindFunc: func(args ...value.Value) (value.Value, error) { return uuid.GENERATE_UUID() },
 	},
 	{
 		// NEW_UUID is GoogleSQL's V1.4 spec-canonical alias for
 		// GENERATE_UUID; both return a random UUID v4 STRING.
-		Name:             "new_uuid",
-		BindFunc:         func(args ...value.Value) (value.Value, error) { return uuid.GENERATE_UUID() },
-		NonDeterministic: true,
+		Name:     "new_uuid",
+		BindFunc: func(args ...value.Value) (value.Value, error) { return uuid.GENERATE_UUID() },
 	},
 
 	// debugging functions
@@ -695,17 +693,17 @@ var normalFuncs = []*funcInfo{
 	// (internal/analyzer.go) — the latter is the one the resolver
 	// consults at analyze time. Runtime bodies live in
 	// internal/functions/aead.
-	{Name: "keys_new_keyset", NonDeterministic: true, BindFunc: aead.BindKeysNewKeyset},
-	{Name: "keys_add_key_from_raw_bytes", NonDeterministic: true, BindFunc: aead.BindKeysAddKeyFromRawBytes},
+	{Name: "keys_new_keyset", BindFunc: aead.BindKeysNewKeyset},
+	{Name: "keys_add_key_from_raw_bytes", BindFunc: aead.BindKeysAddKeyFromRawBytes},
 	{Name: "keys_keyset_length", BindFunc: aead.BindKeysKeysetLength},
 	{Name: "keys_keyset_to_json", BindFunc: aead.BindKeysKeysetToJson},
 	{Name: "keys_keyset_from_json", BindFunc: aead.BindKeysKeysetFromJson},
-	{Name: "keys_rotate_keyset", NonDeterministic: true, BindFunc: aead.BindKeysRotateKeyset},
+	{Name: "keys_rotate_keyset", BindFunc: aead.BindKeysRotateKeyset},
 	{Name: "keys_keyset_chain", BindFunc: aead.BindKeysKeysetChain},
-	{Name: "keys_new_wrapped_keyset", NonDeterministic: true, BindFunc: aead.BindKeysNewWrappedKeyset},
+	{Name: "keys_new_wrapped_keyset", BindFunc: aead.BindKeysNewWrappedKeyset},
 	{Name: "keys_rewrap_keyset", BindFunc: aead.BindKeysRewrapKeyset},
 	{Name: "keys_rotate_wrapped_keyset", BindFunc: aead.BindKeysRotateWrappedKeyset},
-	{Name: "aead_encrypt", NonDeterministic: true, BindFunc: aead.BindAeadEncrypt},
+	{Name: "aead_encrypt", BindFunc: aead.BindAeadEncrypt},
 	{Name: "aead_decrypt_bytes", BindFunc: aead.BindAeadDecryptBytes},
 	{Name: "aead_decrypt_string", BindFunc: aead.BindAeadDecryptString},
 	{Name: "deterministic_encrypt", BindFunc: aead.BindDeterministicEncrypt},

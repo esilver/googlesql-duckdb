@@ -67,7 +67,7 @@ func applyScriptVariables(ctx context.Context, query string, conn *Conn) string 
 		}
 		if name, expr, ok := parseDeclare(trimmed); ok {
 			// Substitute any earlier-declared variables on the RHS,
-			// evaluate the result through SQLite to a concrete
+			// evaluate the result through the engine to a concrete
 			// literal, and store the literal. This keeps repeated
 			// SET m = m + 1 from growing the text quadratically.
 			lit := evaluateScriptVariableExpr(ctx, conn, substituteScriptVariables(expr, conn))
@@ -94,12 +94,12 @@ func applyScriptVariables(ctx context.Context, query string, conn *Conn) string 
 	return strings.Join(keep, "; ")
 }
 
-// evaluateScriptVariableExpr asks the underlying SQLite to compute
+// evaluateScriptVariableExpr asks the underlying engine to compute
 // a single-row, single-column result for the given expression and
 // returns the result as a SQL literal. Falls back to a parenthesised
 // version of the original text when evaluation fails — that keeps
 // callers correct even for expressions whose only use is in another
-// statement (where SQLite's evaluator might reject them in isolation).
+// statement (where the engine's evaluator might reject them in isolation).
 func evaluateScriptVariableExpr(ctx context.Context, conn *Conn, expr string) string {
 	expr = strings.TrimSpace(expr)
 	if expr == "" {

@@ -20,7 +20,7 @@ var (
 // encodeOrPassArgs wraps EncodeGoValues with a fall-through: when the
 // resolved-AST walker failed to populate params (current bridge limitation),
 // s.args is empty even though the caller passed real arguments. In that
-// case we hand the raw values to SQLite directly — its driver handles
+// case we hand the raw values to DuckDB directly — its driver handles
 // @name / ? native binding for primitive types.
 //
 // TODO: once ResolvedNode.ChildrenAccept is bridged and
@@ -29,7 +29,7 @@ var (
 // googlesql-inferred type.
 // CheckNamedValue is the canonical CheckNamedValue used by Conn,
 // DMLStmt, and QueryStmt. It encodes the value into the googlesqlite
-// layout so the underlying SQLite driver only ever sees primitive
+// layout so the underlying DuckDB driver only ever sees primitive
 // driver.Value types. Numeric and bool primitives stay raw because
 // EncodeValue passes them through unchanged.
 func CheckNamedValue(value *driver.NamedValue) error {

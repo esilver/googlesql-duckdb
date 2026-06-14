@@ -193,9 +193,8 @@ func getFuncNameAndArgs(ctx context.Context, node *ResolvedBaseFunctionCallNode,
 	// DuckDB retarget: COUNT(*) is analyzed as the $-builtin
 	// `$count_star` and would otherwise lower to the SQLite UDF
 	// googlesqlite_count_star(). DuckDB has no such UDF but supports
-	// native COUNT(*) with identical semantics, so emit that directly.
-	// (Milestone-0 spine: a hand-translated single-function lowering,
-	// not the full aggregate-UDF retarget.)
+	// native COUNT(*) with identical semantics, so emit that directly
+	// as a hand-translated single-function lowering.
 	if funcName == "$count_star" {
 		return "count", []string{"*"}, nil
 	}

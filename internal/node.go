@@ -268,7 +268,7 @@ type AssertScanNode struct {
 // pipe-FORK and a few other rewrites. The emulator treats it as a
 // pass-through to InputScan — the barrier semantic (cardinality /
 // ordering hint to the optimiser) is irrelevant once we hand the SQL to
-// SQLite.
+// DuckDB.
 type BarrierScanNode struct {
 	node *googlesql.ResolvedBarrierScan
 }

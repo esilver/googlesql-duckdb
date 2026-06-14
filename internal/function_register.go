@@ -11,9 +11,6 @@ import (
 type nameAndFunc struct {
 	Name string
 	Func any
-	// NonDeterministic, when true, drops SQLITE_DETERMINISTIC at
-	// registration so SQLite re-evaluates the call per row.
-	NonDeterministic bool
 }
 
 var (
@@ -178,7 +175,6 @@ func setupNormalFuncMap(info *funcInfo) {
 			}
 			return EncodeValue(ret)
 		},
-		NonDeterministic: info.NonDeterministic,
 	}, &nameAndFunc{
 		Name: fmt.Sprintf("googlesqlite_safe_%s", info.Name),
 		Func: func(args ...any) (any, error) {
@@ -195,7 +191,6 @@ func setupNormalFuncMap(info *funcInfo) {
 			}
 			return EncodeValue(ret)
 		},
-		NonDeterministic: info.NonDeterministic,
 	})
 }
 

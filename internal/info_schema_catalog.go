@@ -9,9 +9,10 @@ import (
 // infoSchemaTableMeta is what infoSchemaTables maps a SimpleTable
 // handle key to. The formatter looks the meta up by handle key
 // during TableScanNode.FormatSQL to detect that a scan targets an
-// INFORMATION_SCHEMA virtual table; if matched, it emits a vtab
-// call against meta.module with `WHERE __schema = 'meta.dataset'`
-// pushed down.
+// INFORMATION_SCHEMA view; if matched, it calls
+// InfoSchemaInlineRelationSQL(meta) to render meta.view limited to
+// meta.dataset as an inline DuckDB relation and splices that in place
+// of the scan.
 type infoSchemaTableMeta struct {
 	view    *infoSchemaView
 	dataset string

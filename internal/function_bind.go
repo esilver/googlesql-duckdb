@@ -13,7 +13,6 @@ import (
 	"github.com/goccy/googlesqlite/internal/value"
 )
 
-type SQLiteFunction func(...any) (any, error)
 type BindFunction func(...value.Value) (value.Value, error)
 type aggregateBindFunction func() func() *helper.Aggregator
 type windowBindFunction func() func() *window.WindowAggregator
@@ -21,12 +20,6 @@ type windowBindFunction func() func() *window.WindowAggregator
 type funcInfo struct {
 	Name     string
 	BindFunc BindFunction
-	// NonDeterministic, when true, registers the underlying SQLite
-	// function without the SQLITE_DETERMINISTIC flag. SQLite is then
-	// required to re-evaluate the call for every row, instead of
-	// constant-folding it. Required for functions like GENERATE_UUID
-	// or CURRENT_TIMESTAMP whose result must vary per call.
-	NonDeterministic bool
 }
 
 type aggregateFuncInfo struct {

@@ -123,7 +123,7 @@ func (c *Conn) ScriptVariable(name string) (string, bool) {
 
 // MaterializeCTE reports the materialize-multi-ref-CTE flag for this
 // connection. The formatter consults this through context to decide
-// whether to emit the SQLite `MATERIALIZED` hint.
+// whether to emit the DuckDB `MATERIALIZED` hint.
 func (c *Conn) MaterializeCTE() bool {
 	return c.materializeCTE
 }

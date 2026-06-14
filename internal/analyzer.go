@@ -1428,7 +1428,7 @@ func applySQLRewritePipeline(query string, steps []sqlRewriteStep) string {
 // parameter nodes, so we count `?` occurrences directly on the parser
 // AST here and hand each statement only the args it owns. Without this,
 // a multi-statement script with positional placeholders would hand all
-// args to every statement, and the underlying SQLite stmt would reject
+// args to every statement, and the underlying DuckDB stmt would reject
 // the over-supply.
 func (a *Analyzer) sliceArgsPerStatement(parsed *parsedScript, args []driver.NamedValue) ([][]driver.NamedValue, error) {
 	stmtArgsList := make([][]driver.NamedValue, len(parsed.stmts))
@@ -1880,7 +1880,7 @@ func (a *Analyzer) newStmtAction(ctx context.Context, query string, args []drive
 // PROPERTY GRAPH ... by recording the spec in the catalog AND
 // registering a SimplePropertyGraph in the go-googlesql
 // SimpleCatalog so subsequent graph queries (`GRAPH X MATCH ...`)
-// can resolve. The statement has no SQLite-side effect.
+// can resolve. The statement has no DuckDB-side effect.
 func (a *Analyzer) newCreatePropertyGraphStmtAction(ctx context.Context, node *googlesql.ResolvedCreatePropertyGraphStmt) (StmtAction, error) {
 	namePath, _ := node.NamePath()
 	name := strings.Join(namePath, ".")
@@ -2953,7 +2953,7 @@ func collectFormatParams(ctx context.Context, n googlesql.ResolvedNode) (string,
 	if err != nil {
 		return "", nil, err
 	}
-	// Surface the translated SQLite text to the CLI debug hook, if one
+	// Surface the translated DuckDB text to the CLI debug hook, if one
 	// is installed on the context. This is the single chokepoint every
 	// statement kind (query / DML / DDL / graph) routes through.
 	if collector := sqlCollectorFromContext(ctx); collector != nil {
@@ -2969,7 +2969,7 @@ func getArgsFromParams(values []driver.NamedValue, params []*googlesql.ResolvedP
 	// The resolved-tree walker is a placeholder while ResolvedNode
 	// child iteration isn't yet bridged, so params may be empty even
 	// when the user supplied real parameters. In that case pass the
-	// named values straight through and let SQLite handle native
+	// named values straight through and let DuckDB handle native
 	// @name / ? binding.
 	if len(params) == 0 && len(values) > 0 {
 		out := make([]any, 0, len(values))

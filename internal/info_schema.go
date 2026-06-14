@@ -9,17 +9,16 @@ import (
 )
 
 // InfoSchemaView describes one BigQuery `INFORMATION_SCHEMA.<name>`
-// view. The driver exposes each view as a SQLite virtual table so
-// rows are pulled lazily from the live catalog at query time —
-// nothing is materialised until SQLite asks for it. This means
-// after a process restart, INFORMATION_SCHEMA queries observe
-// whatever the (file-backed) catalog contains, not stale snapshots.
+// view. There is no SQLite virtual-table layer: each view is
+// registered catalog-side as a SimpleTable, and at formatter time
+// InfoSchemaInlineRelationSQL synthesises the live rows from the
+// catalog and splices them into the DuckDB query as an inline
+// relation. Because the rows are built from the catalog at query
+// time, INFORMATION_SCHEMA queries always observe whatever the
+// catalog currently contains, not a stale snapshot.
 type infoSchemaView struct {
 	// Name is the BigQuery view name, e.g. "TABLES" / "COLUMNS".
 	Name string
-	// Module is the SQLite-side virtual-table name, e.g.
-	// "googlesqlite_info_schema_tables".
-	Module string
 	// Columns are the visible columns in declaration order. The
 	// trailing hidden `__schema` column carries the dataset
 	// constraint passed by the formatter.
@@ -29,22 +28,24 @@ type infoSchemaView struct {
 	BuildRows func(c *Catalog, schema string) []map[string]value.Value
 }
 
-// InfoSchemaColumn declares one virtual-table column.
+// InfoSchemaColumn declares one view column. The declared type maps
+// to the DuckDB column type emitted for the inline relation (see
+// infoSchemaDuckDBColumnType).
 type infoSchemaColumn struct {
 	Name string
-	// Type is the SQLite-level declared type. We use STRING for
-	// most columns since BigQuery's INFORMATION_SCHEMA columns are
-	// nearly all text-typed; INT64 / TIMESTAMP are reflected through
-	// the value layer the same way as anywhere else.
+	// Type is the declared type. We use STRING for most columns since
+	// BigQuery's INFORMATION_SCHEMA columns are nearly all text-typed;
+	// INT64 / TIMESTAMP are reflected through the value layer the same
+	// way as anywhere else.
 	Type string
 }
 
 // infoSchemaViews enumerates every supported view. New views append
-// here; the vtab registrar walks this slice on each connection.
+// here; ensureInfoSchemaForDataset walks this slice to register each
+// view as a SimpleTable.
 var infoSchemaViews = []*infoSchemaView{
 	{
-		Name:   "SCHEMATA",
-		Module: "googlesqlite_info_schema_schemata",
+		Name: "SCHEMATA",
 		Columns: []*infoSchemaColumn{
 			{Name: "catalog_name", Type: "STRING"},
 			{Name: "schema_name", Type: "STRING"},
@@ -56,8 +57,7 @@ var infoSchemaViews = []*infoSchemaView{
 		BuildRows: buildSchemataRows,
 	},
 	{
-		Name:   "TABLES",
-		Module: "googlesqlite_info_schema_tables",
+		Name: "TABLES",
 		Columns: []*infoSchemaColumn{
 			{Name: "table_catalog", Type: "STRING"},
 			{Name: "table_schema", Type: "STRING"},
@@ -70,8 +70,7 @@ var infoSchemaViews = []*infoSchemaView{
 		BuildRows: buildTablesRows,
 	},
 	{
-		Name:   "COLUMNS",
-		Module: "googlesqlite_info_schema_columns",
+		Name: "COLUMNS",
 		Columns: []*infoSchemaColumn{
 			{Name: "table_catalog", Type: "STRING"},
 			{Name: "table_schema", Type: "STRING"},
@@ -87,8 +86,7 @@ var infoSchemaViews = []*infoSchemaView{
 		BuildRows: buildColumnsRows,
 	},
 	{
-		Name:   "TABLE_OPTIONS",
-		Module: "googlesqlite_info_schema_table_options",
+		Name: "TABLE_OPTIONS",
 		Columns: []*infoSchemaColumn{
 			{Name: "table_catalog", Type: "STRING"},
 			{Name: "table_schema", Type: "STRING"},
