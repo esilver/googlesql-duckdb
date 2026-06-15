@@ -45,6 +45,19 @@ defer db.Close()
 rows, _ := db.Query(`SELECT FORMAT('%t', DATE '2026-05-14') AS today`)
 ```
 
+This fork keeps the upstream module path `github.com/goccy/googlesqlite`, so a
+bare `go get` of that path resolves to the upstream SQLite-backed engine. To
+build against this pure-Go DuckDB engine from your own module, add both
+redirects to your `go.mod`. The second is required because a `replace` inside a
+dependency does not apply to your build:
+
+```
+replace github.com/goccy/googlesqlite => github.com/esilver/googlesqlite v0.2.9-pure-go
+replace github.com/goccy/go-googlesql => github.com/esilver/go-googlesql v0.2.4-finalizer.1
+```
+
+The pins advance over time, so match them to this repo's `go.mod` when you build.
+
 ## Status
 
 Every function and type is backed by a declarative spec under `docs/specs/` and
