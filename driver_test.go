@@ -334,8 +334,7 @@ func TestWithCurrentTimeAndCurrentTime(t *testing.T) {
 	got := googlesqlite.CurrentTime(ctx)
 	if got == nil {
 		t.Fatalf("CurrentTime returned nil after WithCurrentTime")
-	}
-	if !got.Equal(now) {
+	} else if !got.Equal(now) {
 		t.Errorf("CurrentTime = %v; want %v", *got, now)
 	}
 }
