@@ -1,4 +1,4 @@
-package googlesqlite
+package duckdbudf
 
 import (
 	"context"
@@ -17,7 +17,7 @@ import (
 	"github.com/goccy/googlesqlite/internal/value"
 )
 
-// registerDuckDBUDFs installs the googlesqlite_* scalar UDFs onto a
+// RegisterUDFs installs the googlesqlite_* scalar UDFs onto a
 // DuckDB database handle. It calls internal.EnsureFuncMaps so the
 // formatter lowers exactly the builtins that get registered here, then
 // registers each UDF against the DuckDB connection (googlesqlite_in_array,
@@ -30,7 +30,7 @@ import (
 // functions at catalog scope, so a single registration is visible to all
 // connections of the same database (the inner pool is pinned to one
 // connection regardless).
-func registerDuckDBUDFs(db *sql.DB) error {
+func RegisterUDFs(db *sql.DB) error {
 	// The formatter's getFuncNameAndArgs lowers a builtin to its
 	// googlesqlite_<name> shell only when the name is present in
 	// normalFuncMap. Fill the maps so the string-family builtins stop
@@ -423,11 +423,11 @@ func (*inArrayUDF) Executor() duckdb.ScalarFuncExecutor {
 	}
 }
 
-// registerDuckDBGeography loads the spatial extension and registers the
-// geography scalar UDF surface. Split from registerDuckDBUDFs so the
+// RegisterGeography loads the spatial extension and registers the
+// geography scalar UDF surface. Split from RegisterUDFs so the
 // connection-open path can call it after the base UDFs are in place.
-func registerDuckDBGeography(db *sql.DB) error {
-	if err := loadSpatialExtension(db); err != nil {
+func RegisterGeography(db *sql.DB) error {
+	if err := LoadSpatialExtension(db); err != nil {
 		return err
 	}
 	return registerGeographyUDFs(db)

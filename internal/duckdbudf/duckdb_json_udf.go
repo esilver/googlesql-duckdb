@@ -1,4 +1,4 @@
-package googlesqlite
+package duckdbudf
 
 import (
 	"context"
@@ -11,7 +11,7 @@ import (
 	internal "github.com/goccy/googlesqlite/internal"
 )
 
-// registerDuckDBJSONUDFs installs the BigQuery JSON-function surface
+// RegisterJSONUDFs installs the BigQuery JSON-function surface
 // (TO_JSON_STRING, JSON_QUERY, JSON_VALUE, JSON_EXTRACT*, JSON_SET,
 // JSON_REMOVE, JSON_STRIP_NULLS, the typed JSON accessors, ...) as
 // googlesqlite_<name> scalar UDFs on a DuckDB handle. Each UDF decodes
@@ -25,7 +25,7 @@ import (
 // BigQuery's JSON semantics (path syntax, NULL handling, JSON_TYPE
 // vocabulary) differ from DuckDB's. Routing through the existing,
 // spec-conformant Go bodies preserves both.
-func registerDuckDBJSONUDFs(db *sql.DB) error {
+func RegisterJSONUDFs(db *sql.DB) error {
 	conn, err := db.Conn(context.Background())
 	if err != nil {
 		return fmt.Errorf("googlesqlite: duckdb json udf conn: %w", err)

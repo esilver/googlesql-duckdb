@@ -1,4 +1,4 @@
-package googlesqlite
+package duckdbudf
 
 import (
 	"database/sql"

@@ -1,4 +1,4 @@
-package googlesqlite
+package duckdbudf
 
 import (
 	"context"
@@ -16,7 +16,7 @@ import (
 // once per process, and spatialLoadErr records that single attempt's
 // outcome for every later caller.
 //
-// registerDuckDBGeography runs on every DB open (see driver.go), and the
+// RegisterGeography runs on every DB open (see driver.go), and the
 // conformance harness opens a fresh in-memory DuckDB instance per spec
 // case under two layers of t.Parallel(). The DuckDB C++ extension loader
 // mutates process-global state (the install registry and the extension's
@@ -45,14 +45,14 @@ var (
 	spatialLoadErr  error
 )
 
-// loadSpatialExtension ensures DuckDB's spatial extension has been
+// LoadSpatialExtension ensures DuckDB's spatial extension has been
 // installed and loaded once in this process. The db argument is accepted
 // for call-site symmetry with the other register* helpers but is not used:
 // the load runs against a dedicated bootstrap database so it is independent
 // of the catalog of whatever per-case DB triggered the first open. INSTALL
 // is idempotent and pulls from the locally cached extension repo when
 // offline.
-func loadSpatialExtension(_ *sql.DB) error {
+func LoadSpatialExtension(_ *sql.DB) error {
 	spatialLoadOnce.Do(func() {
 		spatialLoadErr = doLoadSpatialExtension()
 	})
@@ -69,7 +69,7 @@ func doLoadSpatialExtension() error {
 	// the wasm2go engine) and is NOT needed — the entire geography family lowers
 	// to the pure-Go googlesqlite_st_* / googlesqlite_s2_* scalar UDFs registered
 	// by registerGeographyUDFs. The native INSTALL/LOAD here was only a dead
-	// parity probe (see the comment above loadSpatialExtension), so on this
+	// parity probe (see the comment above LoadSpatialExtension), so on this
 	// backend it is a no-op. SWAP-BLUEPRINT §1.5.
 	return nil
 }

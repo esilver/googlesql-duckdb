@@ -17,6 +17,7 @@ import (
 	duckdb "github.com/goccy/googlesqlite/internal/duckdbgo"
 
 	internal "github.com/goccy/googlesqlite/internal"
+	"github.com/goccy/googlesqlite/internal/duckdbudf"
 )
 
 // dsnParts splits a googlesqlite DSN into its path and driver-option query
@@ -83,12 +84,12 @@ const (
 // of the spatial extension completes while the process is still effectively
 // single-threaded - before any concurrent query reaches DuckDB's
 // duckdb_execute_pending. That ordering is what keeps the extension loader
-// from racing the steady-state query stream (see loadSpatialExtension).
+// from racing the steady-state query stream (see duckdbudf.LoadSpatialExtension).
 var ensureGoogleSQLInit = sync.OnceValue(func() error {
 	if err := googlesql.Init(); err != nil {
 		return err
 	}
-	return loadSpatialExtension(nil)
+	return duckdbudf.LoadSpatialExtension(nil)
 })
 
 var (
@@ -186,7 +187,7 @@ func duckDBQueryParams(query string) string {
 
 // internalDuckDBDriver runs formatter-emitted SQL on duckdb-go. Each
 // connection registers the googlesqlite_* scalar and aggregate UDFs
-// against the DuckDB handle via registerDuckDBUDFs in duckdb_udf.go,
+// against the DuckDB handle via the internal/duckdbudf package,
 // which calls internal.EnsureFuncMaps so the formatter lowers exactly
 // the builtins that are registered.
 type internalDuckDBDriver struct{}
@@ -245,19 +246,19 @@ func registerDuckDBExtensions(db *sql.DB) error {
 	duckDBRegistrationMu.Lock()
 	defer duckDBRegistrationMu.Unlock()
 
-	if err := registerDuckDBUDFs(db); err != nil {
+	if err := duckdbudf.RegisterUDFs(db); err != nil {
 		return err
 	}
-	if err := registerDuckDBJSONUDFs(db); err != nil {
+	if err := duckdbudf.RegisterJSONUDFs(db); err != nil {
 		return err
 	}
-	if err := registerDuckDBGeography(db); err != nil {
+	if err := duckdbudf.RegisterGeography(db); err != nil {
 		return err
 	}
-	if err := registerDuckDBAggregates(db); err != nil {
+	if err := duckdbudf.RegisterAggregates(db); err != nil {
 		return err
 	}
-	if err := registerKLLExtractScalars(db); err != nil {
+	if err := duckdbudf.RegisterKLLExtractScalars(db); err != nil {
 		return err
 	}
 	return nil

@@ -1,4 +1,4 @@
-package googlesqlite
+package duckdbudf
 
 // This file is the pure-Go aggregate bridge. It registers the GoogleSQL aggregate /
 // window UDF surface against the wasm2go pure-Go DuckDB engine through
@@ -381,12 +381,12 @@ func encodeAggResult(out any, resultType int32) (any, error) {
 	return s, nil
 }
 
-// registerDuckDBAggregates installs the aggregate / window UDF surface onto a
+// RegisterAggregates installs the aggregate / window UDF surface onto a
 // pure-Go DuckDB database handle. Mirrors the cgo file: it grabs one connection
 // (catalog-scoped registration is visible to every connection of the same
 // database) and registers each aggregate as an arity band of ANY-parameter
 // overloads through the engine's RegisterAggregateBandConn.
-func registerDuckDBAggregates(db *sql.DB) error {
+func RegisterAggregates(db *sql.DB) error {
 	conn, err := db.Conn(context.Background())
 	if err != nil {
 		return fmt.Errorf("googlesqlite: duckdb aggregate conn: %w", err)

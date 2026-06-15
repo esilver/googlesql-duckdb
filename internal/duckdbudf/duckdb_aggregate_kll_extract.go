@@ -1,4 +1,4 @@
-package googlesqlite
+package duckdbudf
 
 import (
 	"context"
@@ -41,10 +41,10 @@ var kllExtractScalars = map[string]kllExtractSpec{
 	"extract_point_float64": {kll.BindExtractPointFloat64, duckdb.TYPE_DOUBLE},
 }
 
-// registerKLLExtractScalars installs the KLL EXTRACT scalar UDFs on a DuckDB
-// database handle. Mirrors registerDuckDBAggregates: one connection, catalog-
+// RegisterKLLExtractScalars installs the KLL EXTRACT scalar UDFs on a DuckDB
+// database handle. Mirrors RegisterAggregates: one connection, catalog-
 // scoped registration visible to every connection of the same database.
-func registerKLLExtractScalars(db *sql.DB) error {
+func RegisterKLLExtractScalars(db *sql.DB) error {
 	conn, err := db.Conn(context.Background())
 	if err != nil {
 		return fmt.Errorf("googlesqlite: kll extract conn: %w", err)
