@@ -1,12 +1,18 @@
-# GoogleSQLite
+# googlesql-duckdb
 
-[![CI](https://github.com/esilver/googlesqlite/actions/workflows/ci.yml/badge.svg)](https://github.com/esilver/googlesqlite/actions/workflows/ci.yml)
+[![CI](https://github.com/esilver/googlesql-duckdb/actions/workflows/ci.yml/badge.svg)](https://github.com/esilver/googlesql-duckdb/actions/workflows/ci.yml)
 
-A pure-Go GoogleSQL engine, exposed as a `database/sql` driver with no cgo, no
-external services, and no C toolchain, giving you a local execution engine for
-the dialect behind BigQuery and Cloud Spanner.
+A drop-in DuckDB backend for [goccy/googlesqlite](https://github.com/goccy/googlesqlite):
+the same GoogleSQL `database/sql` driver, with the SQLite backend replaced by a
+pure-Go DuckDB backend. No cgo, no external services, and no C toolchain, giving
+you a local execution engine for the dialect behind BigQuery and Cloud Spanner.
 
-It runs the GoogleSQL dialect on a pure-Go DuckDB backend:
+It keeps goccy's module path, `github.com/goccy/googlesqlite`, and the
+`googlesqlite` driver name, so code written against goccy's engine switches
+backends with `replace` lines in `go.mod` and no source changes (see
+[Module path](#module-path)).
+
+The stack has two pure-Go layers:
 
 - Parsing and analysis come from the forked
   [`esilver/go-googlesql`](https://github.com/esilver/go-googlesql), consumed
@@ -45,14 +51,24 @@ defer db.Close()
 rows, _ := db.Query(`SELECT FORMAT('%t', DATE '2026-05-14') AS today`)
 ```
 
-This fork keeps the upstream module path `github.com/goccy/googlesqlite`, so a
-bare `go get` of that path resolves to the upstream SQLite-backed engine. To
-build against this pure-Go DuckDB engine from your own module, add both
-redirects to your `go.mod`. The second is required because a `replace` inside a
-dependency does not apply to your build:
+### Module path
+
+The repository is `esilver/googlesql-duckdb`, but the Go module path stays
+goccy's: `github.com/goccy/googlesqlite`. That is what makes this a drop-in
+replacement. Code that already imports goccy's engine keeps its import paths,
+its `sql.Open("googlesqlite", ...)` calls and the rest of its source unchanged;
+`replace` directives in `go.mod` are the only edit.
+[`esilver/bigquery-emulator`](https://github.com/esilver/bigquery-emulator) runs
+on this engine that way.
+
+Because the path is goccy's, a bare `go get github.com/goccy/googlesqlite`
+resolves to the upstream SQLite-backed engine. To build against this pure-Go
+DuckDB engine from your own module, add both redirects to your `go.mod`. The
+second is required because a `replace` inside a dependency does not apply to
+your build:
 
 ```
-replace github.com/goccy/googlesqlite => github.com/esilver/googlesqlite v0.2.9-pure-go
+replace github.com/goccy/googlesqlite => github.com/esilver/googlesql-duckdb v0.2.9-pure-go
 replace github.com/goccy/go-googlesql => github.com/esilver/go-googlesql v0.2.4-finalizer.1
 ```
 

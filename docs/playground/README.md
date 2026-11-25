@@ -38,7 +38,7 @@ $ make deps      # install npm dependencies (first time only)
 $ make dev       # build the wasm engine, then start the dev server
 ```
 
-`make dev` opens <http://localhost:5173/googlesqlite/>. It compiles
+`make dev` opens <http://localhost:5173/googlesql-duckdb/>. It compiles
 `cmd/googlesqlite` (the `js && wasm` build) into `public/googlesqlite.wasm` and
 copies the Go `wasm_exec.js` loader next to it, both gitignored artifacts.
 The worker (`src/api/worker.ts`) loads the loader, instantiates the engine, and
@@ -83,7 +83,7 @@ make deps                  # first time only
 VITE_ENGINE=server make dev
 ```
 
-Open <http://localhost:5173/googlesqlite/>. The UI loads instantly (no wasm
+Open <http://localhost:5173/googlesql-duckdb/>. The UI loads instantly (no wasm
 download) and every query runs on the native server. The worker skips the wasm
 load and talks HTTP. `VITE_SERVER_URL` overrides the default
 `http://localhost:8765`.

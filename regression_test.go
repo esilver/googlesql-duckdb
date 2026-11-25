@@ -2459,7 +2459,7 @@ func TestRegression_SafeDivideAggregateCoercion(t *testing.T) {
 // produced by UNNEST reach DuckDB with their analyzer-resolved native type
 // instead of JSON, so DuckDB-native functions bind against them.
 //
-// Origin: https://github.com/esilver/googlesqlite/issues/1 — the UNNEST
+// Origin: https://github.com/esilver/googlesql-duckdb/issues/1 — the UNNEST
 // lowering projected raw json_each.value, so MOD(y, 7) over an unnested
 // element failed at prepare time with
 // 'No function matches ... mod(JSON, INTEGER_LITERAL)'.
@@ -2495,7 +2495,7 @@ func TestRegression_UnnestElementNativeBinding(t *testing.T) {
 // TestRegression_UnnestMaxNotLexicographic asserts that MIN / MAX over an
 // unnested integer array compare numerically.
 //
-// Origin: https://github.com/esilver/googlesqlite/issues/1 — with the raw
+// Origin: https://github.com/esilver/googlesql-duckdb/issues/1 — with the raw
 // JSON projection, native MAX compared the JSON values lexicographically,
 // so MAX over UNNEST(GENERATE_ARRAY(1,1000)) silently returned 999.
 func TestRegression_UnnestMaxNotLexicographic(t *testing.T) {
@@ -2520,7 +2520,7 @@ func TestRegression_UnnestMaxNotLexicographic(t *testing.T) {
 // over an unnested array persists a natively typed column, so native
 // functions bind against the stored column afterwards.
 //
-// Origin: https://github.com/esilver/googlesqlite/issues/1 — the JSON typing
+// Origin: https://github.com/esilver/googlesql-duckdb/issues/1 — the JSON typing
 // persisted through CTAS, so MOD(id, 1000) on the stored column failed with
 // the same binder error.
 func TestRegression_UnnestCTASColumnType(t *testing.T) {
@@ -2736,7 +2736,7 @@ func TestRegression_Int64BigintStorage(t *testing.T) {
 // computed as an EXACT integer — no float64 routing anywhere on the path —
 // including above 2^53 where double rounding becomes observable.
 //
-// Origin: https://github.com/esilver/googlesqlite/issues/5 — the aggregate
+// Origin: https://github.com/esilver/googlesql-duckdb/issues/5 — the aggregate
 // lowering cast SUM's argument to DOUBLE, so the whole sum accumulated in
 // float64 and 2^62 + 1 came back as 2^62 (the float64-nearest value), with
 // the result type itself surfacing as FLOAT64.
@@ -2789,7 +2789,7 @@ func TestRegression_SumInt64Exactness(t *testing.T) {
 // result lands within a few units of math.MaxInt64 — every float64 ulp at
 // that magnitude is 1024, so any float routing shows up immediately.
 //
-// Origin: https://github.com/esilver/googlesqlite/issues/5.
+// Origin: https://github.com/esilver/googlesql-duckdb/issues/5.
 func TestRegression_SumInt64NearMaxExact(t *testing.T) {
 	t.Parallel()
 	db, err := sql.Open("googlesqlite", ":memory:")
@@ -2829,7 +2829,7 @@ func TestRegression_SumInt64NearMaxExact(t *testing.T) {
 // semantics: a SUM whose exact value exceeds the int64 range raises an
 // error instead of silently returning a float64-rounded (wrong) value.
 //
-// Origin: https://github.com/esilver/googlesqlite/issues/5.
+// Origin: https://github.com/esilver/googlesql-duckdb/issues/5.
 func TestRegression_SumInt64OverflowErrors(t *testing.T) {
 	t.Parallel()
 	db, err := sql.Open("googlesqlite", ":memory:")

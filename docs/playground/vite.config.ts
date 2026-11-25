@@ -43,11 +43,11 @@ function rawGzPlugin(): Plugin {
   }
 }
 
-// The site is published under https://esilver.github.io/googlesqlite/,
-// so every asset URL is prefixed with /googlesqlite/. The dev server
-// serves under the same base, i.e. http://localhost:5173/googlesqlite/.
+// The site is published under https://esilver.github.io/googlesql-duckdb/,
+// so every asset URL is prefixed with /googlesql-duckdb/. The dev server
+// serves under the same base, i.e. http://localhost:5173/googlesql-duckdb/.
 export default defineConfig({
-  base: '/googlesqlite/',
+  base: '/googlesql-duckdb/',
   plugins: [react(), rawGzPlugin()],
   worker: {
     format: 'es',

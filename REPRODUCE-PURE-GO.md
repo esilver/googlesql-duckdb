@@ -19,8 +19,8 @@ generated files. (The GoogleSQL analyzer is consumed via a documented `replace`
 to the `go-googlesql` fork in `go.mod`, pending upstream.)
 
 ```sh
-git clone https://github.com/esilver/googlesqlite
-cd googlesqlite
+git clone https://github.com/esilver/googlesql-duckdb
+cd googlesql-duckdb
 CGO_ENABLED=0 go run ./cmd/googlesqlite :memory:
 ```
 

@@ -53,7 +53,7 @@ deps:
 	npm install
 
 # dev builds the engine and starts the Vite dev server. The page is
-# served at http://localhost:5173/googlesqlite/.
+# served at http://localhost:5173/googlesql-duckdb/.
 #
 # With VITE_ENGINE=server the in-browser wasm engine is not built or
 # loaded: the UI talks to the native engine server instead (run

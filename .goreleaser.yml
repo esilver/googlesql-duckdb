@@ -25,7 +25,7 @@ archives:
 nfpms:
   - file_name_template: >-
       {{ .ProjectName }}_{{ .Version }}-1_{{ .Arch }}
-    homepage: https://github.com/esilver/googlesqlite
+    homepage: https://github.com/esilver/googlesql-duckdb
     maintainer: esilver
     description: Pure-Go database/sql driver and CLI running GoogleSQL on DuckDB
     license: MIT

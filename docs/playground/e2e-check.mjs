@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-const URL = process.env.PLAYGROUND_URL || 'http://localhost:5173/googlesqlite/'
+const URL = process.env.PLAYGROUND_URL || 'http://localhost:5173/googlesql-duckdb/'
 const ENGINES = { chromium, firefox, webkit }
 const engineName = process.env.BROWSER || 'chromium'
 const engine = ENGINES[engineName]
