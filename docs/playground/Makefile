@@ -1,4 +1,4 @@
-# Makefile for the googlesqlite Playground.
+# Makefile for the googlesql-duckdb Playground.
 #
 # Typical first run:
 #   make deps    # install npm dependencies

@@ -36,7 +36,7 @@ import { EXAMPLES } from './data/examples'
 import type { ExportFormat, LoadProgress, QueryResult } from './api/types'
 import type { ThemeMode } from './theme'
 
-const SAMPLE_QUERY = `-- Welcome to the GoogleSQLite Playground.
+const SAMPLE_QUERY = `-- Welcome to the googlesql-duckdb Playground.
 -- Run with the Run button or Cmd/Ctrl+Enter.
 SELECT 'こんにちは' AS greeting, 1 + 1 AS sum;`
 
@@ -228,7 +228,7 @@ export function App({ mode, onToggleMode }: AppProps) {
       <AppBar position="static" color="default" elevation={1}>
         <Toolbar variant="dense" sx={{ gap: 1 }}>
           <Typography variant="h6" noWrap sx={{ flexGrow: 1 }}>
-            {isMobile ? 'GoogleSQLite' : 'GoogleSQLite Playground'}
+            {isMobile ? 'googlesql-duckdb' : 'googlesql-duckdb Playground'}
           </Typography>
           {!isMobile && debugToggle}
           <Tooltip
@@ -412,7 +412,7 @@ function LoadingScreen({
         p={4}
       >
         <Alert severity="error" sx={{ maxWidth: 640 }}>
-          Failed to start the GoogleSQLite engine: {error}
+          Failed to start the googlesql-duckdb engine: {error}
         </Alert>
       </Box>
     )
@@ -434,7 +434,7 @@ function LoadingScreen({
       height="100%"
       px={3}
     >
-      <Typography variant="h6">GoogleSQLite Playground</Typography>
+      <Typography variant="h6">googlesql-duckdb Playground</Typography>
       <Box sx={{ width: 'min(360px, 80vw)' }}>
         <LinearProgress
           variant={determinate ? 'determinate' : 'indeterminate'}
@@ -472,7 +472,7 @@ function downloadHistory(content: string, format: ExportFormat): void {
   const url = URL.createObjectURL(blob)
   const anchor = document.createElement('a')
   anchor.href = url
-  anchor.download = `googlesqlite-history.${FILE_EXTENSION[format]}`
+  anchor.download = `googlesql-duckdb-history.${FILE_EXTENSION[format]}`
   anchor.click()
   URL.revokeObjectURL(url)
 }

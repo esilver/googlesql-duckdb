@@ -1,6 +1,6 @@
-# googlesqlite Playground
+# googlesql-duckdb Playground
 
-A browser playground for GoogleSQL queries against the `googlesqlite` engine
+A browser playground for GoogleSQL queries against the `googlesql-duckdb` engine
 (the GoogleSQL/BigQuery dialect on the pure-Go DuckDB backend). The same UI runs
 against either of two interchangeable engine modes, selected at start with
 `VITE_ENGINE`:
