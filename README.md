@@ -88,7 +88,7 @@ dependency. Each spec's `notes:` frontmatter says what is missing.
 ## Playground
 
 Run the engine in your browser, nothing to install:
-**<https://esilver.github.io/googlesqlite/>**.
+**<https://esilver.github.io/googlesql-duckdb/>**.
 
 The whole engine, GoogleSQL parsing, analysis, and the pure-Go DuckDB backend,
 compiles to WebAssembly and runs client-side, sending nothing anywhere. The
