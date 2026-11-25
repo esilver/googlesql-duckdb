@@ -96,4 +96,4 @@ require (
 	google.golang.org/grpc v1.80.0 // indirect
 )
 
-replace github.com/goccy/go-googlesql => github.com/esilver/go-googlesql v0.2.4-finalizer.1.0.20260611225755-3bdff21371a3
+replace github.com/goccy/go-googlesql => github.com/esilver/go-googlesql v0.2.4-finalizer.1.0.20260611225755-12b653e5f488

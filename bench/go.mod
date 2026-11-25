@@ -90,4 +90,4 @@ replace github.com/goccy/googlesqlite => ../
 // Keep the benchmark module on the same patched analyzer bridge as the
 // root module. Without this, `go test` from bench/ resolves upstream
 // go-googlesql and benchmarks a different stack.
-replace github.com/goccy/go-googlesql => github.com/esilver/go-googlesql v0.2.4-finalizer.1.0.20260611225755-3bdff21371a3
+replace github.com/goccy/go-googlesql => github.com/esilver/go-googlesql v0.2.4-finalizer.1.0.20260611225755-12b653e5f488
